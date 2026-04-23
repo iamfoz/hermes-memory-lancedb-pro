@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.whl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memory database (don't commit local state)
+~/.hermes/memory-lancedb/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Secrets
+*.key
+*.pem
+*.crt
