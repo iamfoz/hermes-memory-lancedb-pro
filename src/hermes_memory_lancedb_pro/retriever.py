@@ -8,40 +8,46 @@ Architecture from CortexReach memory-lancedb-pro:
      - Length normalisation
      - Hard min score filter (BEFORE decay)
      - Composite decay scoring (Weibull)
-     - Noise filter
-     - MMR diversity
-  4. BM25 ghost entry protection via store.hasId()
-  5. Lifecycle hooks: access count increment + tier evaluation on recall
+  4. Optional cross-encoder reranking (LangSearch API)
+  5. MMR diversity demotion
+  6. BM25 ghost entry protection via store.check_ids()
+  7. Lifecycle hooks: access count increment + tier evaluation on recall
 """
 
-import json
+from __future__ import annotations
+
 import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import requests
 
-from .store import MemoryStore
 from .decay import (
     ScoringPipeline,
-    mmr_diversity_filter,
-    is_noise,
+    _coerce_metadata,
     evaluate_all_tiers,
+    is_noise,
+    mmr_diversity_filter,
 )
+from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
-# LangSearch Reranking API config
+# LangSearch reranking API config
 LANGSEARCH_API_KEY = os.environ.get("LANGSEARCH_API_KEY", "")
 LANGSEARCH_BASE_URL = "https://api.langsearch.com/v1/rerank"
 LANGSEARCH_MODEL = "langsearch-reranker-v1"
 LANGSEARCH_MAX_DOCS = 50  # API limit per request
-LANGSEARCH_TIMEOUT = 15  # seconds
+LANGSEARCH_TIMEOUT = 15   # seconds
+
+# Tier evaluation throttle: full-store tier evaluation happens every Nth recall.
+TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
+TIER_EVAL_BATCH = int(os.environ.get("MEMORY_TIER_EVAL_BATCH", "500"))
 
 
-class HybridRetriever:
+class MemoryRetriever:
     """
     Hybrid retrieval with vector-dominant fusion and spec-compliant scoring.
 
@@ -49,145 +55,123 @@ class HybridRetriever:
       - Vector score is the primary signal
       - BM25 hit provides a confirmation boost (not a full parallel ranking)
       - Pure BM25 hits allowed but with a lower floor
-      - BM25 ghost entries filtered via store.hasId()
+      - BM25 ghost entries filtered via store.check_ids()
       - Preservation floor for high BM25 lexical hits to prevent reranker kills
     """
 
     def __init__(self, store: MemoryStore):
         self.store = store
         self.scoring = ScoringPipeline()
+        # Per-instance throttle counter — the previous class-level counter
+        # was shared across instances, causing surprising throttling when
+        # tests or services held more than one retriever.
+        self._lifecycle_call_count = 0
+
+    # ----- public -----
 
     def retrieve(
         self,
         query: str,
         limit: int = 10,
-        category: Optional[str] = None,
-        scope: Optional[str] = None,
+        category: str | None = None,
+        scope: str | None = None,
         source: str = "manual",
-    ) -> List[Dict[str, Any]]:
-        """
-        Perform hybrid retrieval with full scoring pipeline.
-
-        Args:
-            query: Search query text
-            limit: Maximum number of results
-            category: Optional category filter
-            scope: Optional scope filter
-            source: Retrieval source ("manual", "auto-recall", "cli")
-
-        Returns:
-            List of memory entries with scores
-        """
+    ) -> list[dict[str, Any]]:
+        """Run the full hybrid retrieval pipeline."""
         if not query or not query.strip():
             return []
 
         query = query.strip()
         now_ms = int(time.time() * 1000)
 
-        # Step 1: Parallel vector + BM25 search
-        candidate_pool = min(limit * 4, 40)  # Wide initial net
-
+        # 1. Parallel vector + BM25 search (wide initial net)
+        candidate_pool = min(max(limit * 4, 16), 40)
         vector_results = self.store._vector_search(query, candidate_pool, category, scope)
         bm25_results = self.store._bm25_search(query, candidate_pool, category, scope)
 
-        # Step 1.5: BM25 ghost entry protection
+        # 1.5 BM25 ghost entry protection
         bm25_results = self._filter_bm25_ghosts(bm25_results, vector_results)
 
-        # Step 2: Vector-dominant fusion with BM25 confirmation bonus
+        # 2. Vector-dominant fusion with BM25 confirmation bonus
         fused = self._vector_dominant_fusion(vector_results, bm25_results)
-
         if not fused:
             return []
 
-        # Step 3: Apply scoring pipeline (length norm -> hardMinScore -> decay -> sort)
+        # 3. Scoring pipeline (length norm -> hardMinScore -> decay -> sort)
         scored = self.scoring.apply_scoring(fused, now_ms)
 
-        # Step 4: Noise filter
+        # 4. Noise filter
         scored = [e for e in scored if not is_noise(e.get("text", ""))]
 
-        # Step 5: Cross-encoder reranking (best relevance signal — before diversity)
-        scored = self._rerank(query, scored, top_n=5)
+        # 5. Cross-encoder rerank (best relevance signal — runs before MMR
+        # so diversity operates on the most accurate ordering)
+        scored = self._rerank(query, scored, top_n=min(5, limit))
 
-        # Step 6: MMR diversity (filter after rerank so diversity operates on correct ordering)
-        scored_tuples = [(e, e.get("_final_score", 0)) for e in scored]
+        # 6. MMR diversity (demotes near-duplicates)
+        scored_tuples = [(e, float(e.get("_final_score", 0.0))) for e in scored]
         diverse = mmr_diversity_filter(scored_tuples, similarity_threshold=0.85)
-        scored = [e for e, _ in diverse]
+        scored = [e for e, score in diverse]
+        # propagate the MMR-adjusted score back onto the entry
+        for entry, score in diverse:
+            entry["_mmr_score"] = score
 
-        # Step 6: Lifecycle hooks — increment access count for recalled items
+        # 7. Lifecycle hooks — increment access count, throttle full tier eval
         if source in ("manual", "auto-recall"):
             self._run_recall_lifecycle(scored)
 
-        # Step 7: Limit
         return scored[:limit]
+
+    # ----- helpers -----
 
     def _filter_bm25_ghosts(
         self,
-        bm25_results: List[Dict[str, Any]],
-        vector_results: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Filter BM25-only results that are ghost entries (not in vector index).
-
-        Per spec: BM25-only results checked via store.hasId() to avoid FTS
-        residual ghost entries. Batch query to avoid N+1 database calls.
-        """
+        bm25_results: list[dict[str, Any]],
+        vector_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop BM25-only hits that don't exist (or are archived) in the
+        store. Uses a single batch call to `check_ids` to avoid N+1 lookups."""
         vector_ids = {r["id"] for r in vector_results}
-        # BM25-only IDs not in vector results
-        bm25_only_ids = [entry["id"] for entry in bm25_results if entry["id"] not in vector_ids]
-        
-        # Batch check store for BM25-only IDs
-        if bm25_only_ids:
-            confirmed = set(self.store.check_ids(bm25_only_ids))
-        else:
-            confirmed = set()
-        
-        filtered = []
-        for entry in bm25_results:
-            mid = entry["id"]
-            # Keep if also in vector results (definitely real)
-            if mid in vector_ids:
-                filtered.append(entry)
-            elif mid in confirmed:
-                filtered.append(entry)
-            # Otherwise it's a ghost — drop it
-        return filtered
+        bm25_only_ids = [
+            entry["id"] for entry in bm25_results if entry["id"] not in vector_ids
+        ]
+        confirmed = (
+            set(self.store.check_ids(bm25_only_ids)) if bm25_only_ids else set()
+        )
+        return [
+            entry for entry in bm25_results
+            if entry["id"] in vector_ids or entry["id"] in confirmed
+        ]
 
     def _vector_dominant_fusion(
         self,
-        vector_results: List[Dict[str, Any]],
-        bm25_results: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Vector-score-dominant fusion with BM25 confirmation bonus.
+        vector_results: list[dict[str, Any]],
+        bm25_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Vector-score-dominant fusion with BM25 confirmation bonus.
 
-        Strategy (per CortexReach spec):
-          - For vector hits: fusion_score = 1 - vector_distance (normalised)
-          - BM25 confirmation bonus: if entry also appears in BM25 results,
-            apply a multiplicative boost (1.0 + 0.3 / bm25_rank)
-          - Pure BM25 hits: allowed with a base score (0.3 / rank)
-          - High BM25 lexical hits get a preservation floor to prevent
-            reranker kills
-
-        Returns:
-            List of entries with _fusion_score set
+        - Vector hits: fusion_score = 1 - normalised_distance
+        - Confirmation bonus when also in BM25 results
+        - Pure BM25 hits: lower base, with a preservation floor for
+          high-importance entries to survive subsequent reranking
         """
-        # Build lookup maps + rank dicts
         vector_map = {r["id"]: r for r in vector_results}
         vector_ranks = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
         bm25_map = {r["id"]: r for r in bm25_results}
         bm25_ranks = {r["id"]: i + 1 for i, r in enumerate(bm25_results)}
 
-        # Ordered union: vector results first (in rank order), then BM25-only hits
-        all_ids = list(vector_map.keys()) + [mid for mid in bm25_map if mid not in vector_map]
+        # Ordered union: vector first, then BM25-only
+        ordered_ids = list(vector_map.keys()) + [
+            mid for mid in bm25_map if mid not in vector_map
+        ]
 
-        # Normalise vector distances to [0, 1] range across this batch
-        # (raw cosine distances can exceed 1.0 for very dissimilar vectors)
+        # Normalise vector distances to [0, 1] across this batch
         vector_dists = [r.get("_distance", 0.0) for r in vector_results]
         max_dist = max(vector_dists) if vector_dists else 1.0
         min_dist = min(vector_dists) if vector_dists else 0.0
+        dist_range = max_dist - min_dist
 
-        fused = []
-        for mid in all_ids:
+        fused: list[dict[str, Any]] = []
+        for mid in ordered_ids:
             entry = vector_map.get(mid) or bm25_map.get(mid)
             if entry is None:
                 continue
@@ -196,132 +180,114 @@ class HybridRetriever:
             in_bm25 = mid in bm25_map
 
             if in_vector:
-                # Primary signal: normalised vector proximity
                 raw_dist = entry.get("_distance", 0.0)
-                if max_dist > min_dist:
-                    norm_dist = (raw_dist - min_dist) / (max_dist - min_dist)
-                else:
-                    norm_dist = 0.0
-                # Score: close to 1.0 for good matches, clamped to [0.01, 1.0]
+                norm_dist = (raw_dist - min_dist) / dist_range if dist_range > 0 else 0.0
                 fusion_score = max(0.01, 1.0 - norm_dist)
-
-                # BM25 confirmation bonus
                 if in_bm25:
                     bm25_rank = bm25_ranks[mid]
-                    bonus = 1.0 + (0.3 / (1 + math.log1p(bm25_rank)))
-                    fusion_score *= bonus
-
+                    fusion_score *= 1.0 + (0.3 / (1 + math.log1p(bm25_rank)))
                 entry["_fusion_source"] = "both" if in_bm25 else "vector"
-
-            elif in_bm25:
-                # Pure BM25 hit — lower base score, but with preservation floor
-                # for high-importance entries (per spec: prevent reranker kills)
+            else:
                 bm25_rank = bm25_ranks[mid]
                 fusion_score = 0.15 / (1 + math.log1p(bm25_rank))
-                # Importance preservation floor
-                metadata = entry.get("metadata", {})
-                if isinstance(metadata, str):
-                    try:
-                        metadata = json.loads(metadata)
-                    except (json.JSONDecodeError, TypeError):
-                        metadata = {}
-                importance = metadata.get("importance", 0.5)
+                # Importance preservation floor — read from the top-level
+                # column (the previous version read metadata.importance,
+                # which was always missing → defaulted to 0.5).
+                importance = self._extract_importance(entry)
                 if importance >= 0.8:
                     fusion_score = max(fusion_score, 0.12)
                 elif importance >= 0.6:
                     fusion_score = max(fusion_score, 0.08)
                 entry["_fusion_source"] = "bm25"
-            else:
-                continue
 
             entry["_fusion_score"] = fusion_score
             entry["_vector_rank"] = vector_ranks.get(mid) if in_vector else None
             entry["_bm25_rank"] = bm25_ranks.get(mid)
             fused.append(entry)
 
-        # Sort by fusion score descending
-        fused.sort(key=lambda e: e.get("_fusion_score", 0), reverse=True)
-
+        fused.sort(key=lambda e: e.get("_fusion_score", 0.0), reverse=True)
         return fused
 
-    # Throttle counter for lifecycle evaluation
-    _lifecycle_call_count = 0
+    @staticmethod
+    def _extract_importance(entry: dict[str, Any]) -> float:
+        val = entry.get("importance")
+        if val is None:
+            val = _coerce_metadata(entry.get("metadata", {})).get("importance", 0.5)
+        try:
+            return max(0.0, min(1.0, float(val)))
+        except (TypeError, ValueError):
+            return 0.5
 
-    def _run_recall_lifecycle(
-        self,
-        results: List[Dict[str, Any]],
-    ) -> None:
+    def _run_recall_lifecycle(self, results: list[dict[str, Any]]) -> None:
         """
         Lifecycle hooks after recall (per CortexReach spec):
           1. Increment access count for each recalled item
           2. Update last_accessed_at
-          3. Evaluate tier promotions/demotions for affected scope
+          3. Periodically re-evaluate tier promotions/demotions
 
-        Throttling: Access count increment happens every call, but the
-        expensive full-store tier evaluation (list_memories + evaluate_all_tiers
-        + write-back) only runs every 10th call. Without this throttle, every
-        search triggers hundreds of DB operations — list_memories(limit=500),
-        decay computation on every memory, then conditional writes back.
+        The full-store tier evaluation runs only every TIER_EVAL_FREQUENCY
+        recalls — without throttling, every search triggers hundreds of DB
+        operations and dominates request latency.
         """
-        HybridRetriever._lifecycle_call_count += 1
+        self._lifecycle_call_count += 1
 
-        # Always increment access counts — this is lightweight per-item
+        # Always increment access counts — cheap per-item write
         for entry in results:
             mem_id = entry.get("id")
             if mem_id:
-                self.store.increment_access_count(mem_id)
+                try:
+                    self.store.increment_access_count(mem_id)
+                except Exception as e:
+                    logger.warning("increment_access_count failed for %s: %s", mem_id, e)
 
-        # Throttle full-store tier evaluation to every 10th call
-        if HybridRetriever._lifecycle_call_count % 10 != 0:
+        if TIER_EVAL_FREQUENCY <= 0:
+            return
+        if self._lifecycle_call_count % TIER_EVAL_FREQUENCY != 0:
             return
 
-        # Evaluate tier changes across the full store (not just recalled items)
-        # This is the "scoreAll" + "evaluateAll" cycle from the spec
-        all_memories = self.store.list_memories(limit=500)
-        tier_changes = evaluate_all_tiers(all_memories)
+        try:
+            # list_memories now filters archived rows by default — tier
+            # evaluation only fires on the active pool.
+            all_memories = self.store.list_memories(limit=TIER_EVAL_BATCH)
+        except Exception as e:
+            logger.warning("Tier eval list_memories failed: %s", e)
+            return
 
-        # Write back tier changes
+        try:
+            tier_changes = evaluate_all_tiers(all_memories)
+        except Exception as e:
+            logger.warning("evaluate_all_tiers failed: %s", e)
+            return
+
         for mem_id, new_tier in tier_changes.items():
-            self.store.update(mem_id, tier=new_tier)
+            try:
+                self.store.update(mem_id, tier=new_tier)
+            except Exception as e:
+                logger.warning("Tier update for %s failed: %s", mem_id, e)
 
     def _rerank(
         self,
         query: str,
-        results: List[Dict[str, Any]],
+        results: list[dict[str, Any]],
         top_n: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """
-        Semantic reranking using the LangSearch Reranking API.
+    ) -> list[dict[str, Any]]:
+        """Cross-encoder reranking via LangSearch.
 
-        Sends the top-N fused results to LangSearch's dedicated reranker
-        which scores each document's semantic relevance to the query
-        (0.0–1.0). Far more accurate than the previous LLM-prompt approach.
-
-        Args:
-            query: Original search query
-            results: Pre-fused and scored results
-            top_n: Number of results to return after reranking
-
-        Returns:
-            Reranked list of results
-        """
+        Reranks the top `min(top_n*3, LANGSEARCH_MAX_DOCS)` candidates and
+        carries the un-reranked tail forward unchanged. Uses a fail-soft
+        approach: any error returns the input list unmutated."""
         if not LANGSEARCH_API_KEY:
-            logger.warning("LANGSEARCH_API_KEY not set, skipping reranking")
             return results
-
         if len(results) <= 1:
             return results
 
-        # LangSearch accepts up to 50 documents; cap reasonably
-        candidates = results[:min(top_n * 3, LANGSEARCH_MAX_DOCS)]
+        candidate_count = min(top_n * 3, LANGSEARCH_MAX_DOCS, len(results))
+        if candidate_count <= 1:
+            return results
 
-        # Extract document texts for LangSearch
-        documents = []
-        for entry in candidates:
-            text = entry.get("text", "") or ""
-            documents.append(text)
-
-        if not documents or all(not d for d in documents):
+        candidates = results[:candidate_count]
+        documents = [str(c.get("text", "") or "") for c in candidates]
+        if not any(documents):
             return results
 
         try:
@@ -335,47 +301,62 @@ class HybridRetriever:
                     "model": LANGSEARCH_MODEL,
                     "query": query,
                     "documents": documents,
-                    "top_n": top_n,
+                    "top_n": min(top_n, candidate_count),
                     "return_documents": False,
                 },
                 timeout=LANGSEARCH_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
+        except requests.RequestException as e:
+            logger.warning("LangSearch rerank request failed: %s", e)
+            return results
+        except ValueError as e:
+            logger.warning("LangSearch rerank returned non-JSON: %s", e)
+            return results
 
-            if data.get("code") != 200:
-                logger.warning("LangSearch rerank returned error: %s", data.get("msg", "unknown"))
-                return results
-
-            lang_results = data.get("results", [])
-            if not lang_results:
-                return results
-
-            # Build a map: index -> relevance_score
-            score_map = {}
-            for item in lang_results:
-                idx = item.get("index")
-                score = item.get("relevance_score", 0.0)
-                if idx is not None:
-                    score_map[idx] = score
-
-            # Apply reranking scores — blend: 70% LangSearch, 30% fusion
-            for i, entry in enumerate(candidates):
-                if i in score_map:
-                    entry["_rerank_score"] = score_map[i]
-                    entry["_final_score"] = (
-                        entry.get("_final_score", 0) * 0.3
-                        + score_map[i] * 0.7
-                    )
-
-            # Re-sort by final score descending
-            results[:len(candidates)] = sorted(
-                candidates,
-                key=lambda e: e.get("_final_score", 0),
-                reverse=True,
+        if isinstance(data, dict) and data.get("code") not in (None, 200):
+            logger.warning(
+                "LangSearch rerank returned error: %s",
+                data.get("msg", "unknown"),
             )
             return results
 
-        except Exception as e:
-            logger.warning("LangSearch reranking failed: %s", e)
+        lang_results = (data or {}).get("results") or []
+        if not lang_results:
             return results
+
+        # Map: candidate index -> relevance_score
+        score_map: dict[int, float] = {}
+        for item in lang_results:
+            idx = item.get("index")
+            score = item.get("relevance_score")
+            if isinstance(idx, int) and isinstance(score, (int, float)):
+                score_map[idx] = float(score)
+        if not score_map:
+            return results
+
+        # If the API returns scores for only a subset, blend the missing ones
+        # against their existing _final_score (un-reranked) so the final list
+        # remains on a comparable scale. Without this, blended and raw scores
+        # mix and the sort becomes incoherent.
+        for i, entry in enumerate(candidates):
+            existing = float(entry.get("_final_score", 0.0))
+            if i in score_map:
+                rerank = score_map[i]
+                entry["_rerank_score"] = rerank
+                # 70% rerank, 30% scoring pipeline
+                entry["_final_score"] = 0.7 * rerank + 0.3 * existing
+            else:
+                # Penalise candidates the reranker dropped — they made it to
+                # the API but didn't earn a relevance score.
+                entry["_final_score"] = 0.3 * existing
+                entry["_rerank_score"] = 0.0
+
+        candidates.sort(key=lambda e: e.get("_final_score", 0.0), reverse=True)
+        results[:candidate_count] = candidates
+        return results
+
+
+# Back-compat alias for callers that imported the old name
+HybridRetriever = MemoryRetriever
