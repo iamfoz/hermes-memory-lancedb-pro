@@ -12,9 +12,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Pure-Python re-exports (safe — no heavy deps)
+from .batch_dedup import (  # noqa: F401
+    BatchDedupResult,
+    ExtractionCostStats,
+    batch_dedup,
+    create_extraction_cost_stats,
+)
 from .decay import (  # noqa: F401
     DecayConfig,
     ScoringConfig,
@@ -27,6 +33,26 @@ from .decay import (  # noqa: F401
     is_noise,
     mmr_diversity_filter,
 )
+from .memory_categories import (  # noqa: F401
+    MEMORY_CATEGORIES as SMART_MEMORY_CATEGORIES,
+)
+from .memory_categories import (  # noqa: F401
+    CandidateMemory,
+    SmartCategory,
+    normalize_category,
+)
+from .session_compressor import (  # noqa: F401
+    CompressResult,
+    ScoredText,
+    compress_texts,
+    estimate_conversation_value,
+    score_text,
+)
+from .temporal_classifier import (  # noqa: F401
+    TemporalType,
+    classify_temporal,
+    infer_expiry,
+)
 
 # Names provided by submodules that pull in lancedb / sentence-transformers.
 # Resolved on first access via __getattr__ so `import hermes_memory_lancedb_pro`
@@ -38,6 +64,17 @@ _LAZY_ATTRS = {
     "HybridRetriever": ("retriever", "HybridRetriever"),
     "LanceDBProMemoryProvider": ("provider", "LanceDBProMemoryProvider"),
     "register_memory_provider": ("provider", "register_memory_provider"),
+    # admission_control + memory_compactor reference MemoryStore lazily
+    # (TYPE_CHECKING) so they're safe to import without lancedb.
+    "AdmissionController": ("admission_control", "AdmissionController"),
+    "AdmissionControlConfig": ("admission_control", "AdmissionControlConfig"),
+    "ExtractorLLM": ("admission_control", "ExtractorLLM"),
+    "get_admission_preset": ("admission_control", "get_preset"),
+    "CompactionConfig": ("memory_compactor", "CompactionConfig"),
+    "CompactionResult": ("memory_compactor", "CompactionResult"),
+    "run_compaction": ("memory_compactor", "run_compaction"),
+    "should_run_compaction": ("memory_compactor", "should_run_compaction"),
+    "record_compaction_run": ("memory_compactor", "record_compaction_run"),
 }
 
 
@@ -63,12 +100,14 @@ if TYPE_CHECKING:  # pragma: no cover — for IDEs / type checkers only
 
 
 __all__ = [
+    # Core
     "MemoryStore",
     "MemorySchema",
     "MemoryRetriever",
     "HybridRetriever",
     "LanceDBProMemoryProvider",
     "register_memory_provider",
+    # Decay / scoring
     "DecayConfig",
     "ScoringConfig",
     "ScoringPipeline",
@@ -79,4 +118,35 @@ __all__ = [
     "evaluate_tier",
     "is_noise",
     "mmr_diversity_filter",
+    # Smart category schema
+    "CandidateMemory",
+    "SmartCategory",
+    "SMART_MEMORY_CATEGORIES",
+    "normalize_category",
+    # Temporal classifier
+    "TemporalType",
+    "classify_temporal",
+    "infer_expiry",
+    # Session compressor
+    "ScoredText",
+    "CompressResult",
+    "score_text",
+    "compress_texts",
+    "estimate_conversation_value",
+    # Batch dedup
+    "BatchDedupResult",
+    "ExtractionCostStats",
+    "batch_dedup",
+    "create_extraction_cost_stats",
+    # Admission control
+    "AdmissionController",
+    "AdmissionControlConfig",
+    "ExtractorLLM",
+    "get_admission_preset",
+    # Memory compactor
+    "CompactionConfig",
+    "CompactionResult",
+    "run_compaction",
+    "should_run_compaction",
+    "record_compaction_run",
 ]
