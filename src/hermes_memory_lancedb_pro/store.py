@@ -383,6 +383,77 @@ class MemoryStore:
         self._table.add(prepared)
         return ids
 
+    def store_raw(
+        self,
+        *,
+        text: str,
+        vector: Sequence[float],
+        category: str,
+        scope: str,
+        importance: float,
+        metadata: str,
+        timestamp: int | None = None,
+    ) -> str:
+        """Low-level write: caller supplies the encoded vector AND the
+        full metadata JSON string. Bypasses `_build_metadata` so callers
+        with their own metadata schemas (reflection, audit logs, etc.)
+        aren't forced through the default-field machinery.
+
+        Returns the new memory id. Use this when you need:
+          - a pre-computed vector (saves a re-encode)
+          - a metadata JSON that diverges from the standard schema (e.g.
+            reflection items, with their own decay / quality / item_kind
+            fields)
+
+        For ordinary writes, prefer `store()` / `store_many()`."""
+        if not text or not str(text).strip():
+            raise ValueError("MemoryStore.store_raw: `text` must be non-empty")
+        if not vector:
+            raise ValueError("MemoryStore.store_raw: `vector` must be non-empty")
+
+        mem_id = str(uuid.uuid4())
+        ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
+        importance = max(0.0, min(1.0, float(importance)))
+
+        self._table.add([
+            MemorySchema(
+                id=mem_id,
+                text=text,
+                vector=list(vector),
+                category=category,
+                scope=scope,
+                importance=importance,
+                timestamp=ts,
+                metadata=metadata,
+            )
+        ])
+        return mem_id
+
+    def search_by_vector(
+        self,
+        vector: Sequence[float],
+        limit: int = 10,
+        *,
+        category: str | None = None,
+        scope: str | None = None,
+        keep_vector: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Search by a pre-computed vector — avoids re-encoding when the
+        caller already has the embedding (e.g. reflection dedup, where
+        the vector was just computed for the write)."""
+        if not vector:
+            return []
+        search = self._table.search(list(vector), vector_column_name="vector")
+        where = self._filters_clause(category, scope)
+        if where:
+            search = search.where(where)
+        results = search.limit(max(limit * SEARCH_OVERFETCH_MULTIPLIER, limit)).to_list()
+        return [
+            self._row_to_dict(r, distance=r.get("_distance"), keep_vector=keep_vector)
+            for r in results
+            if not _is_archived(r.get("metadata", ""))
+        ][:limit]
+
     def update(
         self,
         mem_id: str,

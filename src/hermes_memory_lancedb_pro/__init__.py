@@ -12,9 +12,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Pure-Python re-exports (safe — no heavy deps)
+# Reflection layer (PR 2). Pure-Python; the storage adapter delegates to
+# MemoryStore but only the orchestrator imports from `..store` lazily.
+from . import reflection  # noqa: F401
 from .batch_dedup import (  # noqa: F401
     BatchDedupResult,
     ExtractionCostStats,
@@ -149,4 +152,6 @@ __all__ = [
     "run_compaction",
     "should_run_compaction",
     "record_compaction_run",
+    # Reflection layer (subpackage)
+    "reflection",
 ]
