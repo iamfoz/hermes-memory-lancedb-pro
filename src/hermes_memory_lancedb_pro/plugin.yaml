@@ -1,5 +1,5 @@
 name: lancedb_pro
-version: 0.5.0
+version: 0.6.0
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 pip_dependencies:
   - lance
