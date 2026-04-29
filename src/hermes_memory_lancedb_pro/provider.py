@@ -58,6 +58,33 @@ def _load_memory_provider_base():
         return None
 
 
+def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
+    """Try to build a `SmartExtractor` with an env-detected LLM client.
+
+    Returns None when no LLM is configured (the env-detect helper finds
+    nothing) — sync_turn then falls back to legacy raw-turn writes. Any
+    exception is swallowed and reported via debug log; the provider must
+    NEVER fail to construct just because LLM detection went sideways."""
+    try:
+        from .llm_client import create_llm_client_from_env
+        from .smart_extractor import SmartExtractor
+    except ImportError as e:
+        logger.debug("lancedb_pro: smart_extractor unavailable: %s", e)
+        return None
+    try:
+        llm = create_llm_client_from_env()
+    except Exception as e:
+        logger.debug("lancedb_pro: LLM env-detect failed: %s", e)
+        return None
+    if llm is None:
+        return None
+    try:
+        return SmartExtractor(store, llm=llm)
+    except Exception as e:
+        logger.debug("lancedb_pro: SmartExtractor construction failed: %s", e)
+        return None
+
+
 def _format_recall(results: list[dict[str, Any]]) -> str:
     """Format a list of recall results into the text block hermes-agent
     injects under `<memory-context>`. Returns "" for an empty result so
@@ -114,6 +141,8 @@ def _build_provider_class():
             *,
             min_score: float | None = None,
             prefetch_limit: int = DEFAULT_PREFETCH_LIMIT,
+            smart_extractor: Any = None,
+            auto_smart_extraction: bool = True,
         ):
             self._store = store or MemoryStore.get_instance()
             self._retriever = retriever or MemoryRetriever(self._store)
@@ -125,6 +154,15 @@ def _build_provider_class():
             # "used" on the next sync_turn (i.e. only when we actually
             # forwarded the recall to the LLM and got a response back).
             self._pending_used_ids: dict[str, list[str]] = {}
+            # Smart extractor — optional. If the caller doesn't supply one,
+            # auto_smart_extraction tries to construct one from env vars
+            # (`MEMORY_EXTRACTION_*` overrides, then `OPENAI_API_KEY` /
+            # `ANTHROPIC_API_KEY`). When neither resolves, sync_turn falls
+            # back to writing raw user/assistant turns — the same shape this
+            # provider always wrote, so existing stores don't migrate.
+            self._smart_extractor = smart_extractor
+            if smart_extractor is None and auto_smart_extraction:
+                self._smart_extractor = _maybe_build_default_smart_extractor(self._store)
 
         # ---- ABC requirements --------------------------------------------
 
@@ -184,14 +222,55 @@ def _build_provider_class():
             """Persist a completed turn and credit the memories that were
             actually used. We tag each new entry with `source_session` so
             future recalls in this session can find them and other
-            sessions' recalls won't."""
+            sessions' recalls won't.
+
+            When a `smart_extractor` is configured, sync_turn delegates the
+            write to it (LLM-driven 6-category extraction). Otherwise we
+            fall back to writing raw user / assistant turns — same shape
+            this provider has always used."""
+            if self._smart_extractor is not None:
+                try:
+                    self._smart_extractor.extract_and_persist(
+                        user_content=user_content,
+                        assistant_content=assistant_content,
+                        session_key=session_id,
+                        scope="agent",
+                    )
+                except Exception as e:
+                    # The extractor's own pipeline catches per-candidate
+                    # errors; if the orchestrator itself blows up, fall
+                    # back to legacy raw writes so the turn still lands.
+                    logger.warning(
+                        "lancedb_pro smart_extractor sync_turn failed; "
+                        "falling back to raw writes: %s", e,
+                    )
+                    self._raw_sync_turn(user_content, assistant_content, session_id)
+            else:
+                self._raw_sync_turn(user_content, assistant_content, session_id)
+
+            # Credit the memories the model saw in its prefetch — bypasses
+            # the per-recall throttle because we now know they were actually
+            # injected into a turn.
+            used = self._pending_used_ids.pop(session_id, None) if session_id else None
+            if used:
+                try:
+                    self._store.mark_recall_used(used)
+                except Exception as e:
+                    logger.warning("lancedb_pro mark_recall_used failed: %s", e)
+
+        def _raw_sync_turn(
+            self,
+            user_content: str,
+            assistant_content: str,
+            session_id: str,
+        ) -> None:
+            """Legacy raw-turn write path. Used when no smart_extractor is
+            configured, or as a fail-safe if the extractor orchestrator
+            itself raises (per-candidate failures don't reach here)."""
             metadata_extra = (
                 {"source_session": session_id, "source": "agent_turn"}
                 if session_id else {"source": "agent_turn"}
             )
-
-            # Persist the user message and the assistant reply as two
-            # separate memories so each can be searched on its own merits.
             try:
                 if user_content and user_content.strip():
                     self._store.store(
@@ -215,16 +294,6 @@ def _build_provider_class():
                     )
             except Exception as e:
                 logger.warning("lancedb_pro sync_turn assistant write failed: %s", e)
-
-            # Credit the memories the model saw in its prefetch — bypasses
-            # the per-recall throttle because we now know they were actually
-            # injected into a turn.
-            used = self._pending_used_ids.pop(session_id, None) if session_id else None
-            if used:
-                try:
-                    self._store.mark_recall_used(used)
-                except Exception as e:
-                    logger.warning("lancedb_pro mark_recall_used failed: %s", e)
 
         # ---- Lifecycle ----------------------------------------------------
 
