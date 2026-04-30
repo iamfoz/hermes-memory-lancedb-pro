@@ -42,6 +42,7 @@ from .memory_categories import (
     SmartCategory,
     normalize_category,
 )
+from .reflection.retry import run_with_reflection_transient_retry_once
 from .temporal_classifier import classify_temporal, infer_expiry
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -101,6 +102,12 @@ class SmartExtractorConfig:
     legacy_user_importance: float = 0.4
     legacy_assistant_importance: float = 0.4
     legacy_category: str = "other"
+    # Max concurrent candidates to process (each does a vector search + LLM
+    # dedup call). Default 1 = serial, current behaviour. Setting > 1 cuts
+    # multi-candidate latency but adds threading complexity and may stress
+    # the upstream LLM endpoint. 4 is a reasonable upper bound for most
+    # APIs (rate limits, fairness with other tenants).
+    dedup_max_workers: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +265,34 @@ class SmartExtractor:
         """True iff smart extraction is active. False → legacy fallback."""
         return self._llm is not None
 
+    def _llm_complete_json_with_retry(
+        self,
+        prompt: str,
+        *,
+        label: str,
+    ) -> dict[str, Any] | None:
+        """Wrap the LLM's `complete_json` in `run_with_reflection_transient_retry_once`
+        so transient upstream blips (502 / connection reset / timeout) get one
+        retry with a 1-3s jittered delay. Non-transient errors (auth, quota,
+        content_policy) are NOT retried — bouncing those wastes quota.
+
+        Returns None on any unrecoverable failure (matching the contract of
+        the underlying `complete_json`)."""
+        if self._llm is None:
+            return None
+
+        def _call() -> dict[str, Any] | None:
+            assert self._llm is not None
+            return self._llm.complete_json(prompt, label=label)
+
+        try:
+            return run_with_reflection_transient_retry_once(_call)
+        except Exception as e:
+            logger.warning(
+                "smart-extractor: %s LLM call raised after retry: %s", label, e,
+            )
+            return None
+
     # -- main entry ------------------------------------------------------------
 
     def extract_and_persist(
@@ -382,22 +417,77 @@ class SmartExtractor:
         # Pre-compute vectors for non-profile candidates in a single batch
         precomputed = self._precompute_vectors(survivors)
 
-        for i, candidate in enumerate(survivors):
-            try:
-                self._process_candidate(
-                    candidate=candidate,
-                    conversation_text=conversation_text,
-                    session_key=session_key,
-                    stats=stats,
-                    target_scope=target_scope,
-                    scope_filter=scope_filter,
-                    precomputed_vector=precomputed.get(i),
-                )
-            except Exception as e:
-                logger.warning(
-                    "smart-extractor: failed to process candidate [%s] %s: %s",
-                    candidate.category, candidate.abstract[:60], e,
-                )
+        max_workers = max(1, int(self.config.dedup_max_workers))
+        if max_workers <= 1 or len(survivors) <= 1:
+            # Serial path — same behaviour as before.
+            for i, candidate in enumerate(survivors):
+                try:
+                    self._process_candidate(
+                        candidate=candidate,
+                        conversation_text=conversation_text,
+                        session_key=session_key,
+                        stats=stats,
+                        target_scope=target_scope,
+                        scope_filter=scope_filter,
+                        precomputed_vector=precomputed.get(i),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "smart-extractor: failed to process candidate [%s] %s: %s",
+                        candidate.category, candidate.abstract[:60], e,
+                    )
+        else:
+            # Concurrent path — bounded thread pool. Stats mutation is the
+            # only shared mutable state; serialise it under a Lock. LanceDB
+            # writes are tolerant of concurrent calls; the LLM endpoint may
+            # rate-limit but that's the caller's tune.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from threading import Lock
+            stats_lock = Lock()
+
+            # Wrap _process_candidate so it acquires the lock around the
+            # `stats` argument (the call mutates stats fields). This keeps
+            # the parallel work outside the critical section.
+            def _worker(i: int, candidate: CandidateMemory) -> None:
+                # Each worker owns a local stats deltas object.
+                local = ExtractionStats()
+                try:
+                    self._process_candidate(
+                        candidate=candidate,
+                        conversation_text=conversation_text,
+                        session_key=session_key,
+                        stats=local,
+                        target_scope=target_scope,
+                        scope_filter=scope_filter,
+                        precomputed_vector=precomputed.get(i),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "smart-extractor: failed to process candidate [%s] %s: %s",
+                        candidate.category, candidate.abstract[:60], e,
+                    )
+                with stats_lock:
+                    stats.created += local.created
+                    stats.merged += local.merged
+                    stats.skipped += local.skipped
+                    stats.rejected += local.rejected
+                    stats.supported += local.supported
+                    stats.superseded += local.superseded
+                    stats.boundary_skipped += local.boundary_skipped
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_worker, i, c)
+                    for i, c in enumerate(survivors)
+                ]
+                for fut in as_completed(futures):
+                    # Re-raise should not happen — _worker swallows; this
+                    # is a defensive guard for unexpected pool exceptions.
+                    exc = fut.exception()
+                    if exc is not None:
+                        logger.warning(
+                            "smart-extractor: worker raised: %s", exc,
+                        )
         return stats
 
     # -- step 1: LLM extraction ------------------------------------------------
@@ -412,11 +502,9 @@ class SmartExtractor:
         cleaned = strip_envelope_metadata(truncated)
 
         prompt = build_extraction_prompt(cleaned, self.config.user)
-        try:
-            result = self._llm.complete_json(prompt, label="extract-candidates")
-        except Exception as e:
-            logger.warning("smart-extractor: extraction LLM call raised: %s", e)
-            return []
+        result = self._llm_complete_json_with_retry(
+            prompt, label="extract-candidates",
+        )
         if not result:
             return []
         memories = result.get("memories")
@@ -691,11 +779,7 @@ class SmartExtractor:
         prompt = build_dedup_prompt(
             candidate.abstract, candidate.overview, candidate.content, existing,
         )
-        try:
-            data = self._llm.complete_json(prompt, label="dedup-decision")
-        except Exception as e:
-            logger.warning("smart-extractor: dedup LLM raised: %s", e)
-            return DedupResult(decision="create", reason=f"LLM raised: {e}")
+        data = self._llm_complete_json_with_retry(prompt, label="dedup-decision")
         if not data:
             return DedupResult(decision="create", reason="LLM returned no JSON")
 
@@ -821,11 +905,7 @@ class SmartExtractor:
             candidate.abstract, candidate.overview, candidate.content,
             candidate.category,
         )
-        try:
-            merged = self._llm.complete_json(prompt, label="merge-memory")
-        except Exception as e:
-            logger.warning("smart-extractor: merge LLM raised: %s", e)
-            merged = None
+        merged = self._llm_complete_json_with_retry(prompt, label="merge-memory")
         if not merged:
             return
 
