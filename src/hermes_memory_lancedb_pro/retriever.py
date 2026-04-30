@@ -73,6 +73,9 @@ class MemoryRetriever:
         # was shared across instances, causing surprising throttling when
         # tests or services held more than one retriever.
         self._lifecycle_call_count = 0
+        # Lazy: only constructed on first rerank call. Reuses connections
+        # across reranks (cheap latency win on repeated retrievals).
+        self._rerank_session: requests.Session | None = None
 
     # ----- public -----
 
@@ -334,29 +337,52 @@ class MemoryRetriever:
         if not any(documents):
             return results
 
-        try:
-            resp = requests.post(
-                LANGSEARCH_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": LANGSEARCH_MODEL,
-                    "query": query,
-                    "documents": documents,
-                    "top_n": min(top_n, candidate_count),
-                    "return_documents": False,
-                },
-                timeout=LANGSEARCH_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            logger.warning("LangSearch rerank request failed: %s", e)
-            return results
-        except ValueError as e:
-            logger.warning("LangSearch rerank returned non-JSON: %s", e)
+        if self._rerank_session is None:
+            self._rerank_session = requests.Session()
+            self._rerank_session.headers.update({
+                "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
+                "Content-Type": "application/json",
+            })
+
+        payload = {
+            "model": LANGSEARCH_MODEL,
+            "query": query,
+            "documents": documents,
+            "top_n": min(top_n, candidate_count),
+            "return_documents": False,
+        }
+
+        # One retry on 5xx — transient upstream blips shouldn't tank the
+        # whole rerank. Stops short of full backoff (we'd rather degrade
+        # to fusion-only ranking than block the user-facing recall path).
+        data = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._rerank_session.post(
+                    LANGSEARCH_BASE_URL,
+                    json=payload,
+                    timeout=LANGSEARCH_TIMEOUT,
+                )
+                if 500 <= resp.status_code < 600 and attempt == 0:
+                    last_err = Exception(f"5xx on rerank: {resp.status_code}")
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.RequestException as e:
+                last_err = e
+                # Retry only on connection-level errors on first attempt
+                if attempt == 0 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    continue
+                break
+            except ValueError as e:
+                last_err = e
+                break
+        if data is None:
+            if last_err is not None:
+                logger.warning("LangSearch rerank failed: %s", last_err)
             return results
 
         if isinstance(data, dict) and data.get("code") not in (None, 200):
