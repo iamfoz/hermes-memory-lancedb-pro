@@ -594,17 +594,25 @@ class MemoryStore:
         category: str | None = None,
         tier: str | None = None,
         metadata_extra: dict[str, Any] | None = None,
-    ) -> bool:
+    ) -> str | None:
         """Update an existing memory.
 
         If `text` is provided this uses the supersede pattern: the existing
         row is marked archived and a new row with a fresh UUID replaces it.
         Otherwise the existing row's columns and metadata are updated in-place.
 
-        Returns True if the memory was found and updated."""
+        Returns:
+            - the **new** memory ID after a supersede (text was changed)
+            - the **same** `mem_id` after a metadata-only update
+            - `None` if the memory wasn't found
+
+        The non-None return is always truthy, so existing callers that
+        used the result as a boolean (`if store.update(...)`) keep working.
+        Callers chaining the result (e.g. `new_id = store.update(id, text=...)`)
+        now get the actual new ID."""
         existing = self.get_by_id(mem_id)
         if existing is None:
-            return False
+            return None
 
         metadata = _parse_metadata(existing["metadata"])
         now_ms = int(time.time() * 1000)
@@ -646,7 +654,8 @@ class MemoryStore:
             where=f"id = '{_escape_sql(mem_id)}'",
             values=update_values,
         )
-        return True
+        # Metadata-only update keeps the same id
+        return mem_id
 
     def _supersede(
         self,
@@ -659,7 +668,7 @@ class MemoryStore:
         tier: str | None,
         metadata_extra: dict[str, Any] | None,
         now_ms: int,
-    ) -> bool:
+    ) -> str:
         text = _check_injection_guard(text, where="supersede")
         old_id = existing["id"]
         new_id = str(uuid.uuid4())
@@ -736,7 +745,7 @@ class MemoryStore:
             where=f"id = '{_escape_sql(old_id)}'",
             values={"metadata": json.dumps(archived_meta)},
         )
-        return True
+        return new_id
 
     def forget(self, mem_id: str) -> bool:
         """Hard-delete a memory by ID. Returns True if the memory existed."""
@@ -1254,6 +1263,12 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Convert a LanceDB row to a clean dictionary.
 
+        Every result gets a normalised `score` field (higher = better,
+        clamped to [0, 1] for vector / hybrid modes; raw for BM25). The
+        mode-specific raw signals (`_distance` for vector, `_score` for
+        BM25, `_rrf_score` for hybrid) are also preserved so advanced
+        callers can introspect them.
+
         Vectors are dropped by default — they're 768-dim floats that bloat
         downstream pipelines. Pass `keep_vector=True` (e.g. from MMR) to
         preserve them."""
@@ -1269,10 +1284,33 @@ class MemoryStore:
         }
         if keep_vector and "vector" in row:
             result["vector"] = row["vector"]
+
+        # Mode-specific raw signals
         if distance is not None:
             result["_distance"] = distance
         if score is not None:
             result["_score"] = score
         if "_rrf_score" in row:
             result["_rrf_score"] = row["_rrf_score"]
+
+        # Normalised user-facing `score` field — always higher-is-better,
+        # always present. Set whichever raw signal is most informative for
+        # this row. Hybrid takes precedence (most informative); then
+        # vector (cosine 1-distance); then BM25 raw.
+        if "_rrf_score" in result:
+            # RRF scores are typically 0..0.033 (1/(60+1)+1/(60+1)). Scale
+            # by 30 so a top RRF hit lands near 1.0; clamp to [0, 1].
+            result["score"] = max(0.0, min(1.0, float(result["_rrf_score"]) * 30.0))
+        elif distance is not None:
+            # Cosine distance: 0 = identical, ~1 = orthogonal. Normalised
+            # vectors give distances in [0, 2]; for relevant matches it's
+            # almost always 0..1.
+            result["score"] = max(0.0, min(1.0, 1.0 - float(distance)))
+        elif score is not None:
+            # BM25 raw — no clean normalisation. Scale by 10 (typical
+            # max for short FTS queries) and clamp; advanced callers
+            # should use `_score` directly.
+            result["score"] = max(0.0, min(1.0, float(score) / 10.0))
+        else:
+            result["score"] = 0.0
         return result

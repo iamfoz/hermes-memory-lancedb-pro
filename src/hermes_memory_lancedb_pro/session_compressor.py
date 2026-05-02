@@ -304,13 +304,25 @@ def compress_texts(
 # ---------------------------------------------------------------------------
 
 
-def estimate_conversation_value(texts: list[str]) -> float:
+def estimate_conversation_value(texts: list[str] | str | None) -> float:
     """
     Estimate the overall value of a conversation for memory extraction.
     Returns a number between 0.0 and 1.0.
 
     Used by the adaptive extraction throttle to skip low-value conversations.
+
+    Accepts a list of text turns; for convenience also accepts a single
+    string (treated as one turn) or None (treated as empty). Substantive
+    conversations always return at least a small positive baseline so the
+    throttle distinguishes them from empty/trivial input.
     """
+    # Defensive input coercion: callers in the wild sometimes pass a single
+    # string (a joined transcript) rather than a list of turns. Treat that
+    # as one turn rather than iterating its characters.
+    if texts is None:
+        return 0.0
+    if isinstance(texts, str):
+        texts = [texts] if texts.strip() else []
     if not texts:
         return 0.0
 
@@ -333,15 +345,30 @@ def estimate_conversation_value(texts: list[str]) -> float:
     if has_correction_or_decision:
         value += 0.3
 
-    # Total substantive text > 200 chars? +0.2
+    # Substantive content scoring: graduated rather than a single 200-char
+    # cliff. A typical troubleshooting exchange (300-600 chars) should
+    # comfortably clear the throttle floor; the previous threshold left
+    # such conversations stuck at 0.0 if they didn't trigger any of the
+    # pattern-based bumps.
     substantive_chars = sum(
         len(t) for t in texts if len(t.strip()) > 20
     )
-    if substantive_chars > 200:
+    if substantive_chars > 500:
+        value += 0.3
+    elif substantive_chars > 200:
         value += 0.2
+    elif substantive_chars > 100:
+        value += 0.15
 
     # Has multi-turn exchanges (>6 texts)? +0.1
     if len(texts) > 6:
         value += 0.1
+
+    # Baseline floor for any non-trivial conversation: anything with at
+    # least one substantive turn (> 20 chars stripped) gets a small
+    # positive value so the throttle treats it as "worth considering",
+    # even if no specific intent/tool/correction pattern fires.
+    if value == 0.0 and any(len(t.strip()) > 20 for t in texts):
+        value = 0.1
 
     return min(value, 1.0)

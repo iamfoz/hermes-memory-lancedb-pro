@@ -503,3 +503,53 @@ class TestEstimateConversationValue:
         texts = ["ok", "sure", "yeah"]
         value = estimate_conversation_value(texts)
         assert value == pytest.approx(0.0)
+
+    # --- post-deploy fixes (v0.9.0) ---
+
+    def test_string_input_is_coerced_to_single_turn(self):
+        # Defensive coercion: callers occasionally pass a joined transcript
+        # as a single string rather than a list. Should not crash and should
+        # not iterate the string as characters.
+        value = estimate_conversation_value(
+            "Please remember to use UK English in all my docs going forward."
+        )
+        # Memory-intent phrase fires → at least 0.5
+        assert value >= 0.5
+
+    def test_none_input_returns_zero(self):
+        assert estimate_conversation_value(None) == 0.0
+
+    def test_empty_string_returns_zero(self):
+        assert estimate_conversation_value("") == 0.0
+
+    def test_substantive_baseline_floor_for_real_conversation(self):
+        # A real-but-short troubleshooting exchange that doesn't trip
+        # any of the explicit signal patterns. Pre-fix this returned 0.0,
+        # which made the throttle skip extraction entirely. Post-fix it
+        # gets at least the substantive >100 char bump (+0.15).
+        texts = [
+            "The deployment failed with EADDRINUSE on port 8080.",
+            "I checked netstat and saw an old gunicorn worker still running.",
+            "Killed it and the redeploy went through cleanly.",
+        ]
+        value = estimate_conversation_value(texts)
+        assert value > 0.0, "substantive deployment troubleshooting should not score 0"
+        assert value >= 0.15
+
+    def test_substantive_500_chars_gets_higher_bump(self):
+        texts = ["x" * 110] * 6  # 660 chars > 500 → +0.3
+        value = estimate_conversation_value(texts)
+        assert value >= 0.3
+
+    def test_baseline_floor_for_single_substantive_turn(self):
+        # One non-trivial turn, no signal patterns, < 100 chars total
+        # substantive content. Pre-fix → 0.0; post-fix → 0.1 baseline.
+        texts = ["I sometimes use the alpine variant of the image."]
+        value = estimate_conversation_value(texts)
+        assert value >= 0.1
+
+    def test_baseline_does_not_apply_to_trivial_acks(self):
+        # All turns < 20 chars stripped → baseline floor must NOT fire.
+        texts = ["ok", "thanks", "got it"]
+        value = estimate_conversation_value(texts)
+        assert value == pytest.approx(0.0)

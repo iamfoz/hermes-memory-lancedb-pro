@@ -42,14 +42,70 @@ A production-grade memory store that gives Hermes Agent persistent, searchable r
 
 ### Install
 
+There are **two pieces** to a working install, and they live in different
+places. People sometimes confuse them — the actual code is **always** the
+pip-installed package; the path under `~/.hermes/plugins/` is just a small
+discovery shim that imports from the package.
+
+**1. Install the package itself** (this is where the code runs from):
+
 ```bash
-# As a regular package (recommended)
+# From a clone of this repo:
 pip install -e .
 
-# Or drop into your Hermes plugins directory:
-# ~/.hermes/plugins/lancedb_pro/
-# (dependencies still installed via pip; see pyproject.toml)
+# Or, once published, straight from PyPI:
+pip install hermes-memory-lancedb-pro
 ```
+
+**2. Add the discovery shim** so hermes-agent can find the provider:
+
+```bash
+mkdir -p ~/.hermes/plugins/lancedb_pro
+cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
+from hermes_memory_lancedb_pro.provider import (
+    LanceDBProMemoryProvider,
+    register_memory_provider,
+)
+__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+EOF
+```
+
+That's it. The shim is ~5 lines; all real logic lives in the pip package
+and gets updated whenever you `pip install -U`.
+
+#### Upgrading from pre-0.2 installs
+
+Earlier releases told users to clone the repo *into*
+`~/.hermes/plugins/lancedb_pro/`. If you did that, the directory still
+contains a stale full copy of the source. Replace it with the shim:
+
+```bash
+# Back up first if you've made local edits
+mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old
+
+# Install the current version as a pip package
+pip install -U hermes-memory-lancedb-pro   # or `pip install -e .` from a clone
+
+# Recreate the discovery shim (see step 2 above)
+mkdir -p ~/.hermes/plugins/lancedb_pro
+cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
+from hermes_memory_lancedb_pro.provider import (
+    LanceDBProMemoryProvider,
+    register_memory_provider,
+)
+__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+EOF
+```
+
+Verify which copy is actually loading:
+
+```bash
+python -c "import hermes_memory_lancedb_pro as m; print(m.__version__, m.__file__)"
+```
+
+If `__file__` points inside `~/.hermes/plugins/lancedb_pro/` and the
+version is old, the stale checkout is still shadowing the pip install —
+remove or rename that directory, then recreate the shim above.
 
 ### Initialise
 
@@ -100,6 +156,13 @@ results = store.search("concise responses", limit=5, mode="hybrid")  # default
 results = store.search("concise responses", limit=5, mode="vector")
 results = store.search("concise responses", limit=5, mode="bm25")
 
+# Each result has a normalised `score` field (0..1, higher = better)
+# regardless of mode. The raw mode-specific fields are also preserved
+# (`_rrf_score` for hybrid, `_distance` for vector, `_score` for bm25)
+# but use `score` for portable code:
+for r in results:
+    print(r["id"], r["score"], r["text"])
+
 # Session-scoped search — only memories from this session, plus
 # memories explicitly marked cross_session or core-tier (see below).
 results = store.search(
@@ -109,11 +172,15 @@ results = store.search(
     min_score=0.2,   # drop weak matches that would otherwise pollute context
 )
 
-# Update (supersede pattern — archives old, creates new)
-store.update(mem_id=mem_id, text="Updated text here.", tier="core")
+# Update (supersede pattern — archives old, creates new).
+# Returns the *new* memory ID after a text-changing supersede,
+# the *same* mem_id after a metadata-only update, or None if not found.
+new_id = store.update(mem_id=mem_id, text="Updated text here.", tier="core")
+assert store.has_id(new_id)
 
-# Or metadata-only — no re-embedding, no supersede
-store.update(mem_id=mem_id, importance=0.95, tier="core")
+# Metadata-only — no re-embedding, no supersede; returns the same id.
+same_id = store.update(mem_id=new_id, importance=0.95, tier="core")
+assert same_id == new_id
 
 # Delete
 store.forget(mem_id=mem_id)
@@ -546,7 +613,7 @@ Environment variables (all optional):
 | `MEMORY_MD`                    | `~/.hermes/memory/MEMORY.md`       | Seed file for `memory_init.sh`                                    |
 | `HERMES_PYTHON`                | auto-detected                      | Python interpreter for the init script                            |
 | `HF_TOKEN`                     | *(none)*                           | HuggingFace token (avoids rate limits on embedding model download) |
-| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables cross-encoder reranking in `MemoryRetriever`              |
+| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables cross-encoder reranking in `MemoryRetriever`. Unset → reranking is skipped silently. If the key is set but the API returns 401/403/429, reranking is disabled for the lifetime of the retriever (one warning, no log spam) and results fall back to fusion-only ranking. |
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
 | `MEMORY_TIER_EVAL_BATCH`       | `500`                              | Rows fetched per tier evaluation                                  |
