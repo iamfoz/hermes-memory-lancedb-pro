@@ -156,12 +156,15 @@ results = store.search("concise responses", limit=5, mode="hybrid")  # default
 results = store.search("concise responses", limit=5, mode="vector")
 results = store.search("concise responses", limit=5, mode="bm25")
 
-# Each result has a normalised `score` field (0..1, higher = better)
-# regardless of mode. The raw mode-specific fields are also preserved
-# (`_rrf_score` for hybrid, `_distance` for vector, `_score` for bm25)
-# but use `score` for portable code:
+# Every result has a portable `score` field (no underscore, 0..1, higher
+# is better) that's safe to use across all three search modes. Use this
+# for filtering/ranking in your own code:
 for r in results:
     print(r["id"], r["score"], r["text"])
+
+# Mode-specific raw fields prefixed with `_` (e.g. `_rrf_score`,
+# `_distance`, `_score`) are internal/debug-only and only set on the
+# mode that produced them. Don't rely on them — use `score` instead.
 
 # Session-scoped search — only memories from this session, plus
 # memories explicitly marked cross_session or core-tier (see below).
@@ -622,6 +625,38 @@ Environment variables (all optional):
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
+
+### LLM extraction (Smart Extractor)
+
+The LLM-driven Smart Extractor needs to know which provider to call. By
+default it falls back to `OPENAI_API_KEY` then `ANTHROPIC_API_KEY`, but
+you almost always want the dedicated `MEMORY_EXTRACTION_*` overrides so
+the extractor doesn't accidentally hit a different model than the agent.
+
+| Variable                     | Purpose                                                                                  |
+|------------------------------|------------------------------------------------------------------------------------------|
+| `MEMORY_EXTRACTION_API_KEY`  | API key for the extraction provider. Required to enable LLM extraction.                  |
+| `MEMORY_EXTRACTION_BASE_URL` | OpenAI-compatible base URL (e.g. `http://127.0.0.1:7883/v1` for jmunch).                 |
+| `MEMORY_EXTRACTION_MODEL`    | Model id (e.g. `Qwen3.6`, `gpt-4o-mini`, `claude-3-5-haiku-latest`).                     |
+| `MEMORY_EXTRACTION_PROVIDER` | `openai` (default, OpenAI-compatible) or `anthropic` (native Anthropic SDK).             |
+
+If you're routing through a local OpenAI-compatible proxy like
+[**jmunch**](https://github.com/) — which is the recommended setup
+when hermes-agent is configured with a `custom_providers` entry — point
+the extractor at the same proxy:
+
+```bash
+# ~/.hermes/.env
+MEMORY_EXTRACTION_PROVIDER=openai
+MEMORY_EXTRACTION_BASE_URL=http://127.0.0.1:7883/v1
+MEMORY_EXTRACTION_MODEL=Qwen3.6
+MEMORY_EXTRACTION_API_KEY=local        # jmunch usually ignores the value
+```
+
+Without `MEMORY_EXTRACTION_*` set the extractor falls back to whichever
+of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` it finds first; if neither is
+set, extraction is disabled and writes go in raw (the rest of the
+pipeline still works — decay, dedup, search etc.).
 
 ## Scripts
 
