@@ -8,10 +8,22 @@ Architecture from CortexReach memory-lancedb-pro:
      - Length normalisation
      - Hard min score filter (BEFORE decay)
      - Composite decay scoring (Weibull)
-  4. Optional cross-encoder reranking (LangSearch API)
+  4. Optional cross-encoder reranking (LangSearch or Google Ranking API)
   5. MMR diversity demotion
   6. BM25 ghost entry protection via store.check_ids()
   7. Lifecycle hooks: access count increment + tier evaluation on recall
+
+Reranker selection
+------------------
+Set ``MEMORY_RERANKER`` to choose explicitly:
+
+  - ``langsearch``  — LangSearch cross-encoder (requires LANGSEARCH_API_KEY)
+  - ``google``      — Google Discovery Engine Ranking API (requires
+                      GOOGLE_API_KEY + GOOGLE_CLOUD_PROJECT)
+  - ``disabled``    — skip reranking entirely
+  - ``auto``        — (default) choose the one whose keys are present;
+                      if both are configured, log a warning and disable
+                      until the user sets MEMORY_RERANKER explicitly.
 """
 
 from __future__ import annotations
@@ -35,12 +47,103 @@ from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
-# LangSearch reranking API config
+# ---------------------------------------------------------------------------
+# LangSearch config
+# ---------------------------------------------------------------------------
 LANGSEARCH_API_KEY = os.environ.get("LANGSEARCH_API_KEY", "")
 LANGSEARCH_BASE_URL = "https://api.langsearch.com/v1/rerank"
 LANGSEARCH_MODEL = "langsearch-reranker-v1"
 LANGSEARCH_MAX_DOCS = 50  # API limit per request
 LANGSEARCH_TIMEOUT = 15   # seconds
+
+# ---------------------------------------------------------------------------
+# Google Discovery Engine Ranking API config
+# ---------------------------------------------------------------------------
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+# Project ID is required in the URL. Accept the three common env var names.
+GOOGLE_CLOUD_PROJECT: str = (
+    os.environ.get("GOOGLE_CLOUD_PROJECT")
+    or os.environ.get("GOOGLE_PROJECT_ID")
+    or os.environ.get("GOOGLE_PROJECT")
+    or ""
+)
+# Model name. "semantic-ranker-512@latest" is the current GA model.
+GOOGLE_RANKING_MODEL = os.environ.get(
+    "MEMORY_GOOGLE_RANKING_MODEL", "semantic-ranker-512@latest"
+)
+GOOGLE_RANKING_MAX_DOCS = 200   # API limit per request
+GOOGLE_RANKING_TIMEOUT = 15     # seconds
+
+# ---------------------------------------------------------------------------
+# Reranker selection
+# ---------------------------------------------------------------------------
+
+def _resolve_reranker() -> str:
+    """
+    Determine which reranker backend to activate.
+
+    Returns ``"langsearch"``, ``"google"``, or ``""`` (disabled).
+    Called once at import time so the decision is logged early and doesn't
+    repeat on every recall.
+    """
+    setting = os.environ.get("MEMORY_RERANKER", "auto").strip().lower()
+
+    have_langsearch = bool(LANGSEARCH_API_KEY)
+    # Google reranking needs both key AND project — the key alone isn't enough
+    # because the project ID appears in the request URL.
+    have_google = bool(GOOGLE_API_KEY and GOOGLE_CLOUD_PROJECT)
+
+    if setting == "disabled":
+        return ""
+
+    if setting == "langsearch":
+        if not have_langsearch:
+            logger.warning(
+                "MEMORY_RERANKER=langsearch but LANGSEARCH_API_KEY is not set; "
+                "reranking disabled."
+            )
+            return ""
+        return "langsearch"
+
+    if setting == "google":
+        if not have_google:
+            missing = []
+            if not GOOGLE_API_KEY:
+                missing.append("GOOGLE_API_KEY")
+            if not GOOGLE_CLOUD_PROJECT:
+                missing.append("GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID)")
+            logger.warning(
+                "MEMORY_RERANKER=google but %s not set; reranking disabled.",
+                " and ".join(missing),
+            )
+            return ""
+        return "google"
+
+    # auto — pick the one available; warn if ambiguous.
+    if have_langsearch and have_google:
+        logger.warning(
+            "Both LANGSEARCH_API_KEY and GOOGLE_API_KEY+GOOGLE_CLOUD_PROJECT are "
+            "set. Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
+            "choose one. Reranking is disabled until configured."
+        )
+        return ""
+    if have_langsearch:
+        logger.info("Reranker: LangSearch (auto-selected, LANGSEARCH_API_KEY found)")
+        return "langsearch"
+    if have_google:
+        logger.info("Reranker: Google Ranking API (auto-selected, GOOGLE_API_KEY+project found)")
+        return "google"
+
+    # Neither key is present — no reranking, no log noise.
+    return ""
+
+
+# Resolved once at import — changing env vars at runtime requires a restart.
+ACTIVE_RERANKER: str = _resolve_reranker()
+
+# ---------------------------------------------------------------------------
+# Other tuning constants
+# ---------------------------------------------------------------------------
 
 # Tier evaluation throttle: full-store tier evaluation happens every Nth recall.
 TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
@@ -73,14 +176,15 @@ class MemoryRetriever:
         # was shared across instances, causing surprising throttling when
         # tests or services held more than one retriever.
         self._lifecycle_call_count = 0
-        # Lazy: only constructed on first rerank call. Reuses connections
-        # across reranks (cheap latency win on repeated retrievals).
-        self._rerank_session: requests.Session | None = None
-        # Set to True when we hit a persistent auth/rate-limit error from
-        # LangSearch (401/403/429). Once tripped, we skip the rerank call
-        # for the rest of this retriever's lifetime so we don't spam the
-        # API or the logs. Cleared only by re-instantiating the retriever.
-        self._rerank_disabled: bool = False
+
+        # One requests.Session per backend, created lazily.
+        self._langsearch_session: requests.Session | None = None
+        self._google_session: requests.Session | None = None
+
+        # Per-backend kill-switch: tripped on persistent 401/403/429 so we
+        # log once and stop hammering the API for the retriever's lifetime.
+        self._langsearch_disabled: bool = False
+        self._google_disabled: bool = False
 
     # ----- public -----
 
@@ -317,7 +421,24 @@ class MemoryRetriever:
             except Exception as e:
                 logger.warning("Tier update for %s failed: %s", mem_id, e)
 
+    # ----- reranking dispatcher -----
+
     def _rerank(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Dispatch to the active reranker backend, or return results unchanged."""
+        if ACTIVE_RERANKER == "langsearch":
+            return self._rerank_langsearch(query, results, top_n)
+        if ACTIVE_RERANKER == "google":
+            return self._rerank_google(query, results, top_n)
+        return results
+
+    # ----- LangSearch backend -----
+
+    def _rerank_langsearch(
         self,
         query: str,
         results: list[dict[str, Any]],
@@ -325,12 +446,11 @@ class MemoryRetriever:
     ) -> list[dict[str, Any]]:
         """Cross-encoder reranking via LangSearch.
 
-        Reranks the top `min(top_n*3, LANGSEARCH_MAX_DOCS)` candidates and
+        Reranks the top ``min(top_n*3, LANGSEARCH_MAX_DOCS)`` candidates and
         carries the un-reranked tail forward unchanged. Uses a fail-soft
-        approach: any error returns the input list unmutated."""
-        if not LANGSEARCH_API_KEY:
-            return results
-        if self._rerank_disabled:
+        approach: any error returns the input list unmutated.
+        """
+        if self._langsearch_disabled:
             return results
         if len(results) <= 1:
             return results
@@ -344,9 +464,9 @@ class MemoryRetriever:
         if not any(documents):
             return results
 
-        if self._rerank_session is None:
-            self._rerank_session = requests.Session()
-            self._rerank_session.headers.update({
+        if self._langsearch_session is None:
+            self._langsearch_session = requests.Session()
+            self._langsearch_session.headers.update({
                 "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
                 "Content-Type": "application/json",
             })
@@ -359,23 +479,17 @@ class MemoryRetriever:
             "return_documents": False,
         }
 
-        # One retry on 5xx — transient upstream blips shouldn't tank the
-        # whole rerank. Stops short of full backoff (we'd rather degrade
-        # to fusion-only ranking than block the user-facing recall path).
         data = None
         last_err: Exception | None = None
         for attempt in range(2):
             try:
-                resp = self._rerank_session.post(
+                resp = self._langsearch_session.post(
                     LANGSEARCH_BASE_URL,
                     json=payload,
                     timeout=LANGSEARCH_TIMEOUT,
                 )
-                # Persistent auth or rate-limit failures: trip the disable
-                # flag so subsequent calls short-circuit. A bad/exhausted
-                # API key shouldn't spam the API or the logs forever.
                 if resp.status_code in (401, 403, 429):
-                    self._rerank_disabled = True
+                    self._langsearch_disabled = True
                     logger.warning(
                         "LangSearch rerank disabled for this session "
                         "(HTTP %d). Check LANGSEARCH_API_KEY or quota. "
@@ -392,13 +506,13 @@ class MemoryRetriever:
                 break
             except requests.RequestException as e:
                 last_err = e
-                # Retry only on connection-level errors on first attempt
                 if attempt == 0 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
                     continue
                 break
             except ValueError as e:
                 last_err = e
                 break
+
         if data is None:
             if last_err is not None:
                 logger.warning("LangSearch rerank failed: %s", last_err)
@@ -415,7 +529,7 @@ class MemoryRetriever:
         if not lang_results:
             return results
 
-        # Map: candidate index -> relevance_score
+        # Map: candidate index → relevance_score
         score_map: dict[int, float] = {}
         for item in lang_results:
             idx = item.get("index")
@@ -425,20 +539,170 @@ class MemoryRetriever:
         if not score_map:
             return results
 
-        # If the API returns scores for only a subset, blend the missing ones
-        # against their existing _final_score (un-reranked) so the final list
-        # remains on a comparable scale. Without this, blended and raw scores
-        # mix and the sort becomes incoherent.
+        return self._apply_rerank_scores(candidates, results, candidate_count, score_map)
+
+    # ----- Google Ranking API backend -----
+
+    def _rerank_google(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Cross-encoder reranking via Google Discovery Engine Ranking API.
+
+        Uses the ``semantic-ranker-512@latest`` model (configurable via
+        ``MEMORY_GOOGLE_RANKING_MODEL``).  Requires ``GOOGLE_API_KEY`` and
+        ``GOOGLE_CLOUD_PROJECT`` (or ``GOOGLE_PROJECT_ID``).
+
+        Pricing: first 1,000 queries / month are free; thereafter ~$0.001 /
+        query — substantially cheaper than most LLM-based reranking options.
+        """
+        if self._google_disabled:
+            return results
+        if len(results) <= 1:
+            return results
+
+        candidate_count = min(top_n * 3, GOOGLE_RANKING_MAX_DOCS, len(results))
+        if candidate_count <= 1:
+            return results
+
+        candidates = results[:candidate_count]
+        if not any(c.get("text") for c in candidates):
+            return results
+
+        if self._google_session is None:
+            self._google_session = requests.Session()
+            self._google_session.headers.update({
+                "x-goog-api-key": GOOGLE_API_KEY,
+                "Content-Type": "application/json",
+            })
+
+        # Records use string ids "0".."N-1" — Google returns them back by id
+        # so we can map score → candidate position without relying on ordering.
+        records = [
+            {"id": str(i), "content": str(c.get("text", "") or "")}
+            for i, c in enumerate(candidates)
+        ]
+        payload = {
+            "model": GOOGLE_RANKING_MODEL,
+            # Ask for ALL candidates so we can re-score the full set.
+            # topN < candidate_count would silently drop records we need
+            # to penalise in the blend step.
+            "topN": candidate_count,
+            "query": query,
+            "records": records,
+        }
+        url = (
+            f"https://discoveryengine.googleapis.com/v1/projects/{GOOGLE_CLOUD_PROJECT}"
+            f"/locations/global/rankingConfigs/default_ranking_config:rank"
+        )
+
+        data = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._google_session.post(
+                    url,
+                    json=payload,
+                    timeout=GOOGLE_RANKING_TIMEOUT,
+                )
+                if resp.status_code in (401, 403, 429):
+                    self._google_disabled = True
+                    logger.warning(
+                        "Google rerank disabled for this session "
+                        "(HTTP %d). Check GOOGLE_API_KEY / GOOGLE_CLOUD_PROJECT "
+                        "or quota. Falling back to fusion-only ranking.",
+                        resp.status_code,
+                    )
+                    return results
+                if resp.status_code == 404:
+                    # Almost always means the project ID or API isn't enabled.
+                    self._google_disabled = True
+                    logger.warning(
+                        "Google rerank got 404. Ensure the Discovery Engine API "
+                        "is enabled for project %r and GOOGLE_CLOUD_PROJECT is "
+                        "correct. Falling back to fusion-only ranking.",
+                        GOOGLE_CLOUD_PROJECT,
+                    )
+                    return results
+                if 500 <= resp.status_code < 600 and attempt == 0:
+                    last_err = Exception(f"5xx on Google rerank: {resp.status_code}")
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.RequestException as e:
+                last_err = e
+                if attempt == 0 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    continue
+                break
+            except ValueError as e:
+                last_err = e
+                break
+
+        if data is None:
+            if last_err is not None:
+                logger.warning("Google rerank failed: %s", last_err)
+            return results
+
+        google_records = (data or {}).get("records") or []
+        if not google_records:
+            return results
+
+        # Map: candidate index (int) → relevance_score (float)
+        # Google returns records by our string id — parse back to int.
+        score_map: dict[int, float] = {}
+        for rec in google_records:
+            try:
+                idx = int(rec["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            score = rec.get("relevanceScore")
+            if isinstance(score, (int, float)):
+                score_map[idx] = float(score)
+        if not score_map:
+            return results
+
+        # Google relevanceScore is in [0, 1] but tends to cluster in a narrower
+        # band. Normalise within the returned batch so the blend step operates
+        # on the same scale as LangSearch scores.
+        if score_map:
+            max_s = max(score_map.values())
+            min_s = min(score_map.values())
+            span = max_s - min_s
+            if span > 0:
+                score_map = {k: (v - min_s) / span for k, v in score_map.items()}
+
+        return self._apply_rerank_scores(candidates, results, candidate_count, score_map)
+
+    # ----- shared rerank blend logic -----
+
+    @staticmethod
+    def _apply_rerank_scores(
+        candidates: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        candidate_count: int,
+        score_map: dict[int, float],
+    ) -> list[dict[str, Any]]:
+        """
+        Blend reranker scores into ``_final_score`` and re-sort.
+
+        ``score_map`` maps candidate list index → normalised relevance score.
+        Candidates without a score entry (reranker dropped them) are penalised.
+        The tail of ``results`` beyond ``candidate_count`` is preserved
+        unchanged.
+        """
         for i, entry in enumerate(candidates):
             existing = float(entry.get("_final_score", 0.0))
             if i in score_map:
                 rerank = score_map[i]
                 entry["_rerank_score"] = rerank
-                # 70% rerank, 30% scoring pipeline
+                # 70% rerank signal, 30% scoring-pipeline signal
                 entry["_final_score"] = 0.7 * rerank + 0.3 * existing
             else:
-                # Penalise candidates the reranker dropped — they made it to
-                # the API but didn't earn a relevance score.
+                # Penalise candidates the reranker didn't score.
                 entry["_final_score"] = 0.3 * existing
                 entry["_rerank_score"] = 0.0
 
