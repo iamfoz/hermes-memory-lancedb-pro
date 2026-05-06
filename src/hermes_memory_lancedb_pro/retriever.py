@@ -24,6 +24,17 @@ Set ``MEMORY_RERANKER`` to choose explicitly:
   - ``auto``        — (default) choose the one whose keys are present;
                       if both are configured, log a warning and disable
                       until the user sets MEMORY_RERANKER explicitly.
+
+Env-var timing note
+-------------------
+API keys are read inside ``MemoryRetriever.__init__``, not at module-import
+time.  This is intentional: hermes-agent (and many other hosts) load
+``~/.hermes/.env`` into ``os.environ`` *after* Python imports the plugin
+modules, so a module-level ``os.environ.get("GOOGLE_API_KEY")`` would
+always return ``""`` even when the key is present in the file.  By
+deferring to ``__init__`` — which is called at provider-instantiation time,
+well after dotenv loading — the retriever always sees the fully-populated
+environment.
 """
 
 from __future__ import annotations
@@ -48,110 +59,29 @@ from .store import MemoryStore
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# LangSearch config
+# Static config — safe at module level because these never come from .env
 # ---------------------------------------------------------------------------
-LANGSEARCH_API_KEY = os.environ.get("LANGSEARCH_API_KEY", "")
+
 LANGSEARCH_BASE_URL = "https://api.langsearch.com/v1/rerank"
 LANGSEARCH_MODEL = "langsearch-reranker-v1"
-LANGSEARCH_MAX_DOCS = 50  # API limit per request
-LANGSEARCH_TIMEOUT = 15   # seconds
+LANGSEARCH_MAX_DOCS = 50   # API limit per request
+LANGSEARCH_TIMEOUT = 15    # seconds
 
-# ---------------------------------------------------------------------------
-# Google Discovery Engine Ranking API config
-# ---------------------------------------------------------------------------
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-# Project ID is required in the URL. Accept the three common env var names.
-GOOGLE_CLOUD_PROJECT: str = (
-    os.environ.get("GOOGLE_CLOUD_PROJECT")
-    or os.environ.get("GOOGLE_PROJECT_ID")
-    or os.environ.get("GOOGLE_PROJECT")
-    or ""
-)
-# Model name. "semantic-ranker-512@latest" is the current GA model.
-GOOGLE_RANKING_MODEL = os.environ.get(
-    "MEMORY_GOOGLE_RANKING_MODEL", "semantic-ranker-512@latest"
+GOOGLE_RANKING_BASE_URL = (
+    "https://discoveryengine.googleapis.com/v1/projects/{project}"
+    "/locations/global/rankingConfigs/default_ranking_config:rank"
 )
 GOOGLE_RANKING_MAX_DOCS = 200   # API limit per request
 GOOGLE_RANKING_TIMEOUT = 15     # seconds
 
 # ---------------------------------------------------------------------------
-# Reranker selection
+# Tuning constants — these are non-secret; reading at import is fine because
+# they're set in the system environment, not in the user's .env file, and
+# their defaults are always usable even if the env var isn't present yet.
 # ---------------------------------------------------------------------------
 
-def _resolve_reranker() -> str:
-    """
-    Determine which reranker backend to activate.
-
-    Returns ``"langsearch"``, ``"google"``, or ``""`` (disabled).
-    Called once at import time so the decision is logged early and doesn't
-    repeat on every recall.
-    """
-    setting = os.environ.get("MEMORY_RERANKER", "auto").strip().lower()
-
-    have_langsearch = bool(LANGSEARCH_API_KEY)
-    # Google reranking needs both key AND project — the key alone isn't enough
-    # because the project ID appears in the request URL.
-    have_google = bool(GOOGLE_API_KEY and GOOGLE_CLOUD_PROJECT)
-
-    if setting == "disabled":
-        return ""
-
-    if setting == "langsearch":
-        if not have_langsearch:
-            logger.warning(
-                "MEMORY_RERANKER=langsearch but LANGSEARCH_API_KEY is not set; "
-                "reranking disabled."
-            )
-            return ""
-        return "langsearch"
-
-    if setting == "google":
-        if not have_google:
-            missing = []
-            if not GOOGLE_API_KEY:
-                missing.append("GOOGLE_API_KEY")
-            if not GOOGLE_CLOUD_PROJECT:
-                missing.append("GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID)")
-            logger.warning(
-                "MEMORY_RERANKER=google but %s not set; reranking disabled.",
-                " and ".join(missing),
-            )
-            return ""
-        return "google"
-
-    # auto — pick the one available; warn if ambiguous.
-    if have_langsearch and have_google:
-        logger.warning(
-            "Both LANGSEARCH_API_KEY and GOOGLE_API_KEY+GOOGLE_CLOUD_PROJECT are "
-            "set. Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
-            "choose one. Reranking is disabled until configured."
-        )
-        return ""
-    if have_langsearch:
-        logger.info("Reranker: LangSearch (auto-selected, LANGSEARCH_API_KEY found)")
-        return "langsearch"
-    if have_google:
-        logger.info("Reranker: Google Ranking API (auto-selected, GOOGLE_API_KEY+project found)")
-        return "google"
-
-    # Neither key is present — no reranking, no log noise.
-    return ""
-
-
-# Resolved once at import — changing env vars at runtime requires a restart.
-ACTIVE_RERANKER: str = _resolve_reranker()
-
-# ---------------------------------------------------------------------------
-# Other tuning constants
-# ---------------------------------------------------------------------------
-
-# Tier evaluation throttle: full-store tier evaluation happens every Nth recall.
 TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
 TIER_EVAL_BATCH = int(os.environ.get("MEMORY_TIER_EVAL_BATCH", "500"))
-
-# Default minimum final score for a recall to be returned. Set lower with
-# `min_score=...` per-call. The default is conservative; relaxing it is
-# the main lever for tuning recall recall vs precision.
 DEFAULT_MIN_RECALL_SCORE: float = float(
     os.environ.get("MEMORY_MIN_RECALL_SCORE", "0.0")
 )
@@ -172,17 +102,45 @@ class MemoryRetriever:
     def __init__(self, store: MemoryStore):
         self.store = store
         self.scoring = ScoringPipeline()
-        # Per-instance throttle counter — the previous class-level counter
-        # was shared across instances, causing surprising throttling when
-        # tests or services held more than one retriever.
         self._lifecycle_call_count = 0
 
-        # One requests.Session per backend, created lazily.
+        # -----------------------------------------------------------------
+        # Read API keys HERE, not at module level.
+        #
+        # hermes-agent loads ~/.hermes/.env into os.environ during startup,
+        # AFTER Python has already imported all plugin modules.  Reading keys
+        # at module level (e.g. at the top of this file) means they're always
+        # empty because the import runs before dotenv loading.
+        #
+        # MemoryRetriever.__init__ is called when the provider is
+        # instantiated, which happens after dotenv loading, so by this point
+        # os.environ is fully populated.
+        # -----------------------------------------------------------------
+        self._langsearch_api_key: str = os.environ.get("LANGSEARCH_API_KEY", "")
+        self._google_api_key: str = os.environ.get("GOOGLE_API_KEY", "")
+        self._google_cloud_project: str = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GOOGLE_PROJECT_ID")
+            or os.environ.get("GOOGLE_PROJECT")
+            or ""
+        )
+        self._google_ranking_model: str = os.environ.get(
+            "MEMORY_GOOGLE_RANKING_MODEL", "semantic-ranker-512@latest"
+        )
+
+        # Resolve which backend to use (logs once, here at construction time)
+        self._active_reranker: str = self._resolve_reranker(
+            langsearch_key=self._langsearch_api_key,
+            google_key=self._google_api_key,
+            google_project=self._google_cloud_project,
+            setting=os.environ.get("MEMORY_RERANKER", "auto").strip().lower(),
+        )
+
+        # One requests.Session per backend, created lazily on first use
         self._langsearch_session: requests.Session | None = None
         self._google_session: requests.Session | None = None
 
-        # Per-backend kill-switch: tripped on persistent 401/403/429 so we
-        # log once and stop hammering the API for the retriever's lifetime.
+        # Per-backend kill-switch: tripped on persistent 401/403/429
         self._langsearch_disabled: bool = False
         self._google_disabled: bool = False
 
@@ -208,14 +166,11 @@ class MemoryRetriever:
             source: "manual" / "auto-recall" / "cli" — drives the recall
                 lifecycle hooks. Use "cli" to skip access-count bumps.
             session_id: when set, results are restricted to memories whose
-                `metadata.source_session` matches this id, plus memories
-                explicitly flagged `cross_session` or living in the core
-                tier. This is the key knob for fixing "sticky" memory:
-                without it, recall surfaces top-N results from any prior
-                session that happens to be semantically near the bare user
-                message, even when the user has clearly pivoted topic.
+                ``metadata.source_session`` matches this id, plus memories
+                explicitly flagged ``cross_session`` or living in the core
+                tier.
             min_score: drop final results below this threshold. Defaults to
-                `DEFAULT_MIN_RECALL_SCORE` (env MEMORY_MIN_RECALL_SCORE).
+                ``DEFAULT_MIN_RECALL_SCORE`` (env ``MEMORY_MIN_RECALL_SCORE``).
         """
         if not query or not query.strip():
             return []
@@ -256,26 +211,87 @@ class MemoryRetriever:
         scored_tuples = [(e, float(e.get("_final_score", 0.0))) for e in scored]
         diverse = mmr_diversity_filter(scored_tuples, similarity_threshold=0.85)
         scored = [e for e, score in diverse]
-        # propagate the MMR-adjusted score back onto the entry
         for entry, score in diverse:
             entry["_mmr_score"] = score
 
-        # 7. Apply min_score gate — drop weak matches that the LLM would
-        # otherwise treat as relevant context. This is the second key
-        # stickiness lever (after session_id): a query that has no real
-        # answer in the store should return [], not the top-N regardless.
+        # 7. Apply min_score gate
         if min_score and min_score > 0.0:
             scored = [
                 e for e in scored
                 if float(e.get("_final_score", 0.0)) >= min_score
             ]
 
-        # 8. Lifecycle hooks — increment access count (throttled), tier eval.
-        # Only bumps the count for memories actually returned to the caller.
+        # 8. Lifecycle hooks
         if source in ("manual", "auto-recall"):
             self._run_recall_lifecycle(scored[:limit])
 
         return scored[:limit]
+
+    # ----- reranker resolution -----
+
+    @staticmethod
+    def _resolve_reranker(
+        *,
+        langsearch_key: str,
+        google_key: str,
+        google_project: str,
+        setting: str,
+    ) -> str:
+        """
+        Choose which reranker backend to activate.
+
+        Returns ``"langsearch"``, ``"google"``, or ``""`` (disabled).
+
+        Accepts the key values and the ``MEMORY_RERANKER`` setting as
+        explicit arguments rather than reading ``os.environ`` directly, so
+        that tests can call it without environment manipulation.
+        """
+        have_langsearch = bool(langsearch_key)
+        # Google requires BOTH key AND project (project appears in the URL)
+        have_google = bool(google_key and google_project)
+
+        if setting == "disabled":
+            return ""
+
+        if setting == "langsearch":
+            if not have_langsearch:
+                logger.warning(
+                    "MEMORY_RERANKER=langsearch but LANGSEARCH_API_KEY is not set; "
+                    "reranking disabled."
+                )
+                return ""
+            return "langsearch"
+
+        if setting == "google":
+            if not have_google:
+                missing = []
+                if not google_key:
+                    missing.append("GOOGLE_API_KEY")
+                if not google_project:
+                    missing.append("GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID)")
+                logger.warning(
+                    "MEMORY_RERANKER=google but %s not set; reranking disabled.",
+                    " and ".join(missing),
+                )
+                return ""
+            return "google"
+
+        # auto — pick the configured one; warn if ambiguous
+        if have_langsearch and have_google:
+            logger.warning(
+                "Both LANGSEARCH_API_KEY and GOOGLE_API_KEY+GOOGLE_CLOUD_PROJECT are "
+                "set. Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
+                "choose one. Reranking is disabled until configured."
+            )
+            return ""
+        if have_langsearch:
+            logger.info("Reranker: LangSearch (auto-selected, LANGSEARCH_API_KEY found)")
+            return "langsearch"
+        if have_google:
+            logger.info("Reranker: Google Ranking API (auto-selected)")
+            return "google"
+
+        return ""
 
     # ----- helpers -----
 
@@ -284,8 +300,7 @@ class MemoryRetriever:
         bm25_results: list[dict[str, Any]],
         vector_results: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Drop BM25-only hits that don't exist (or are archived) in the
-        store. Uses a single batch call to `check_ids` to avoid N+1 lookups."""
+        """Drop BM25-only hits that don't exist (or are archived) in the store."""
         vector_ids = {r["id"] for r in vector_results}
         bm25_only_ids = [
             entry["id"] for entry in bm25_results if entry["id"] not in vector_ids
@@ -303,24 +318,16 @@ class MemoryRetriever:
         vector_results: list[dict[str, Any]],
         bm25_results: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Vector-score-dominant fusion with BM25 confirmation bonus.
-
-        - Vector hits: fusion_score = 1 - normalised_distance
-        - Confirmation bonus when also in BM25 results
-        - Pure BM25 hits: lower base, with a preservation floor for
-          high-importance entries to survive subsequent reranking
-        """
+        """Vector-score-dominant fusion with BM25 confirmation bonus."""
         vector_map = {r["id"]: r for r in vector_results}
         vector_ranks = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
         bm25_map = {r["id"]: r for r in bm25_results}
         bm25_ranks = {r["id"]: i + 1 for i, r in enumerate(bm25_results)}
 
-        # Ordered union: vector first, then BM25-only
         ordered_ids = list(vector_map.keys()) + [
             mid for mid in bm25_map if mid not in vector_map
         ]
 
-        # Normalise vector distances to [0, 1] across this batch
         vector_dists = [r.get("_distance", 0.0) for r in vector_results]
         max_dist = max(vector_dists) if vector_dists else 1.0
         min_dist = min(vector_dists) if vector_dists else 0.0
@@ -346,9 +353,6 @@ class MemoryRetriever:
             else:
                 bm25_rank = bm25_ranks[mid]
                 fusion_score = 0.15 / (1 + math.log1p(bm25_rank))
-                # Importance preservation floor — read from the top-level
-                # column (the previous version read metadata.importance,
-                # which was always missing → defaulted to 0.5).
                 importance = self._extract_importance(entry)
                 if importance >= 0.8:
                     fusion_score = max(fusion_score, 0.12)
@@ -375,19 +379,9 @@ class MemoryRetriever:
             return 0.5
 
     def _run_recall_lifecycle(self, results: list[dict[str, Any]]) -> None:
-        """
-        Lifecycle hooks after recall (per CortexReach spec):
-          1. Increment access count for each recalled item
-          2. Update last_accessed_at
-          3. Periodically re-evaluate tier promotions/demotions
-
-        The full-store tier evaluation runs only every TIER_EVAL_FREQUENCY
-        recalls — without throttling, every search triggers hundreds of DB
-        operations and dominates request latency.
-        """
+        """Lifecycle hooks after recall: access-count increment + tier eval."""
         self._lifecycle_call_count += 1
 
-        # Always increment access counts — cheap per-item write
         for entry in results:
             mem_id = entry.get("id")
             if mem_id:
@@ -402,8 +396,6 @@ class MemoryRetriever:
             return
 
         try:
-            # list_memories now filters archived rows by default — tier
-            # evaluation only fires on the active pool.
             all_memories = self.store.list_memories(limit=TIER_EVAL_BATCH)
         except Exception as e:
             logger.warning("Tier eval list_memories failed: %s", e)
@@ -430,9 +422,9 @@ class MemoryRetriever:
         top_n: int = 5,
     ) -> list[dict[str, Any]]:
         """Dispatch to the active reranker backend, or return results unchanged."""
-        if ACTIVE_RERANKER == "langsearch":
+        if self._active_reranker == "langsearch":
             return self._rerank_langsearch(query, results, top_n)
-        if ACTIVE_RERANKER == "google":
+        if self._active_reranker == "google":
             return self._rerank_google(query, results, top_n)
         return results
 
@@ -444,12 +436,7 @@ class MemoryRetriever:
         results: list[dict[str, Any]],
         top_n: int = 5,
     ) -> list[dict[str, Any]]:
-        """Cross-encoder reranking via LangSearch.
-
-        Reranks the top ``min(top_n*3, LANGSEARCH_MAX_DOCS)`` candidates and
-        carries the un-reranked tail forward unchanged. Uses a fail-soft
-        approach: any error returns the input list unmutated.
-        """
+        """Cross-encoder reranking via LangSearch."""
         if self._langsearch_disabled:
             return results
         if len(results) <= 1:
@@ -467,7 +454,7 @@ class MemoryRetriever:
         if self._langsearch_session is None:
             self._langsearch_session = requests.Session()
             self._langsearch_session.headers.update({
-                "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
+                "Authorization": f"Bearer {self._langsearch_api_key}",
                 "Content-Type": "application/json",
             })
 
@@ -529,7 +516,6 @@ class MemoryRetriever:
         if not lang_results:
             return results
 
-        # Map: candidate index → relevance_score
         score_map: dict[int, float] = {}
         for item in lang_results:
             idx = item.get("index")
@@ -551,12 +537,15 @@ class MemoryRetriever:
     ) -> list[dict[str, Any]]:
         """Cross-encoder reranking via Google Discovery Engine Ranking API.
 
-        Uses the ``semantic-ranker-512@latest`` model (configurable via
-        ``MEMORY_GOOGLE_RANKING_MODEL``).  Requires ``GOOGLE_API_KEY`` and
-        ``GOOGLE_CLOUD_PROJECT`` (or ``GOOGLE_PROJECT_ID``).
+        Uses ``GOOGLE_API_KEY`` (via ``x-goog-api-key`` header) and
+        ``GOOGLE_CLOUD_PROJECT`` (in the request URL).  Both are read at
+        ``MemoryRetriever.__init__`` time, not at module-import time, so
+        they correctly pick up values loaded from ``~/.hermes/.env``.
 
-        Pricing: first 1,000 queries / month are free; thereafter ~$0.001 /
-        query — substantially cheaper than most LLM-based reranking options.
+        Model: ``semantic-ranker-512@latest`` (overridable via
+        ``MEMORY_GOOGLE_RANKING_MODEL``).
+
+        Pricing: 1,000 free queries/month; ~$0.001/query thereafter.
         """
         if self._google_disabled:
             return results
@@ -574,29 +563,21 @@ class MemoryRetriever:
         if self._google_session is None:
             self._google_session = requests.Session()
             self._google_session.headers.update({
-                "x-goog-api-key": GOOGLE_API_KEY,
+                "x-goog-api-key": self._google_api_key,
                 "Content-Type": "application/json",
             })
 
-        # Records use string ids "0".."N-1" — Google returns them back by id
-        # so we can map score → candidate position without relying on ordering.
         records = [
             {"id": str(i), "content": str(c.get("text", "") or "")}
             for i, c in enumerate(candidates)
         ]
         payload = {
-            "model": GOOGLE_RANKING_MODEL,
-            # Ask for ALL candidates so we can re-score the full set.
-            # topN < candidate_count would silently drop records we need
-            # to penalise in the blend step.
+            "model": self._google_ranking_model,
             "topN": candidate_count,
             "query": query,
             "records": records,
         }
-        url = (
-            f"https://discoveryengine.googleapis.com/v1/projects/{GOOGLE_CLOUD_PROJECT}"
-            f"/locations/global/rankingConfigs/default_ranking_config:rank"
-        )
+        url = GOOGLE_RANKING_BASE_URL.format(project=self._google_cloud_project)
 
         data = None
         last_err: Exception | None = None
@@ -617,13 +598,12 @@ class MemoryRetriever:
                     )
                     return results
                 if resp.status_code == 404:
-                    # Almost always means the project ID or API isn't enabled.
                     self._google_disabled = True
                     logger.warning(
                         "Google rerank got 404. Ensure the Discovery Engine API "
                         "is enabled for project %r and GOOGLE_CLOUD_PROJECT is "
                         "correct. Falling back to fusion-only ranking.",
-                        GOOGLE_CLOUD_PROJECT,
+                        self._google_cloud_project,
                     )
                     return results
                 if 500 <= resp.status_code < 600 and attempt == 0:
@@ -651,8 +631,6 @@ class MemoryRetriever:
         if not google_records:
             return results
 
-        # Map: candidate index (int) → relevance_score (float)
-        # Google returns records by our string id — parse back to int.
         score_map: dict[int, float] = {}
         for rec in google_records:
             try:
@@ -665,9 +643,8 @@ class MemoryRetriever:
         if not score_map:
             return results
 
-        # Google relevanceScore is in [0, 1] but tends to cluster in a narrower
-        # band. Normalise within the returned batch so the blend step operates
-        # on the same scale as LangSearch scores.
+        # Normalise within the batch — Google's scores cluster in a narrow
+        # band and need rescaling before the 70/30 blend.
         if score_map:
             max_s = max(score_map.values())
             min_s = min(score_map.values())
@@ -689,20 +666,17 @@ class MemoryRetriever:
         """
         Blend reranker scores into ``_final_score`` and re-sort.
 
-        ``score_map`` maps candidate list index → normalised relevance score.
-        Candidates without a score entry (reranker dropped them) are penalised.
-        The tail of ``results`` beyond ``candidate_count`` is preserved
-        unchanged.
+        ``score_map`` maps candidate-list index → normalised relevance score.
+        Candidates without a score entry are penalised.  The tail of
+        ``results`` beyond ``candidate_count`` is preserved unchanged.
         """
         for i, entry in enumerate(candidates):
             existing = float(entry.get("_final_score", 0.0))
             if i in score_map:
                 rerank = score_map[i]
                 entry["_rerank_score"] = rerank
-                # 70% rerank signal, 30% scoring-pipeline signal
                 entry["_final_score"] = 0.7 * rerank + 0.3 * existing
             else:
-                # Penalise candidates the reranker didn't score.
                 entry["_final_score"] = 0.3 * existing
                 entry["_rerank_score"] = 0.0
 
