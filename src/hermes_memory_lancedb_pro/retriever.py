@@ -19,7 +19,8 @@ Set ``MEMORY_RERANKER`` to choose explicitly:
 
   - ``langsearch``  — LangSearch cross-encoder (requires LANGSEARCH_API_KEY)
   - ``google``      — Google Discovery Engine Ranking API (requires
-                      GOOGLE_API_KEY + GOOGLE_CLOUD_PROJECT)
+                      GOOGLE_CLOUD_PROJECT + Application Default Credentials;
+                      see ``_get_google_auth_token`` for credential sources)
   - ``disabled``    — skip reranking entirely
   - ``auto``        — (default) choose the one whose keys are present;
                       if both are configured, log a warning and disable
@@ -117,7 +118,6 @@ class MemoryRetriever:
         # os.environ is fully populated.
         # -----------------------------------------------------------------
         self._langsearch_api_key: str = os.environ.get("LANGSEARCH_API_KEY", "")
-        self._google_api_key: str = os.environ.get("GOOGLE_API_KEY", "")
         self._google_cloud_project: str = (
             os.environ.get("GOOGLE_CLOUD_PROJECT")
             or os.environ.get("GOOGLE_PROJECT_ID")
@@ -131,7 +131,6 @@ class MemoryRetriever:
         # Resolve which backend to use (logs once, here at construction time)
         self._active_reranker: str = self._resolve_reranker(
             langsearch_key=self._langsearch_api_key,
-            google_key=self._google_api_key,
             google_project=self._google_cloud_project,
             setting=os.environ.get("MEMORY_RERANKER", "auto").strip().lower(),
         )
@@ -139,6 +138,9 @@ class MemoryRetriever:
         # One requests.Session per backend, created lazily on first use
         self._langsearch_session: requests.Session | None = None
         self._google_session: requests.Session | None = None
+
+        # Google OAuth2 credentials — obtained lazily via ADC on first use
+        self._google_credentials: object | None = None
 
         # Per-backend kill-switch: tripped on persistent 401/403/429
         self._langsearch_disabled: bool = False
@@ -233,7 +235,6 @@ class MemoryRetriever:
     def _resolve_reranker(
         *,
         langsearch_key: str,
-        google_key: str,
         google_project: str,
         setting: str,
     ) -> str:
@@ -245,10 +246,15 @@ class MemoryRetriever:
         Accepts the key values and the ``MEMORY_RERANKER`` setting as
         explicit arguments rather than reading ``os.environ`` directly, so
         that tests can call it without environment manipulation.
+
+        Note: the Google backend authenticates via Application Default
+        Credentials (ADC), not an API key — ``GOOGLE_CLOUD_PROJECT`` is the
+        only env var needed for detection.  Credential problems surface at
+        the first rerank call, not here.
         """
         have_langsearch = bool(langsearch_key)
-        # Google requires BOTH key AND project (project appears in the URL)
-        have_google = bool(google_key and google_project)
+        # Google only needs a project ID in the URL; auth is handled via ADC.
+        have_google = bool(google_project)
 
         if setting == "disabled":
             return ""
@@ -264,14 +270,9 @@ class MemoryRetriever:
 
         if setting == "google":
             if not have_google:
-                missing = []
-                if not google_key:
-                    missing.append("GOOGLE_API_KEY")
-                if not google_project:
-                    missing.append("GOOGLE_CLOUD_PROJECT (or GOOGLE_PROJECT_ID)")
                 logger.warning(
-                    "MEMORY_RERANKER=google but %s not set; reranking disabled.",
-                    " and ".join(missing),
+                    "MEMORY_RERANKER=google but GOOGLE_CLOUD_PROJECT (or "
+                    "GOOGLE_PROJECT_ID) is not set; reranking disabled."
                 )
                 return ""
             return "google"
@@ -279,8 +280,8 @@ class MemoryRetriever:
         # auto — pick the configured one; warn if ambiguous
         if have_langsearch and have_google:
             logger.warning(
-                "Both LANGSEARCH_API_KEY and GOOGLE_API_KEY+GOOGLE_CLOUD_PROJECT are "
-                "set. Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
+                "Both LANGSEARCH_API_KEY and GOOGLE_CLOUD_PROJECT are set. "
+                "Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
                 "choose one. Reranking is disabled until configured."
             )
             return ""
@@ -288,7 +289,9 @@ class MemoryRetriever:
             logger.info("Reranker: LangSearch (auto-selected, LANGSEARCH_API_KEY found)")
             return "langsearch"
         if have_google:
-            logger.info("Reranker: Google Ranking API (auto-selected)")
+            logger.info(
+                "Reranker: Google Ranking API (auto-selected, GOOGLE_CLOUD_PROJECT found)"
+            )
             return "google"
 
         return ""
@@ -412,6 +415,78 @@ class MemoryRetriever:
                 self.store.update(mem_id, tier=new_tier)
             except Exception as e:
                 logger.warning("Tier update for %s failed: %s", mem_id, e)
+
+    # ----- Google OAuth2 token acquisition -----
+
+    def _get_google_auth_token(self) -> str | None:
+        """Obtain an OAuth2 bearer token via Application Default Credentials.
+
+        Google's Discovery Engine Ranking API requires OAuth2 authentication;
+        API keys are explicitly rejected with a 401.  This method uses the
+        ``google-auth`` library's ADC chain, which resolves credentials in
+        this priority order:
+
+        1. **Service account JSON** — set ``GOOGLE_APPLICATION_CREDENTIALS``
+           to the path of a downloaded service account key file.
+        2. **Developer workstation** — run
+           ``gcloud auth application-default login`` once; credentials are
+           cached at ``~/.config/gcloud/application_default_credentials.json``.
+        3. **GCP Metadata Server** — running inside GCP Compute, Cloud Run,
+           GKE, etc. — credentials are fetched automatically from the instance
+           metadata endpoint.
+
+        The first call acquires credentials and caches them on
+        ``self._google_credentials``.  Subsequent calls refresh the token
+        only when it is about to expire (``creds.valid`` is False).  On any
+        unrecoverable failure the Google reranker is disabled for the session.
+
+        Returns the OAuth2 access token string, or ``None`` on failure.
+        """
+        try:
+            import google.auth
+            import google.auth.transport.requests
+        except ImportError:
+            logger.warning(
+                "google-auth is not installed; cannot use the Google Ranking API. "
+                "Install it with: pip install 'hermes-memory-lancedb-pro[google]' "
+                "or: pip install google-auth"
+            )
+            self._google_disabled = True
+            return None
+
+        if self._google_credentials is None:
+            try:
+                creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                self._google_credentials = creds
+            except Exception as e:
+                logger.warning(
+                    "Google Application Default Credentials not found: %s. "
+                    "To authenticate, either: (1) set GOOGLE_APPLICATION_CREDENTIALS "
+                    "to a service account JSON path, (2) run "
+                    "'gcloud auth application-default login', or (3) deploy on GCP. "
+                    "Google reranking disabled for this session.",
+                    e,
+                )
+                self._google_disabled = True
+                return None
+
+        creds = self._google_credentials
+        if not creds.valid:
+            try:
+                auth_req = google.auth.transport.requests.Request()
+                creds.refresh(auth_req)
+            except Exception as e:
+                logger.warning(
+                    "Google auth token refresh failed: %s. "
+                    "Google reranking disabled for this session.",
+                    e,
+                )
+                self._google_disabled = True
+                return None
+
+        return creds.token
 
     # ----- reranking dispatcher -----
 
@@ -537,10 +612,11 @@ class MemoryRetriever:
     ) -> list[dict[str, Any]]:
         """Cross-encoder reranking via Google Discovery Engine Ranking API.
 
-        Uses ``GOOGLE_API_KEY`` (via ``x-goog-api-key`` header) and
-        ``GOOGLE_CLOUD_PROJECT`` (in the request URL).  Both are read at
-        ``MemoryRetriever.__init__`` time, not at module-import time, so
-        they correctly pick up values loaded from ``~/.hermes/.env``.
+        Authenticates with an OAuth2 bearer token obtained via Application
+        Default Credentials (see ``_get_google_auth_token``).  The GCP
+        project ID comes from ``GOOGLE_CLOUD_PROJECT`` (also accepted as
+        ``GOOGLE_PROJECT_ID`` or ``GOOGLE_PROJECT``), read at
+        ``MemoryRetriever.__init__`` time so dotenv-loaded values are seen.
 
         Model: ``semantic-ranker-512@latest`` (overridable via
         ``MEMORY_GOOGLE_RANKING_MODEL``).
@@ -560,12 +636,16 @@ class MemoryRetriever:
         if not any(c.get("text") for c in candidates):
             return results
 
+        # Obtain a fresh OAuth2 bearer token (refreshed transparently when expired)
+        token = self._get_google_auth_token()
+        if token is None:
+            return results
+
         if self._google_session is None:
             self._google_session = requests.Session()
-            self._google_session.headers.update({
-                "x-goog-api-key": self._google_api_key,
-                "Content-Type": "application/json",
-            })
+            self._google_session.headers["Content-Type"] = "application/json"
+        # Set/refresh the Authorization header on every call — tokens expire (~1 hr)
+        self._google_session.headers["Authorization"] = f"Bearer {token}"
 
         records = [
             {"id": str(i), "content": str(c.get("text", "") or "")}
@@ -592,8 +672,9 @@ class MemoryRetriever:
                     self._google_disabled = True
                     logger.warning(
                         "Google rerank disabled for this session "
-                        "(HTTP %d). Check GOOGLE_API_KEY / GOOGLE_CLOUD_PROJECT "
-                        "or quota. Falling back to fusion-only ranking.",
+                        "(HTTP %d). Check Application Default Credentials and "
+                        "GOOGLE_CLOUD_PROJECT, or quota. "
+                        "Falling back to fusion-only ranking.",
                         resp.status_code,
                     )
                     return results
