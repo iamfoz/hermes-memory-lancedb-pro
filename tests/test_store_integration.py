@@ -133,8 +133,12 @@ class TestCrud:
 
     def test_increment_access_count(self, store):
         mid = store.store(text="counts accesses correctly")
+        # First access always lands (count was 0).
         assert store.increment_access_count(mid)
-        assert store.increment_access_count(mid)
+        # Second rapid access is throttled — that's the feedback-loop fix.
+        # Pass throttle_seconds=0 to mimic the legacy "always increment" path
+        # for this test's intent (verifying the counter reaches 2).
+        assert store.increment_access_count(mid, throttle_seconds=0)
         meta = store.get_by_id(mid)["metadata"]
         assert meta["access_count"] == 2
 
