@@ -35,6 +35,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6.0",
 ]
+google = [
+    "google-auth>=2.0.0",
+]
 
 [project.scripts]
 hermes-memory-smoke = "hermes_memory_lancedb_pro._cli:smoke_main"
