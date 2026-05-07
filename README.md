@@ -14,6 +14,11 @@ A production-grade memory store that gives Hermes Agent persistent, searchable r
 - **Archived row filtering** — superseded/deleted entries excluded from queries by default
 - **Bulk inserts** — `store_many()` encodes and writes in one batch
 - **Per-path singleton** — `get_instance(db_path=...)` is keyed by path so multi-store callers work
+- **Temporal classifier** — distinguishes static facts from time-sensitive ("tomorrow", "next week") and infers expiry timestamps
+- **Session compressor** — scores conversation turns by signal value (tool calls / corrections / decisions > greetings) before extraction
+- **Batch dedup** — pre-LLM cosine dedup within extraction batches
+- **Admission control** — pluggable AMAC-v1 gate (utility / confidence / novelty / recency / type-prior scoring) with `balanced` / `conservative` / `high-recall` presets
+- **Memory compactor** — clusters and merges semantically similar old entries into single consolidated memories
 
 ### Schema
 
@@ -221,6 +226,115 @@ hermes-agent isn't on PYTHONPATH at instantiation time.
 This package has **no** dependency on jmunch-mcp; the two are completely
 orthogonal and can be installed together or separately without
 interfering.
+
+## Write-side helpers (CortexReach feature parity)
+
+These modules support extraction / admission / compaction pipelines without
+imposing them. Each is opt-in — call them yourself when the workflow fits.
+
+### Temporal classification
+
+```python
+from hermes_memory_lancedb_pro import classify_temporal, infer_expiry
+
+classify_temporal("I have a meeting tomorrow")  # → "dynamic"
+classify_temporal("My favourite colour is blue")  # → "static"
+
+infer_expiry("see you tomorrow")    # → +24h epoch ms
+infer_expiry("see you next week")   # → +7d epoch ms
+infer_expiry("static fact")          # → None
+```
+
+Use the result as `metadata_extra={"temporal_type": ..., "valid_until": ...}`
+on `store.store(...)` so the Weibull decay engine's `temporal_type=="dynamic"`
+fast-decay path activates and the entry is automatically marked stale after
+its expiry passes.
+
+### Session compressor
+
+When persisting a long conversation under a fixed extraction budget, score
+each turn first and keep the high-signal ones:
+
+```python
+from hermes_memory_lancedb_pro import compress_texts, estimate_conversation_value
+
+result = compress_texts(turn_texts, max_chars=4000)
+# result.texts is the chronological subset; result.scored has per-turn scores
+# Decisions / corrections / tool_calls score 0.85-1.0; greetings 0.1.
+```
+
+`estimate_conversation_value(turn_texts)` returns a 0.0-1.0 estimate you can
+use to decide whether the conversation is worth extracting at all.
+
+### Batch dedup (pre-LLM)
+
+Before sending candidate memories to an LLM dedup judge, drop the obvious
+near-duplicates by cosine on their abstracts:
+
+```python
+from hermes_memory_lancedb_pro import batch_dedup
+
+result = batch_dedup(abstracts, vectors, threshold=0.85)
+survivors = [candidates[i] for i in result.surviving_indices]
+```
+
+### Admission control
+
+A scoring gate that decides whether a candidate memory is worth admitting,
+modelled on the CortexReach AMAC-v1 spec. Optional LLM client for the
+"utility" feature; without one, that feature falls back to a neutral 0.5.
+
+```python
+from hermes_memory_lancedb_pro import (
+    AdmissionController,
+    CandidateMemory,
+    get_admission_preset,
+)
+
+controller = AdmissionController(
+    store,
+    config=get_admission_preset("balanced"),  # or "conservative" / "high-recall"
+    llm=my_extractor_llm,  # optional — see PR 3 for built-in adapters
+)
+
+candidate = CandidateMemory(
+    category="preferences",
+    abstract="user prefers dark mode",
+    overview="...",
+    content="user said they prefer dark mode in the IDE",
+    vector=store.encode("user prefers dark mode"),
+)
+verdict = controller.evaluate(candidate, conversation_text="...")
+if verdict.decision == "pass_to_dedup":
+    store.store(text=candidate.content, ...)  # or merge into existing
+```
+
+The audit record on every verdict (`verdict.audit`) gives you the per-feature
+score breakdown for tuning, plus a structured rejection reason.
+
+### Memory compactor
+
+Periodic cron that clusters similar old memories and merges them into one:
+
+```python
+from hermes_memory_lancedb_pro import (
+    CompactionConfig,
+    record_compaction_run,
+    run_compaction,
+    should_run_compaction,
+)
+
+state_file = "~/.hermes/memory-lancedb/.compaction-state.json"
+if should_run_compaction(state_file, cooldown_hours=24):
+    result = run_compaction(
+        store,
+        CompactionConfig(min_age_days=7, similarity_threshold=0.88, min_cluster_size=2),
+    )
+    record_compaction_run(state_file)
+    print(f"merged {result.clusters_found} clusters → -{result.memories_deleted} +{result.memories_created}")
+```
+
+Set `dry_run=True` to see the plan without writing.
 
 ## Architecture
 
