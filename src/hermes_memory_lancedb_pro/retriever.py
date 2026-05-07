@@ -46,6 +46,13 @@ LANGSEARCH_TIMEOUT = 15   # seconds
 TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
 TIER_EVAL_BATCH = int(os.environ.get("MEMORY_TIER_EVAL_BATCH", "500"))
 
+# Default minimum final score for a recall to be returned. Set lower with
+# `min_score=...` per-call. The default is conservative; relaxing it is
+# the main lever for tuning recall recall vs precision.
+DEFAULT_MIN_RECALL_SCORE: float = float(
+    os.environ.get("MEMORY_MIN_RECALL_SCORE", "0.0")
+)
+
 
 class MemoryRetriever:
     """
@@ -76,18 +83,44 @@ class MemoryRetriever:
         category: str | None = None,
         scope: str | None = None,
         source: str = "manual",
+        *,
+        session_id: str | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Run the full hybrid retrieval pipeline."""
+        """Run the full hybrid retrieval pipeline.
+
+        Args:
+            query: search text (the user's current message, typically).
+            limit: maximum number of results to return.
+            category, scope: optional column filters.
+            source: "manual" / "auto-recall" / "cli" — drives the recall
+                lifecycle hooks. Use "cli" to skip access-count bumps.
+            session_id: when set, results are restricted to memories whose
+                `metadata.source_session` matches this id, plus memories
+                explicitly flagged `cross_session` or living in the core
+                tier. This is the key knob for fixing "sticky" memory:
+                without it, recall surfaces top-N results from any prior
+                session that happens to be semantically near the bare user
+                message, even when the user has clearly pivoted topic.
+            min_score: drop final results below this threshold. Defaults to
+                `DEFAULT_MIN_RECALL_SCORE` (env MEMORY_MIN_RECALL_SCORE).
+        """
         if not query or not query.strip():
             return []
 
         query = query.strip()
         now_ms = int(time.time() * 1000)
+        if min_score is None:
+            min_score = DEFAULT_MIN_RECALL_SCORE
 
         # 1. Parallel vector + BM25 search (wide initial net)
         candidate_pool = min(max(limit * 4, 16), 40)
-        vector_results = self.store._vector_search(query, candidate_pool, category, scope)
-        bm25_results = self.store._bm25_search(query, candidate_pool, category, scope)
+        vector_results = self.store._vector_search(
+            query, candidate_pool, category, scope, session_id=session_id,
+        )
+        bm25_results = self.store._bm25_search(
+            query, candidate_pool, category, scope, session_id=session_id,
+        )
 
         # 1.5 BM25 ghost entry protection
         bm25_results = self._filter_bm25_ghosts(bm25_results, vector_results)
@@ -115,9 +148,20 @@ class MemoryRetriever:
         for entry, score in diverse:
             entry["_mmr_score"] = score
 
-        # 7. Lifecycle hooks — increment access count, throttle full tier eval
+        # 7. Apply min_score gate — drop weak matches that the LLM would
+        # otherwise treat as relevant context. This is the second key
+        # stickiness lever (after session_id): a query that has no real
+        # answer in the store should return [], not the top-N regardless.
+        if min_score and min_score > 0.0:
+            scored = [
+                e for e in scored
+                if float(e.get("_final_score", 0.0)) >= min_score
+            ]
+
+        # 8. Lifecycle hooks — increment access count (throttled), tier eval.
+        # Only bumps the count for memories actually returned to the caller.
         if source in ("manual", "auto-recall"):
-            self._run_recall_lifecycle(scored)
+            self._run_recall_lifecycle(scored[:limit])
 
         return scored[:limit]
 

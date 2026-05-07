@@ -46,6 +46,9 @@ from ._sql import (
     is_archived as _is_archived,
 )
 from ._sql import (
+    match_session as _match_session,
+)
+from ._sql import (
     parse_metadata as _parse_metadata,
 )
 
@@ -75,6 +78,23 @@ VECTOR_INDEX_MIN_ROWS: int = 256
 MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other", "reflection"]
 MEMORY_TIERS = ["core", "working", "peripheral"]
 MEMORY_STATES = ["pending", "confirmed", "archived"]
+
+# Tiers whose memories are always available regardless of session_id filtering.
+# Core memories represent long-term knowledge (user preferences, profile facts);
+# scoping them to a single session would defeat the point of persistent memory.
+CROSS_SESSION_TIERS = frozenset({"core"})
+
+# Minimum gap between successive access_count increments for the same memory.
+# Without this throttle, every retrieve() bumps every result's access_count,
+# which feeds into the decay/frequency score, which raises the memory's
+# composite score, which makes it more likely to be retrieved next time —
+# a runaway feedback loop that produces "sticky" memories that surface on
+# every turn regardless of relevance. 5 minutes is long enough to break the
+# loop within a single conversation while still credit-scoring genuine
+# repeated use.
+ACCESS_COUNT_THROTTLE_SECONDS: int = int(
+    os.environ.get("MEMORY_ACCESS_COUNT_THROTTLE_S", "300")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +256,11 @@ class MemoryStore:
             "state": "confirmed",
             "source": "manual",
             "source_session": "",
+            # When True, this memory is exempt from session_id filtering
+            # (used for global preferences, profile facts, etc. that should
+            # surface across all sessions). Set via metadata_extra at write
+            # time; core-tier memories are also cross-session by default.
+            "cross_session": False,
             "created_at": now_ms,
             "last_accessed_at": now_ms,
             "injected_count": 0,
@@ -504,19 +529,60 @@ class MemoryStore:
         self._table.delete(f"id = '{_escape_sql(mem_id)}'")
         return True
 
-    def increment_access_count(self, mem_id: str) -> bool:
-        """Increment access_count and update last_accessed_at."""
+    def increment_access_count(
+        self,
+        mem_id: str,
+        *,
+        force: bool = False,
+        throttle_seconds: int | None = None,
+    ) -> bool:
+        """Increment access_count and update last_accessed_at.
+
+        Throttled by default: a memory's access_count won't increment more
+        than once per `ACCESS_COUNT_THROTTLE_SECONDS` (default 5 min). This
+        breaks the recall feedback loop where every retrieve() bumped the
+        count, which raised the decay-frequency score, which made the same
+        memory more retrievable next time, ad infinitum.
+
+        Pass `force=True` to bypass the throttle (e.g. for a definitive
+        "memory was actually used" signal from the agent). Pass
+        `throttle_seconds=N` to override the default cooldown."""
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
+
         metadata = _parse_metadata(existing["metadata"])
-        metadata["access_count"] = int(metadata.get("access_count", 0) or 0) + 1
-        metadata["last_accessed_at"] = int(time.time() * 1000)
+        now_ms = int(time.time() * 1000)
+        cooldown_ms = (
+            ACCESS_COUNT_THROTTLE_SECONDS if throttle_seconds is None else max(0, int(throttle_seconds))
+        ) * 1000
+
+        # Skip the throttle on the very first access (count==0). Without this,
+        # a freshly-stored memory whose `last_accessed_at == created_at` would
+        # have its first recall blocked, and access_count would never tick up.
+        current_count = int(metadata.get("access_count", 0) or 0)
+        if not force and cooldown_ms > 0 and current_count > 0:
+            last = int(metadata.get("last_accessed_at", 0) or 0)
+            if last and (now_ms - last) < cooldown_ms:
+                return False
+
+        metadata["access_count"] = current_count + 1
+        metadata["last_accessed_at"] = now_ms
         self._table.update(
             where=f"id = '{_escape_sql(mem_id)}'",
             values={"metadata": json.dumps(metadata)},
         )
         return True
+
+    def mark_recall_used(self, mem_ids: Sequence[str]) -> int:
+        """Definitively mark memories as having been used (e.g. injected
+        into a prompt and meaningfully referenced). Bypasses the access
+        count throttle. Returns the number of memories actually updated."""
+        updated = 0
+        for mem_id in mem_ids:
+            if self.increment_access_count(mem_id, force=True):
+                updated += 1
+        return updated
 
     # ----- CRUD: read -----
 
@@ -575,6 +641,7 @@ class MemoryStore:
         scope: str | None = None,
         offset: int = 0,
         include_archived: bool = False,
+        session_id: str | None = None,
         # Hermes core may pass `categories` instead of `category`
         categories: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -582,7 +649,12 @@ class MemoryStore:
 
         Filters are AND-combined into a single WHERE clause — chaining
         `.where()` on a LanceQueryBuilder replaces the previous predicate
-        in many LanceDB versions, so we must build the clause ourselves."""
+        in many LanceDB versions, so we must build the clause ourselves.
+
+        When `session_id` is set, only memories from that session (or
+        explicitly cross-session memories — see `_match_session`) are
+        returned. Pass `session_id=None` to disable session scoping (the
+        default, for full backwards compat)."""
         effective_category = category if category is not None else categories
         clauses: list[str] = []
         if effective_category:
@@ -594,8 +666,11 @@ class MemoryStore:
                 f"metadata LIKE '%\"tier\": \"{_escape_sql(tier)}\"%'"
             )
 
-        # Over-fetch when we'll filter archived rows post-query
-        fetch_limit = limit if include_archived else limit + offset + max(limit, 16) * 2
+        # Over-fetch when we'll filter archived/session rows post-query
+        post_filter = (not include_archived) or (session_id is not None)
+        fetch_limit = (
+            limit + offset + max(limit, 16) * 2 if post_filter else limit
+        )
 
         query = self._table.search()
         where_clause = _and_clauses(*clauses)
@@ -606,6 +681,8 @@ class MemoryStore:
         rows = [self._row_to_dict(r) for r in results]
         if not include_archived:
             rows = [r for r in rows if r["metadata"].get("state") != ARCHIVED_STATE]
+        if session_id is not None:
+            rows = [r for r in rows if _match_session(r["metadata"], session_id)]
         return rows[offset : offset + limit]
 
     def search(
@@ -615,18 +692,43 @@ class MemoryStore:
         mode: str = "hybrid",  # "vector" | "bm25" | "hybrid"
         category: str | None = None,
         scope: str | None = None,
+        session_id: str | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
         """Search memories using vector, BM25, or hybrid mode.
 
         All three modes return `List[Dict[str, Any]]` — the previous version
-        returned tuples for hybrid mode, breaking polymorphic callers."""
+        returned tuples for hybrid mode, breaking polymorphic callers.
+
+        `session_id` (optional): when set, results are restricted to memories
+        whose `metadata.source_session` matches, plus memories explicitly
+        marked `cross_session` or living in a cross-session tier (core).
+        Without this filter, retrieving from a fresh conversation surfaces
+        memories from earlier sessions and produces "sticky" recall — the
+        agent gets confused about what the user is currently asking.
+
+        `min_score` (optional): drops results whose relevance is below the
+        threshold. Semantics depend on the mode:
+          - vector: keep iff `(1 - _distance) >= min_score`  (cosine)
+          - bm25:   keep iff `_score >= min_score`           (FTS rank)
+          - hybrid: keep iff `_rrf_score >= min_score`        (fused rank)
+        """
         if not query_text or not query_text.strip():
             return []
         if mode == "vector":
-            return self._vector_search(query_text, limit, category, scope)
+            return self._vector_search(
+                query_text, limit, category, scope,
+                session_id=session_id, min_score=min_score,
+            )
         if mode == "bm25":
-            return self._bm25_search(query_text, limit, category, scope)
-        return self._hybrid_search(query_text, limit, category, scope)
+            return self._bm25_search(
+                query_text, limit, category, scope,
+                session_id=session_id, min_score=min_score,
+            )
+        return self._hybrid_search(
+            query_text, limit, category, scope,
+            session_id=session_id, min_score=min_score,
+        )
 
     # ----- search modes -----
 
@@ -642,6 +744,27 @@ class MemoryStore:
             clauses.append(f"scope = '{_escape_sql(scope)}'")
         return _and_clauses(*clauses)
 
+    @staticmethod
+    def _post_filter(
+        rows: list[dict[str, Any]],
+        *,
+        session_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Apply non-archived + session_id filters in Python.
+
+        Archived filtering is always applied (callers that want archived
+        rows go through different paths). Session filtering is applied
+        only when `session_id` is provided."""
+        out = []
+        for row in rows:
+            meta = row.get("metadata", "")
+            if _is_archived(meta):
+                continue
+            if session_id is not None and not _match_session(meta, session_id):
+                continue
+            out.append(row)
+        return out
+
     def _vector_search(
         self,
         query_text: str,
@@ -649,18 +772,31 @@ class MemoryStore:
         category: str | None,
         scope: str | None,
         keep_vector: bool = False,
+        *,
+        session_id: str | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
         vector = self.encode(query_text)
         search = self._table.search(vector, vector_column_name="vector")
         where = self._filters_clause(category, scope)
         if where:
             search = search.where(where)
-        results = search.limit(limit * SEARCH_OVERFETCH_MULTIPLIER).to_list()
-        return [
+        # Over-fetch more aggressively when post-filtering by session, since
+        # session-matching rows may be sparse in the top-N from LanceDB.
+        overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
+        results = search.limit(max(limit * overfetch, limit)).to_list()
+        results = self._post_filter(results, session_id=session_id)
+
+        rows = [
             self._row_to_dict(r, distance=r.get("_distance"), keep_vector=keep_vector)
             for r in results
-            if not _is_archived(r.get("metadata", ""))
-        ][:limit]
+        ]
+        if min_score is not None:
+            rows = [
+                r for r in rows
+                if (1.0 - float(r.get("_distance") or 0.0)) >= min_score
+            ]
+        return rows[:limit]
 
     def _bm25_search(
         self,
@@ -669,6 +805,9 @@ class MemoryStore:
         category: str | None,
         scope: str | None,
         keep_vector: bool = False,
+        *,
+        session_id: str | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
         # Scope FTS to the `text` column only — LanceDB's FTS otherwise indexes
         # all string columns, polluting results with id/category/metadata.
@@ -678,12 +817,17 @@ class MemoryStore:
         where = self._filters_clause(category, scope)
         if where:
             search = search.where(where)
-        results = search.limit(limit * SEARCH_OVERFETCH_MULTIPLIER).to_list()
-        return [
+        overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
+        results = search.limit(max(limit * overfetch, limit)).to_list()
+        results = self._post_filter(results, session_id=session_id)
+
+        rows = [
             self._row_to_dict(r, score=r.get("_score"), keep_vector=keep_vector)
             for r in results
-            if not _is_archived(r.get("metadata", ""))
-        ][:limit]
+        ]
+        if min_score is not None:
+            rows = [r for r in rows if float(r.get("_score") or 0.0) >= min_score]
+        return rows[:limit]
 
     def _hybrid_search(
         self,
@@ -691,14 +835,23 @@ class MemoryStore:
         limit: int,
         category: str | None,
         scope: str | None,
+        *,
+        session_id: str | None = None,
+        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
         """Reciprocal Rank Fusion of vector + BM25 results.
 
         Always returns plain dicts (with `_rrf_score` set) for parity with
         the other search modes."""
         candidate = max(limit * 2, 10)
-        vector_results = self._vector_search(query_text, candidate, category, scope)
-        bm25_results = self._bm25_search(query_text, candidate, category, scope)
+        vector_results = self._vector_search(
+            query_text, candidate, category, scope,
+            session_id=session_id,
+        )
+        bm25_results = self._bm25_search(
+            query_text, candidate, category, scope,
+            session_id=session_id,
+        )
 
         # Rank dicts (1-based) — used to compute RRF without O(n²) scans
         v_rank = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
@@ -729,6 +882,11 @@ class MemoryStore:
             key=lambda e: e.get("_rrf_score", 0.0),
             reverse=True,
         )
+        if min_score is not None:
+            ranked = [
+                r for r in ranked
+                if float(r.get("_rrf_score") or 0.0) >= min_score
+            ]
         return ranked[:limit]
 
     # ----- bulk ops -----

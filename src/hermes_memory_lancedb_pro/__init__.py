@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Pure-Python re-exports (safe — no heavy deps)
 from .decay import (  # noqa: F401
@@ -36,6 +36,8 @@ _LAZY_ATTRS = {
     "MemorySchema": ("store", "MemorySchema"),
     "MemoryRetriever": ("retriever", "MemoryRetriever"),
     "HybridRetriever": ("retriever", "HybridRetriever"),
+    "LanceDBProMemoryProvider": ("provider", "LanceDBProMemoryProvider"),
+    "register_memory_provider": ("provider", "register_memory_provider"),
 }
 
 
@@ -55,6 +57,7 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:  # pragma: no cover — for IDEs / type checkers only
+    from .provider import LanceDBProMemoryProvider, register_memory_provider
     from .retriever import HybridRetriever, MemoryRetriever
     from .store import MemorySchema, MemoryStore
 
@@ -64,6 +67,8 @@ __all__ = [
     "MemorySchema",
     "MemoryRetriever",
     "HybridRetriever",
+    "LanceDBProMemoryProvider",
+    "register_memory_provider",
     "DecayConfig",
     "ScoringConfig",
     "ScoringPipeline",
