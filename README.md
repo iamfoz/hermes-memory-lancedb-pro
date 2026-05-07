@@ -95,6 +95,15 @@ results = store.search("concise responses", limit=5, mode="hybrid")  # default
 results = store.search("concise responses", limit=5, mode="vector")
 results = store.search("concise responses", limit=5, mode="bm25")
 
+# Session-scoped search — only memories from this session, plus
+# memories explicitly marked cross_session or core-tier (see below).
+results = store.search(
+    "concise responses",
+    limit=5,
+    session_id="sess-2026-05-07_abc",
+    min_score=0.2,   # drop weak matches that would otherwise pollute context
+)
+
 # Update (supersede pattern — archives old, creates new)
 store.update(mem_id=mem_id, text="Updated text here.", tier="core")
 
@@ -112,10 +121,106 @@ store.list_memories(limit=10)                  # active memories only
 store.list_memories(limit=10, include_archived=True)
 store.purge_archived(grace_period_days=30)     # GC superseded rows
 
-# Full-pipeline retrieval (rerank + MMR + lifecycle hooks)
+# Full-pipeline retrieval (rerank + MMR + lifecycle hooks).
+# Both filters apply here too — recommended for use inside an agent.
 retriever = MemoryRetriever(store)
-hits = retriever.retrieve("concise responses", limit=5)
+hits = retriever.retrieve(
+    "concise responses",
+    limit=5,
+    session_id="sess-2026-05-07_abc",
+    min_score=0.2,
+)
+
+# After the LLM has actually consumed the recall, credit the memories
+# (bypasses the per-recall throttle so the count reflects real usage):
+store.mark_recall_used([h["id"] for h in hits])
 ```
+
+## Avoiding "sticky" memory recall
+
+The most common failure mode for an LLM agent backed by a memory store is
+recall **stickiness** — old memories from a previous task or session keep
+getting injected into a fresh conversation, and the model conflates the
+prior context with the current question. Three knobs in this plugin
+control that:
+
+1. **`session_id`** — the strongest lever. When `MemoryRetriever.retrieve()`
+   is called with `session_id="X"`, results are restricted to memories
+   created in that session (matched against `metadata.source_session`),
+   plus memories that opt in to cross-session visibility:
+   - **`metadata.cross_session = True`** — explicit opt-in for memories
+     that should surface across all sessions (user preferences, profile
+     facts).
+   - **`tier == "core"`** — long-term knowledge that's been promoted by
+     the tier evaluator. Always cross-session.
+   Pass `session_id=None` (default) for the legacy "see everything"
+   behaviour.
+
+2. **`min_score`** — drop weak semantic / lexical matches before they
+   reach the LLM. The default is permissive (env `MEMORY_MIN_RECALL_SCORE`,
+   default 0.0); raise it to ~0.2 if you'd rather have an empty recall
+   than tangentially related noise.
+
+3. **Access-count throttle** — `increment_access_count()` is throttled
+   to once every `MEMORY_ACCESS_COUNT_THROTTLE_S` seconds (default 300).
+   Without this, every retrieve bumps every result's access_count,
+   raising its decay-frequency score, raising its composite, raising
+   its retrieval rank — a feedback loop that produces "permanently
+   sticky" memories. Use `force=True` or `mark_recall_used()` for the
+   "this memory was definitely used" signal.
+
+If you're integrating with **hermes-agent**, the recommended path is
+to use the bundled `LanceDBProMemoryProvider` adapter (see below) — it
+plumbs `session_id` through `prefetch()`, tags writes with
+`source_session`, and credits recalls only on `sync_turn()`. That
+combination is what closes the stickiness loop.
+
+## Hermes Agent integration
+
+This package ships a `MemoryProvider` adapter that hermes-agent's plugin
+system can discover and instantiate. Drop a one-line shim into your
+`~/.hermes/plugins/lancedb_pro/__init__.py`:
+
+```python
+# ~/.hermes/plugins/lancedb_pro/__init__.py
+from hermes_memory_lancedb_pro.provider import (
+    LanceDBProMemoryProvider,
+    register_memory_provider,
+)
+
+__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+```
+
+Then activate it in your hermes config:
+
+```yaml
+memory:
+  provider: lancedb_pro
+```
+
+The adapter:
+
+- forwards `session_id` from `prefetch(query, session_id=...)` into
+  `MemoryRetriever.retrieve(...)` so memories from prior sessions don't
+  bleed into the current conversation
+- tags every `sync_turn` write with `metadata.source_session` so future
+  recalls in this session can find them
+- caches the prefetched ids and credits them via `mark_recall_used()`
+  on `sync_turn` — only the memories the model actually saw get their
+  access_count bumped, eliminating the recall feedback loop
+- mirrors built-in `/memory` tool writes via `on_memory_write`, marking
+  them `cross_session=True` so user-curated facts surface in every session
+
+The adapter has a soft, lazy dependency on hermes-agent: the rest of
+this package (MemoryStore, MemoryRetriever, decay, scoring) imports
+without hermes-agent installed and is fully usable as a standalone
+library. Importing `hermes_memory_lancedb_pro.provider` succeeds either
+way; `LanceDBProMemoryProvider()` will raise a clear `ImportError` if
+hermes-agent isn't on PYTHONPATH at instantiation time.
+
+This package has **no** dependency on jmunch-mcp; the two are completely
+orthogonal and can be installed together or separately without
+interfering.
 
 ## Architecture
 
@@ -158,6 +263,9 @@ Environment variables (all optional):
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
 | `MEMORY_TIER_EVAL_BATCH`       | `500`                              | Rows fetched per tier evaluation                                  |
+| `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300`                            | Min seconds between access_count increments for the same memory  |
+| `MEMORY_MIN_RECALL_SCORE`      | `0.0`                              | Default `min_score` for `MemoryRetriever.retrieve()` (0 = permissive) |
+| `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
 
 ## Scripts
 
