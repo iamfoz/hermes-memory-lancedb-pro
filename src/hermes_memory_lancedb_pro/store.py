@@ -31,10 +31,35 @@ DEFAULT_DB_PATH = os.path.expanduser("~/.hermes/memory-lancedb")
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 VECTOR_DIM = 768
 
-# SQL LIKE pattern to exclude archived (superseded) memories.
-# The metadata JSON contains '"state": "archived"' when a row has been superseded.
-# We use a module-level constant to avoid escape-hell in .where() calls.
-ARCHIVED_STATE = '"state": "archived"'
+
+def _escape_sql(val: str) -> str:
+    """Escape a string for safe inclusion in SQL WHERE clauses."""
+    return val.replace("'", "''")
+
+
+def _is_archived(metadata) -> bool:
+    """Check if a memory is archived by parsing its metadata JSON safely."""
+    try:
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        if isinstance(metadata, dict):
+            return metadata.get("state") == "archived"
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
+
+
+def _parse_metadata(value) -> dict:
+    """Safely parse metadata field, handling str, dict, or corrupt data."""
+    try:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
 
 # Memory categories
 MEMORY_CATEGORIES = [
@@ -148,6 +173,9 @@ class MemoryStore:
         mem_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
 
+        # Clamp importance to valid range [0.0, 1.0]
+        importance = max(0.0, min(1.0, importance))
+
         metadata = {
             "tier": tier,
             "access_count": 0,
@@ -188,7 +216,7 @@ class MemoryStore:
 
     def get_by_id(self, mem_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a memory by ID."""
-        results = self._table.search().where(f"id = '{mem_id}'").limit(1).to_list()
+        results = self._table.search().where(f"id = '{_escape_sql(mem_id)}'").limit(1).to_list()
         if not results:
             return None
         return self._row_to_dict(results[0])
@@ -207,7 +235,7 @@ class MemoryStore:
         if existing is None:
             return False
 
-        metadata = existing["metadata"] if isinstance(existing["metadata"], dict) else json.loads(existing["metadata"])
+        metadata = _parse_metadata(existing["metadata"])
 
         if text is not None:
             # Re-encode vector when text changes
@@ -219,7 +247,7 @@ class MemoryStore:
 
             # Update old entry with supersede info
             self._table.update(
-                where=f"id = '{mem_id}'",
+                where=f"id = '{_escape_sql(mem_id)}'",
                 values={
                     "metadata": json.dumps(metadata),
                 },
@@ -268,7 +296,7 @@ class MemoryStore:
                 update_values["category"] = category
 
             self._table.update(
-                where=f"id = '{mem_id}'",
+                where=f"id = '{_escape_sql(mem_id)}'",
                 values=update_values,
             )
 
@@ -279,7 +307,7 @@ class MemoryStore:
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
-        self._table.delete(f"id = '{mem_id}'")
+        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
         return True
 
     def list_memories(
@@ -297,9 +325,9 @@ class MemoryStore:
         # Support both 'category' and 'categories' param names (Hermes core uses 'categories')
         effective_category = category if category is not None else categories
         if effective_category:
-            query = query.where(f"category = '{effective_category}'")
+            query = query.where(f"category = '{_escape_sql(effective_category)}'")
         if scope:
-            query = query.where(f"scope = '{scope}'")
+            query = query.where(f"scope = '{_escape_sql(scope)}'")
         if tier:
             query = query.where(f"metadata LIKE '%\"tier\": \"{tier}\"%'")
 
@@ -328,15 +356,15 @@ class MemoryStore:
         vector = self.encode(query_text)
         search = self._table.search(vector, vector_column_name="vector")
         if category:
-            search = search.where(f"category = '{category}'")
+            search = search.where(f"category = '{_escape_sql(category)}'")
         if scope:
-            search = search.where(f"scope = '{scope}'")
+            search = search.where(f"scope = '{_escape_sql(scope)}'")
         # Fetch extra to account for archived rows we'll filter out
         results = search.limit(limit * 3).to_list()
         return [
             self._row_to_dict(r, distance=r.get("_distance"))
             for r in results
-            if ARCHIVED_STATE not in r.get("metadata", "")
+            if not _is_archived(r.get("metadata", ""))
         ][:limit]
 
     def _bm25_search(
@@ -346,15 +374,15 @@ class MemoryStore:
         # columns by default, which pollutes results with id/category/metadata.
         search = self._table.search(query_text, query_type="fts", fts_columns=["text"])
         if category:
-            search = search.where(f"category = '{category}'")
+            search = search.where(f"category = '{_escape_sql(category)}'")
         if scope:
-            search = search.where(f"scope = '{scope}'")
+            search = search.where(f"scope = '{_escape_sql(scope)}'")
         # Fetch extra to account for archived rows we'll filter out
         results = search.limit(limit * 3).to_list()
         return [
             self._row_to_dict(r)
             for r in results
-            if ARCHIVED_STATE not in r.get("metadata", "")
+            if not _is_archived(r.get("metadata", ""))
         ][:limit]
 
     def _hybrid_search(
@@ -367,7 +395,8 @@ class MemoryStore:
         # Build lookup maps
         vector_map = {r["id"]: r for r in vector_results}
         bm25_map = {r["id"]: r for r in bm25_results}
-        all_ids = set(vector_map.keys()) | set(bm25_map.keys())
+        # Deterministic ordering: vector results first, then BM25-only
+        all_ids = list(vector_map.keys()) + [mid for mid in bm25_map if mid not in vector_map]
 
         results = []
         for mid in all_ids:
@@ -392,25 +421,41 @@ class MemoryStore:
         Used for BM25 ghost protection."""
         results = (
             self._table.search()
-            .where(f"id = '{mem_id}'")
+            .where(f"id = '{_escape_sql(mem_id)}'")
             .limit(1)
             .to_list()
         )
         if not results:
             return False
         # Filter out archived/superseded rows
-        return ARCHIVED_STATE not in results[0].get("metadata", "")
+        return not _is_archived(results[0].get("metadata", ""))
+
+    def check_ids(self, mem_ids: List[str]) -> List[str]:
+        """Batch check which memory IDs exist in the store (excluding archived rows).
+        Used for BM25 ghost protection to avoid N+1 queries."""
+        if not mem_ids:
+            return []
+        escaped = ",'".join(_escape_sql(mid) for mid in mem_ids)
+        results = (
+            self._table.search()
+            .where(f"id IN ('{escaped}')")
+            .to_list()
+        )
+        return [
+            r["id"] for r in results
+            if not _is_archived(r.get("metadata", ""))
+        ]
 
     def increment_access_count(self, mem_id: str) -> bool:
         """Increment access count and update last_accessed_at."""
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
-        metadata = existing["metadata"] if isinstance(existing["metadata"], dict) else json.loads(existing["metadata"])
+        metadata = _parse_metadata(existing["metadata"])
         metadata["access_count"] = metadata.get("access_count", 0) + 1
         metadata["last_accessed_at"] = int(time.time() * 1000)
         self._table.update(
-            where=f"id = '{mem_id}'",
+            where=f"id = '{_escape_sql(mem_id)}'",
             values={"metadata": json.dumps(metadata)},
         )
         return True
@@ -426,7 +471,7 @@ class MemoryStore:
         for row in all_results:
             cat = row.get("category", "unknown")
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
-            meta = json.loads(row.get("metadata", "{}"))
+            meta = _parse_metadata(row.get("metadata", "{}"))
             tier = meta.get("tier", "working")
             tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
@@ -455,13 +500,13 @@ class MemoryStore:
         all_results = self._table.search().limit(10000).to_list()
         purged = 0
         for row in all_results:
-            meta = json.loads(row.get("metadata", "{}"))
+            meta = _parse_metadata(row.get("metadata", "{}"))
             if meta.get("state") == "archived":
                 invalidated = meta.get("invalidated_at", 0)
                 if invalidated and invalidated < cutoff_ms:
                     mem_id = row.get("id", "")
                     if mem_id:
-                        self._table.delete(f"id = '{mem_id}'")
+                        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
                         purged += 1
 
         if purged:
@@ -481,7 +526,7 @@ class MemoryStore:
             "scope": row["scope"],
             "importance": row["importance"],
             "timestamp": row["timestamp"],
-            "metadata": json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"],
+            "metadata": _parse_metadata(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"],
         }
         if distance is not None:
             result["_distance"] = distance

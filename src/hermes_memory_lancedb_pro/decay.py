@@ -291,7 +291,10 @@ def evaluate_all_tiers(
     for mem in memories:
         metadata = mem.get("metadata", {})
         if isinstance(metadata, str):
-            metadata = json.loads(metadata)
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
 
         decay = compute_decay_score(metadata, now_ms, decay_config)
         new_tier = evaluate_tier(metadata, decay, tier_config)
@@ -430,7 +433,10 @@ class ScoringPipeline:
         for entry in results:
             metadata = entry.get("metadata", {})
             if isinstance(metadata, str):
-                metadata = json.loads(metadata)
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
 
             decay = compute_decay_score(metadata, now_ms, decay_config)
             entry["_decay"] = decay

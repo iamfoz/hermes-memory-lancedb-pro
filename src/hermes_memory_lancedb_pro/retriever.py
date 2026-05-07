@@ -105,13 +105,13 @@ class HybridRetriever:
         # Step 4: Noise filter
         scored = [e for e in scored if not is_noise(e.get("text", ""))]
 
-        # Step 5: MMR diversity
+        # Step 5: Cross-encoder reranking (best relevance signal — before diversity)
+        scored = self._rerank(query, scored, top_n=5)
+
+        # Step 6: MMR diversity (filter after rerank so diversity operates on correct ordering)
         scored_tuples = [(e, e.get("_final_score", 0)) for e in scored]
         diverse = mmr_diversity_filter(scored_tuples, similarity_threshold=0.85)
         scored = [e for e, _ in diverse]
-
-        # Step 5.5: Cross-encoder reranking (LLM-based)
-        scored = self._rerank(query, scored, top_n=5)
 
         # Step 6: Lifecycle hooks — increment access count for recalled items
         if source in ("manual", "auto-recall"):
@@ -129,21 +129,27 @@ class HybridRetriever:
         Filter BM25-only results that are ghost entries (not in vector index).
 
         Per spec: BM25-only results checked via store.hasId() to avoid FTS
-        residual ghost entries. Here we filter BM25 results whose IDs don't
-        exist in the vector result set AND aren't confirmed in the store.
+        residual ghost entries. Batch query to avoid N+1 database calls.
         """
         vector_ids = {r["id"] for r in vector_results}
+        # BM25-only IDs not in vector results
+        bm25_only_ids = [entry["id"] for entry in bm25_results if entry["id"] not in vector_ids]
+        
+        # Batch check store for BM25-only IDs
+        if bm25_only_ids:
+            confirmed = set(self.store.check_ids(bm25_only_ids))
+        else:
+            confirmed = set()
+        
         filtered = []
         for entry in bm25_results:
             mid = entry["id"]
             # Keep if also in vector results (definitely real)
             if mid in vector_ids:
                 filtered.append(entry)
-            else:
-                # Check store to confirm entry exists (not a ghost)
-                if self.store.has_id(mid):
-                    filtered.append(entry)
-                # Otherwise it's a ghost — drop it
+            elif mid in confirmed:
+                filtered.append(entry)
+            # Otherwise it's a ghost — drop it
         return filtered
 
     def _vector_dominant_fusion(
@@ -165,12 +171,14 @@ class HybridRetriever:
         Returns:
             List of entries with _fusion_score set
         """
-        # Build lookup maps
+        # Build lookup maps + rank dicts
         vector_map = {r["id"]: r for r in vector_results}
+        vector_ranks = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
         bm25_map = {r["id"]: r for r in bm25_results}
         bm25_ranks = {r["id"]: i + 1 for i, r in enumerate(bm25_results)}
 
-        all_ids = set(vector_map.keys()) | set(bm25_map.keys())
+        # Ordered union: vector results first (in rank order), then BM25-only hits
+        all_ids = list(vector_map.keys()) + [mid for mid in bm25_map if mid not in vector_map]
 
         # Normalise vector distances to [0, 1] range across this batch
         # (raw cosine distances can exceed 1.0 for very dissimilar vectors)
@@ -213,7 +221,10 @@ class HybridRetriever:
                 # Importance preservation floor
                 metadata = entry.get("metadata", {})
                 if isinstance(metadata, str):
-                    metadata = json.loads(metadata)
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
                 importance = metadata.get("importance", 0.5)
                 if importance >= 0.8:
                     fusion_score = max(fusion_score, 0.12)
@@ -224,7 +235,7 @@ class HybridRetriever:
                 continue
 
             entry["_fusion_score"] = fusion_score
-            entry["_vector_rank"] = (list(vector_map.keys()).index(mid) + 1) if in_vector else None
+            entry["_vector_rank"] = vector_ranks.get(mid) if in_vector else None
             entry["_bm25_rank"] = bm25_ranks.get(mid)
             fused.append(entry)
 
@@ -232,6 +243,9 @@ class HybridRetriever:
         fused.sort(key=lambda e: e.get("_fusion_score", 0), reverse=True)
 
         return fused
+
+    # Throttle counter for lifecycle evaluation
+    _lifecycle_call_count = 0
 
     def _run_recall_lifecycle(
         self,
@@ -242,11 +256,24 @@ class HybridRetriever:
           1. Increment access count for each recalled item
           2. Update last_accessed_at
           3. Evaluate tier promotions/demotions for affected scope
+
+        Throttling: Access count increment happens every call, but the
+        expensive full-store tier evaluation (list_memories + evaluate_all_tiers
+        + write-back) only runs every 10th call. Without this throttle, every
+        search triggers hundreds of DB operations — list_memories(limit=500),
+        decay computation on every memory, then conditional writes back.
         """
+        HybridRetriever._lifecycle_call_count += 1
+
+        # Always increment access counts — this is lightweight per-item
         for entry in results:
             mem_id = entry.get("id")
             if mem_id:
                 self.store.increment_access_count(mem_id)
+
+        # Throttle full-store tier evaluation to every 10th call
+        if HybridRetriever._lifecycle_call_count % 10 != 0:
+            return
 
         # Evaluate tier changes across the full store (not just recalled items)
         # This is the "scoreAll" + "evaluateAll" cycle from the spec
