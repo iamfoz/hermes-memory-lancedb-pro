@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.5.0"
+version = "0.6.0"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -76,6 +76,16 @@ ignore = [
 # hermes-agent is on PYTHONPATH; the lazy import is by design.
 "src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415"]
 "src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912"]
+# smart_extractor's process_candidate is a long dispatch table over the 7
+# dedup decisions — collapsing it via a function-table hurts readability
+# and the per-branch logic is what reviewers want to read.
+"src/hermes_memory_lancedb_pro/smart_extractor.py" = ["PLR0911", "PLR0912", "PLR0915", "PLC0415"]
+# llm_client has multi-step env-detection + JSON-repair state machine that
+# read more cleanly with explicit early returns than nested gates.
+"src/hermes_memory_lancedb_pro/llm_client.py" = ["PLR0911", "PLR0912"]
+# smart_metadata's defaults / context-normalisation switch on many enum
+# values — flat returns are clearer than match/case here.
+"src/hermes_memory_lancedb_pro/smart_metadata.py" = ["PLR0911"]
 # score_text is a flat lookup over many score buckets — collapsing the
 # returns into a single expression hurts readability.
 "src/hermes_memory_lancedb_pro/session_compressor.py" = ["PLR0911", "PLR1714"]
