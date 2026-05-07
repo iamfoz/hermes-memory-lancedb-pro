@@ -616,10 +616,9 @@ Environment variables (all optional):
 | `MEMORY_MD`                    | `~/.hermes/memory/MEMORY.md`       | Seed file for `memory_init.sh`                                    |
 | `HERMES_PYTHON`                | auto-detected                      | Python interpreter for the init script                            |
 | `HF_TOKEN`                     | *(none)*                           | HuggingFace token (avoids rate limits on embedding model download) |
-| `MEMORY_RERANKER`              | `auto`                             | Which reranker to use: `langsearch`, `google`, `disabled`, or `auto`. In `auto` mode the system picks whichever key is configured; if **both** are present it logs a warning and disables reranking until you set this explicitly. |
-| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables LangSearch cross-encoder reranking. In `auto` mode, set this **or** `GOOGLE_API_KEY`+`GOOGLE_CLOUD_PROJECT`, not both. On persistent 401/403/429 the reranker is disabled for the session with one warning. |
-| `GOOGLE_API_KEY`               | *(none)*                           | Enables Google Discovery Engine Ranking API. Must be paired with `GOOGLE_CLOUD_PROJECT`. Free tier: 1,000 queries/month; ~$0.001/query thereafter. |
-| `GOOGLE_CLOUD_PROJECT`         | *(none)*                           | GCP project ID for the Google Ranking API. Also accepted as `GOOGLE_PROJECT_ID` or `GOOGLE_PROJECT`. Ensure the [Discovery Engine API](https://console.cloud.google.com/apis/library/discoveryengine.googleapis.com) is enabled for the project. |
+| `MEMORY_RERANKER`              | `auto`                             | Which reranker to use: `langsearch`, `google`, `disabled`, or `auto`. In `auto` mode the system picks whichever service is configured; if **both** are present it logs a warning and disables reranking until you set this explicitly. |
+| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables LangSearch cross-encoder reranking. In `auto` mode, set this **or** `GOOGLE_CLOUD_PROJECT` (not both). On persistent 401/403/429 the reranker is disabled for the session with one warning. |
+| `GOOGLE_CLOUD_PROJECT`         | *(none)*                           | Enables Google Discovery Engine Ranking API. Also accepted as `GOOGLE_PROJECT_ID` or `GOOGLE_PROJECT`. Ensure the [Discovery Engine API](https://console.cloud.google.com/apis/library/discoveryengine.googleapis.com) is enabled for the project. Free tier: 1,000 queries/month; ~$0.001/query thereafter. **No API key needed** — authentication uses Application Default Credentials (see below). |
 | `MEMORY_GOOGLE_RANKING_MODEL`  | `semantic-ranker-512@latest`       | Google ranking model name (advanced). |
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
@@ -629,6 +628,38 @@ Environment variables (all optional):
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
+
+### Google Ranking API — Authentication Setup
+
+The Google Discovery Engine Ranking API uses **OAuth2 authentication** —
+API keys are explicitly rejected. The plugin uses the `google-auth` library's
+[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
+(ADC) chain, which tries credential sources in this order:
+
+1. **Service account JSON** — recommended for production/server deployments:
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+   ```
+
+2. **Developer workstation** — run once on your local machine:
+   ```bash
+   gcloud auth application-default login
+   ```
+   Credentials are cached at
+   `~/.config/gcloud/application_default_credentials.json`.
+
+3. **GCP Metadata Server** — no configuration needed when running inside
+   GCP Compute Engine, Cloud Run, GKE, etc.
+
+Install `google-auth` before enabling this backend:
+
+```bash
+pip install 'hermes-memory-lancedb-pro[google]'
+# or: pip install google-auth
+```
+
+Then set `GOOGLE_CLOUD_PROJECT` (and optionally `MEMORY_RERANKER=google`)
+in `~/.hermes/.env`. No API key is required.
 
 ### LLM extraction (Smart Extractor)
 
