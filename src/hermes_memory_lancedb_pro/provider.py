@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any
 
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
@@ -83,6 +84,40 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
     except Exception as e:
         logger.debug("lancedb_pro: SmartExtractor construction failed: %s", e)
         return None
+
+
+_TOKEN_RE = re.compile(r"[a-z']{2,}")
+
+
+def _response_references_memory(response_lower: str, memory_text: str) -> bool:
+    """Heuristic: did the assistant response reference this memory?
+
+    Looks for any 3-word phrase from the memory in the response. Robust
+    to paraphrasing — "user prefers Vim" recalled, response mentions
+    "your Vim shortcuts" — the 3-word "your vim shortcuts" wouldn't
+    match, but "prefers vim shortcuts" or any 3-word window from the
+    memory that the response also contains will hit.
+
+    For very short memories (< 3 tokens) falls back to substring match.
+    """
+    mem_lower = (memory_text or "").lower().strip()
+    if not mem_lower or not response_lower:
+        return False
+    tokens = _TOKEN_RE.findall(mem_lower)
+    if len(tokens) < 3:
+        return mem_lower in response_lower
+    for i in range(len(tokens) - 2):
+        phrase = f"{tokens[i]} {tokens[i + 1]} {tokens[i + 2]}"
+        if phrase in response_lower:
+            return True
+    # Fallback: a long memory might lose its 3-grams to paraphrasing.
+    # Check if the response contains 3+ distinctive (length > 4) tokens
+    # from the memory.
+    distinctive = {t for t in tokens if len(t) > 4}
+    if not distinctive:
+        return False
+    hits = sum(1 for t in distinctive if t in response_lower)
+    return hits >= 3
 
 
 def _format_recall(results: list[dict[str, Any]]) -> str:
@@ -181,12 +216,11 @@ def _build_provider_class():
 
         # ---- Read path ----------------------------------------------------
 
-        def prefetch(self, query: str, *, session_id: str = "") -> str:
-            """Run a session-scoped recall and return the formatted block.
-
-            The session_id passed by hermes-agent is the active turn's
-            session — we forward it to MemoryRetriever.retrieve() so old
-            sessions' memories don't bleed into the new conversation."""
+        def _do_recall(self, query: str, session_id: str) -> str:
+            """Shared implementation for both `prefetch` and
+            `before_prompt_build`. Runs a session-scoped recall, caches
+            the returned ids in `_pending_used_ids[session_id]` so we
+            can credit them later, and returns the formatted block."""
             if not query or not query.strip():
                 return ""
             try:
@@ -198,17 +232,42 @@ def _build_provider_class():
                     source="auto-recall",
                 )
             except Exception as e:
-                logger.warning("lancedb_pro prefetch failed: %s", e)
+                logger.warning("lancedb_pro recall failed: %s", e)
                 return ""
 
             if results and session_id:
-                # Track which ids hermes-agent ended up showing the model
-                # so we can credit them properly on sync_turn.
                 self._pending_used_ids[session_id] = [
                     r["id"] for r in results if r.get("id")
                 ]
-
             return _format_recall(results)
+
+        def prefetch(self, query: str, *, session_id: str = "") -> str:
+            """User-message memory injection (legacy hermes-agent path).
+
+            Returns the formatted recall block. On hermes-agent versions
+            that support `before_prompt_build`, this method is NOT
+            called — the host detects our override and skips prefetch
+            to avoid double-injection. On older hermes-agent, this is
+            the only injection point."""
+            return self._do_recall(query, session_id)
+
+        def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
+            """System-prompt memory injection (new hermes-agent path).
+
+            On hosts that support the hook (introduced via the
+            corresponding hermes-agent PR), this places the recall
+            block in the system prompt — a more authoritative position
+            than the user message. The host calls this instead of
+            `prefetch` for providers that override it; we override it,
+            so on a new host we'll always go through here.
+
+            Older hosts never call this method, so it's dormant for
+            users who haven't picked up the hermes-agent change. The
+            plugin keeps both methods so the SAME wheel works against
+            both old and new hermes-agent."""
+            query = str(turn_state.get("query") or "")
+            session_id = str(turn_state.get("session_id") or "")
+            return self._do_recall(query, session_id)
 
         # ---- Write path ---------------------------------------------------
 
@@ -311,6 +370,68 @@ def _build_provider_class():
             # going to credit recalls that were never confirmed.
             if parent_session_id:
                 self._pending_used_ids.pop(parent_session_id, None)
+
+        def on_recall_used(
+            self,
+            response_text: str,
+            *,
+            session_id: str = "",
+        ) -> None:
+            """Credit memories the response actually referenced.
+
+            On hermes-agent hosts that support this hook, fires once per
+            turn with the full assistant response. We do a phrase-overlap
+            match between each prefetched memory and the response and
+            credit only the matches — far more precise than the legacy
+            "credit everything we prefetched" approach.
+
+            When this hook fires, we consume the per-session
+            `_pending_used_ids` ledger so `sync_turn`'s legacy
+            timing-based crediting becomes a no-op (no double-credit)."""
+            ids = self._pending_used_ids.pop(session_id or "", None) if session_id else None
+            if not ids:
+                return
+
+            response_lower = (response_text or "").lower()
+            if not response_lower.strip():
+                return
+
+            used: list[str] = []
+            for mem_id in ids:
+                try:
+                    row = self._store.get_by_id(mem_id)
+                except Exception:
+                    continue
+                if not row:
+                    continue
+                if _response_references_memory(response_lower, row.get("text") or ""):
+                    used.append(mem_id)
+
+            if used:
+                try:
+                    self._store.mark_recall_used(used, session_id=session_id)
+                except Exception as e:
+                    logger.warning(
+                        "lancedb_pro mark_recall_used (on_recall_used) failed: %s", e,
+                    )
+
+        def on_tool_call_observed(
+            self,
+            tool_name: str,
+            args: dict[str, Any],
+            result: Any,
+            *,
+            session_id: str = "",
+            success: bool = True,
+        ) -> None:
+            """Hook for observing every tool call. Currently a no-op
+            stub — placeholder for future entity-extraction logic
+            ('agent kept calling read_file on /foo' → high-utility
+            entity). Fires for both successful and failed tool calls."""
+            # Intentionally minimal. The hook is wired so future
+            # versions of the plugin can extract entities here without
+            # requiring another hermes-agent change.
+            return
 
         def on_memory_write(
             self,
