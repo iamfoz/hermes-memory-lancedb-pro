@@ -254,7 +254,9 @@ def _build_provider_class():
             used = self._pending_used_ids.pop(session_id, None) if session_id else None
             if used:
                 try:
-                    self._store.mark_recall_used(used)
+                    # Pass session_id so the cross-session auto-promotion
+                    # ledger can track distinct-session usage.
+                    self._store.mark_recall_used(used, session_id=session_id)
                 except Exception as e:
                     logger.warning("lancedb_pro mark_recall_used failed: %s", e)
 

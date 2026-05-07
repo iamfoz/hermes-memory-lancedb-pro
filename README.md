@@ -543,6 +543,8 @@ Environment variables (all optional):
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300`                            | Min seconds between access_count increments for the same memory  |
 | `MEMORY_MIN_RECALL_SCORE`      | `0.0`                              | Default `min_score` for `MemoryRetriever.retrieve()` (0 = permissive) |
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
+| `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
+| `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
 
 ## Scripts
 
@@ -551,6 +553,24 @@ Environment variables (all optional):
 | `scripts/memory_init.sh`        | Create DB, seed from MEMORY.md, auto-recover if corrupt  |
 | `scripts/memory_reset.sh`       | Wipe DB + reinitialise (uses sibling `memory_init.sh`)   |
 | `scripts/memory_smoke_test.py`  | End-to-end test suite (use `--ephemeral` for tmp DB)     |
+
+After `pip install -e .` you also get two console entry points:
+
+```bash
+hermes-memory-smoke --ephemeral    # full E2E smoke test
+hermes-memory --help               # admin CLI: export / import / doctor
+hermes-memory export --out backup.jsonl
+hermes-memory import --in backup.jsonl --reembed
+hermes-memory doctor               # diagnostic report; recommends purge / compaction
+```
+
+`MemoryStore.warmup()` is also worth calling at agent boot so the
+embedding-model load + JIT cost doesn't land on the user's first turn:
+
+```python
+from hermes_memory_lancedb_pro import MemoryStore
+MemoryStore.get_instance().warmup()
+```
 
 ## Tests
 
