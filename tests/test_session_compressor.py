@@ -138,15 +138,15 @@ class TestScoreText:
     # --- substantive ---
 
     def test_substantive_non_cjk(self):
-        # Must be >80 chars to be substantive for Latin text
-        text = "a" * 81
+        # Must be >40 chars to be substantive for Latin text
+        text = "a" * 41
         result = score_text(text, 0)
         assert result.score == 0.7
         assert result.reason == "substantive"
 
     def test_non_cjk_at_threshold_not_substantive(self):
-        # Exactly 80 chars — NOT substantive (threshold is strictly greater)
-        text = "a" * 80
+        # Exactly 40 chars — NOT substantive (threshold is strictly greater)
+        text = "a" * 40
         result = score_text(text, 0)
         assert result.reason != "substantive"
 
@@ -215,6 +215,85 @@ class TestScoreText:
         result = score_text("Use dark mode", 0)
         assert result.score == 0.4
         assert result.reason == "short_statement"
+
+    # --- corrections: inflected forms (post v0.9.0 fix) ---
+
+    @pytest.mark.parametrize("text", [
+        "Fixed it",
+        "Fixed the deployment bug",
+        "I'm fixing the issue now",
+        "Fixes the regression",
+        "Corrected the typo",
+        "Correcting the example output",
+        "There were corrections to the spec",
+    ])
+    def test_correction_inflected(self, text: str):
+        result = score_text(text, 0)
+        assert result.score == 0.95, f"expected correction score for {text!r}"
+        assert result.reason == "correction"
+
+    # --- decisions: inflected forms ---
+
+    @pytest.mark.parametrize("text", [
+        "Decided on option B",
+        "We're deciding now",
+        "Confirms the new schedule",
+        "Approving the rollout",
+    ])
+    def test_decision_inflected(self, text: str):
+        result = score_text(text, 0)
+        assert result.score == 0.85, f"expected decision score for {text!r}"
+        assert result.reason == "decision"
+
+    # --- greetings (post v0.9.0 fix) ---
+
+    @pytest.mark.parametrize("text", [
+        "Hi",
+        "Hello",
+        "Hey!",
+        "Howdy",
+        "Good morning",
+        "Good afternoon!",
+        "How are you?",
+        "How are things going?",
+        "How's it going?",
+        "你好",
+        "您好",
+    ])
+    def test_greeting_scored_low(self, text: str):
+        result = score_text(text, 0)
+        assert result.score == 0.1, f"expected greeting score for {text!r}"
+        assert result.reason == "greeting"
+
+    def test_greeting_does_not_swallow_substantive(self):
+        # "Hi, the deployment failed because of a port conflict on 8080."
+        # starts with "Hi" but is substantive; greeting pattern is anchored
+        # to whole-line so this should NOT match greeting.
+        text = "Hi, the deployment failed because of a port conflict on 8080."
+        result = score_text(text, 0)
+        assert result.reason != "greeting"
+
+    # --- substantive: technical sentences in the 40-80 char range
+    # used to fall into short_statement (0.4); now they correctly score
+    # higher than short questions and greetings.
+
+    def test_short_technical_sentence_is_substantive(self):
+        text = "The deployment failed because of a port conflict"
+        assert 40 < len(text) <= 80, "test premise: between 40 and 80 chars"
+        result = score_text(text, 0)
+        assert result.score == 0.7
+        assert result.reason == "substantive"
+
+    def test_substantive_outranks_greeting_and_question(self):
+        # The headline regression from the bug report: a real technical
+        # statement should outrank "How are you?" / "Hi".
+        substantive = score_text("The deployment failed because of a port conflict", 0).score
+        greeting = score_text("How are you?", 0).score
+        hi = score_text("Hi", 0).score
+        fixed_it = score_text("Fixed it", 0).score
+        assert substantive > greeting
+        assert substantive > hi
+        assert fixed_it > substantive  # corrections outrank substantive
 
     # --- index is preserved ---
 
