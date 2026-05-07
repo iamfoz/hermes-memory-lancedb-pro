@@ -616,7 +616,11 @@ Environment variables (all optional):
 | `MEMORY_MD`                    | `~/.hermes/memory/MEMORY.md`       | Seed file for `memory_init.sh`                                    |
 | `HERMES_PYTHON`                | auto-detected                      | Python interpreter for the init script                            |
 | `HF_TOKEN`                     | *(none)*                           | HuggingFace token (avoids rate limits on embedding model download) |
-| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables cross-encoder reranking in `MemoryRetriever`. Unset → reranking is skipped silently. If the key is set but the API returns 401/403/429, reranking is disabled for the lifetime of the retriever (one warning, no log spam) and results fall back to fusion-only ranking. |
+| `MEMORY_RERANKER`              | `auto`                             | Which reranker to use: `langsearch`, `google`, `disabled`, or `auto`. In `auto` mode the system picks whichever key is configured; if **both** are present it logs a warning and disables reranking until you set this explicitly. |
+| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables LangSearch cross-encoder reranking. In `auto` mode, set this **or** `GOOGLE_API_KEY`+`GOOGLE_CLOUD_PROJECT`, not both. On persistent 401/403/429 the reranker is disabled for the session with one warning. |
+| `GOOGLE_API_KEY`               | *(none)*                           | Enables Google Discovery Engine Ranking API. Must be paired with `GOOGLE_CLOUD_PROJECT`. Free tier: 1,000 queries/month; ~$0.001/query thereafter. |
+| `GOOGLE_CLOUD_PROJECT`         | *(none)*                           | GCP project ID for the Google Ranking API. Also accepted as `GOOGLE_PROJECT_ID` or `GOOGLE_PROJECT`. Ensure the [Discovery Engine API](https://console.cloud.google.com/apis/library/discoveryengine.googleapis.com) is enabled for the project. |
+| `MEMORY_GOOGLE_RANKING_MODEL`  | `semantic-ranker-512@latest`       | Google ranking model name (advanced). |
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
 | `MEMORY_TIER_EVAL_BATCH`       | `500`                              | Rows fetched per tier evaluation                                  |
