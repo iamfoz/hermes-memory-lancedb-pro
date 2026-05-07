@@ -227,6 +227,16 @@ This package has **no** dependency on jmunch-mcp; the two are completely
 orthogonal and can be installed together or separately without
 interfering.
 
+The provider opportunistically uses three new hooks
+(`before_prompt_build`, `on_recall_used`, `on_tool_call_observed`) that
+are introduced via [a parallel hermes-agent PR](https://github.com/iamfoz/hermes-agent/pull/1).
+On hosts that have those hooks merged, memory recall is injected into
+the **system prompt** rather than the user message — a more authoritative
+position for the LLM, with cleaner separation between agent context and
+user input. On hosts without the hooks, the plugin falls back to the
+classic user-message injection path automatically. Same wheel works
+against both versions.
+
 ## Write-side helpers (CortexReach feature parity)
 
 These modules support extraction / admission / compaction pipelines without
