@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.3.0"
+version = "0.4.0"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -76,5 +76,8 @@ ignore = [
 # hermes-agent is on PYTHONPATH; the lazy import is by design.
 "src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415"]
 "src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912"]
+# score_text is a flat lookup over many score buckets — collapsing the
+# returns into a single expression hurts readability.
+"src/hermes_memory_lancedb_pro/session_compressor.py" = ["PLR0911", "PLR1714"]
 # The rerank function has many fail-soft early returns by design.
 "src/hermes_memory_lancedb_pro/retriever.py" = ["PLR0911", "PLR0912"]
