@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Pure-Python re-exports (safe — no heavy deps)
 # Reflection layer (PR 2). Pure-Python; the storage adapter delegates to
@@ -36,6 +36,21 @@ from .decay import (  # noqa: F401
     is_noise,
     mmr_diversity_filter,
 )
+
+# Smart extractor + LLM client (PR 3). Both are import-safe without an LLM
+# SDK installed — the LLM clients lazy-import `openai` / `anthropic` only on
+# instantiation, and the extractor's pipeline branches on `llm is None`.
+from .extraction_prompts import (  # noqa: F401
+    build_dedup_prompt,
+    build_extraction_prompt,
+    build_merge_prompt,
+)
+from .llm_client import (  # noqa: F401
+    AnthropicLlmClient,
+    LlmClient,
+    OpenAICompatibleLlmClient,
+    create_llm_client_from_env,
+)
 from .memory_categories import (  # noqa: F401
     MEMORY_CATEGORIES as SMART_MEMORY_CATEGORIES,
 )
@@ -50,6 +65,25 @@ from .session_compressor import (  # noqa: F401
     compress_texts,
     estimate_conversation_value,
     score_text,
+)
+from .smart_extractor import (  # noqa: F401
+    DedupResult,
+    ExtractionRateLimiter,
+    ExtractionStats,
+    SmartExtractor,
+    SmartExtractorConfig,
+    strip_envelope_metadata,
+)
+from .smart_metadata import (  # noqa: F401
+    SmartMemoryMetadata,
+    SupportInfoV2,
+    SupportSlice,
+    build_smart_metadata,
+    derive_fact_key,
+    parse_smart_metadata,
+    parse_support_info,
+    stringify_smart_metadata,
+    update_support_stats,
 )
 from .temporal_classifier import (  # noqa: F401
     TemporalType,
@@ -154,4 +188,28 @@ __all__ = [
     "record_compaction_run",
     # Reflection layer (subpackage)
     "reflection",
+    # Smart extractor + LLM client
+    "AnthropicLlmClient",
+    "DedupResult",
+    "ExtractionRateLimiter",
+    "ExtractionStats",
+    "LlmClient",
+    "OpenAICompatibleLlmClient",
+    "SmartExtractor",
+    "SmartExtractorConfig",
+    "build_dedup_prompt",
+    "build_extraction_prompt",
+    "build_merge_prompt",
+    "create_llm_client_from_env",
+    "strip_envelope_metadata",
+    # Smart metadata (L0/L1/L2 + support stats + fact-key)
+    "SmartMemoryMetadata",
+    "SupportInfoV2",
+    "SupportSlice",
+    "build_smart_metadata",
+    "derive_fact_key",
+    "parse_smart_metadata",
+    "parse_support_info",
+    "stringify_smart_metadata",
+    "update_support_stats",
 ]

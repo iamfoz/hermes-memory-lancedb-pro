@@ -312,6 +312,103 @@ if verdict.decision == "pass_to_dedup":
 The audit record on every verdict (`verdict.audit`) gives you the per-feature
 score breakdown for tuning, plus a structured rejection reason.
 
+### Smart extractor (LLM-driven 6-category extraction with switchable fallback)
+
+When an LLM client is available, the smart extractor replaces "store
+the raw user / assistant turn" with a structured 6-category pipeline
+(profile / preferences / entities / events / cases / patterns), per-line
+L0/L1/L2 metadata, vector-pre-filter + LLM-driven dedup decisions
+(create / merge / skip / supersede / support / contextualize / contradict),
+and admission-control gating.
+
+**The extractor is switchable**: when `llm=None`, `extract_and_persist`
+falls back to writing the raw user + assistant turns as separate
+memories — exactly the legacy shape the hermes-agent provider has
+always produced.
+
+#### Auto-detection — piggy-backs on whatever the agent uses
+
+`create_llm_client_from_env()` checks env vars in this order:
+
+1. `MEMORY_EXTRACTION_API_KEY` + `MEMORY_EXTRACTION_BASE_URL` +
+   `MEMORY_EXTRACTION_MODEL` → dedicated cheap-extractor override
+2. `MEMORY_EXTRACTION_PROVIDER=anthropic` + `MEMORY_EXTRACTION_API_KEY`
+   → Anthropic SDK
+3. `OPENAI_API_KEY` (with optional `OPENAI_BASE_URL` /
+   `OPENAI_MODEL`) → OpenAI-compat SDK; this is what makes
+   **jmunch → Qwen / Ollama / LM Studio / OpenRouter just work** —
+   the same env vars that point hermes-agent at your jmunch proxy
+   serve the extractor too.
+4. `ANTHROPIC_API_KEY` → Anthropic SDK
+5. None of the above → returns `None` → extractor stays in fallback
+
+The `LanceDBProMemoryProvider` adapter calls this factory at construction
+time. If the result is non-None, smart extraction is used on every
+`sync_turn`; if None, the legacy shape is preserved.
+
+```python
+from hermes_memory_lancedb_pro import (
+    SmartExtractor, create_llm_client_from_env, MemoryStore,
+)
+
+store = MemoryStore.get_instance()
+llm = create_llm_client_from_env()  # may be None
+extractor = SmartExtractor(store, llm=llm)
+
+extractor.has_llm           # → False if llm is None — fallback path
+stats = extractor.extract_and_persist(
+    user_content="I switched from Vim to Emacs.",
+    assistant_content="Got it — I'll remember that.",
+    session_key="sess-abc",
+    scope="agent",
+)
+# stats.created / merged / skipped / superseded / supported / rejected
+```
+
+The provider auto-wires this for you:
+
+```python
+from hermes_memory_lancedb_pro import LanceDBProMemoryProvider
+
+# auto_smart_extraction=True (default) → extractor built from env vars
+provider = LanceDBProMemoryProvider()
+
+# Or pass an explicit extractor / disable auto-detection
+provider = LanceDBProMemoryProvider(
+    smart_extractor=my_extractor,
+    auto_smart_extraction=False,
+)
+```
+
+#### Optional dependencies
+
+The `openai` and `anthropic` SDKs are **not** declared as required deps —
+they're imported lazily and only when the corresponding env vars resolve.
+A typical user installs one of:
+
+```bash
+pip install openai      # for OpenAI / OpenRouter / Ollama / jmunch / etc.
+pip install anthropic   # for native Anthropic
+```
+
+Without either, `create_llm_client_from_env()` returns `None` and the
+extractor stays in fallback mode. No errors, no breaking import.
+
+#### Custom LLM clients
+
+Any object with a `complete_json(prompt, *, label) -> dict | None` method
+satisfies `LlmClient` / `ExtractorLLM`. Useful for unit tests
+(`FakeLlm` returning canned JSON) or for routing through your own gateway:
+
+```python
+class MyGatewayLlm:
+    def complete_json(self, prompt, *, label=None):
+        # ... your own HTTP call, retry, telemetry ...
+        return {"memories": [...]}
+
+extractor = SmartExtractor(store, llm=MyGatewayLlm())
+```
+
 ### Reflection layer
 
 Captures structured insights from an LLM-produced reflection summary

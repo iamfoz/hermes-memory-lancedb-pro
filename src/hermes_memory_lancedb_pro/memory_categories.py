@@ -33,17 +33,23 @@ MEMORY_CATEGORIES: tuple[SmartCategory, ...] = (
     "patterns",
 )
 
-# Categories that are typically time-versioned (newer entries supersede older).
-TEMPORAL_VERSIONED_CATEGORIES: frozenset[SmartCategory] = frozenset({"events"})
+# Categories that are time-versioned: a newer entry with the same `fact_key`
+# supersedes the older one (the older row is marked invalidated). Lifted
+# from the CortexReach TS source — applied in smart_extractor's supersede
+# branch and in admission control's recency scoring.
+TEMPORAL_VERSIONED_CATEGORIES: frozenset[SmartCategory] = frozenset({
+    "preferences", "entities",
+})
 
 # Categories where merging two similar entries is always preferred over
-# storing a duplicate (vs. categories where each entry stands alone).
+# storing a duplicate. Profile is the canonical case: a single user has
+# one profile, even when discussed across many sessions.
 ALWAYS_MERGE_CATEGORIES: frozenset[SmartCategory] = frozenset({"profile"})
 
-# Categories that *support* merging (a candidate can be merged into a
-# matching existing entry rather than added fresh).
+# Categories that *support* merging (the LLM dedup `MERGE` decision is
+# valid for these; for other categories, MERGE degrades to CREATE).
 MERGE_SUPPORTED_CATEGORIES: frozenset[SmartCategory] = frozenset({
-    "profile", "preferences", "entities", "patterns",
+    "preferences", "entities", "patterns",
 })
 
 
