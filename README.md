@@ -312,6 +312,72 @@ if verdict.decision == "pass_to_dedup":
 The audit record on every verdict (`verdict.audit`) gives you the per-feature
 score breakdown for tuning, plus a structured rejection reason.
 
+### Reflection layer
+
+Captures structured insights from an LLM-produced reflection summary
+(invariants, derived deltas, lessons, decisions) and replays them on
+recall. Lives under `hermes_memory_lancedb_pro.reflection.*`. The LLM
+that *generates* the markdown summary is the caller's job (PR 3's
+smart_extractor will be the typical caller).
+
+```python
+from hermes_memory_lancedb_pro.reflection import (
+    MemoryStoreReflectionAdapter,
+    store_reflection_to_lancedb,
+    load_agent_reflection_slices_from_entries,
+    load_reflection_mapped_rows_from_entries,
+)
+
+# After an LLM has produced a reflection summary like:
+reflection_md = """## Invariants
+- always answer in UK English
+- prefer short responses
+
+## Derived
+- this run: ship the reflection layer
+- next run: write tests for the orchestrator
+"""
+
+adapter = MemoryStoreReflectionAdapter(store)
+result = store_reflection_to_lancedb(
+    adapter,
+    reflection_text=reflection_md,
+    session_key="sk", session_id="sess-1",
+    agent_id="alpha", command="reflect", scope="agent",
+    run_at=int(time.time() * 1000),
+)
+# Writes one event payload, one item-invariant per invariant line, one
+# item-derived per derived line, plus one combined-legacy bundle. The
+# combined-legacy is deduped against existing entries (cosine ≥ 0.97).
+
+# Later — recall on a fresh turn:
+entries = store.list_memories(limit=200)
+slices = load_agent_reflection_slices_from_entries(
+    entries=entries, agent_id="alpha",
+)
+# slices.invariants — top 8 invariants (logistic decay; midpoint 45 days)
+# slices.derived    — top 10 derived lines (midpoint 7 days)
+```
+
+Key behaviours ported from CortexReach's spec:
+
+- **Logistic decay** — invariants stay relevant for ~45 days, derived
+  for ~7. Used-fallback content gets a 0.75× penalty.
+- **Ownership guard** — `derived` items are strictly per-agent; an
+  agent can never see another agent's derived insights. `invariant`,
+  `mapped`, and legacy entries allow a "main"-agent fallback.
+- **Resolved-item suppression** — once all item rows in a section are
+  marked `resolved_at`, the section is suppressed *unless* legacy rows
+  carry unique unresolved content (the "P1/P2 fix"). Prevents the
+  reflection fallback path from reviving advice the user has already
+  moved on from.
+- **Mapped rows** — separate `user_model` / `agent_model` / `lesson` /
+  `decision` slices loaded via `load_reflection_mapped_rows_from_entries`,
+  each ranked + capped per kind.
+- **Prompt-injection guard** — every reflection line passes
+  `sanitize_injectable_reflection_lines` (drops "ignore previous",
+  `<system>...</system>`, etc.) before it can reach the LLM.
+
 ### Memory compactor
 
 Periodic cron that clusters similar old memories and merges them into one:
