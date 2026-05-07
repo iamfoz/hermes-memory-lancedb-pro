@@ -97,24 +97,30 @@ class TestCrud:
 
     def test_update_supersede(self, store):
         mid = store.store(text="original text content here")
-        assert store.update(mid, text="updated text content here", tier="core") is True
+        # update() returns the new ID after supersede (not bool)
+        new_id = store.update(mid, text="updated text content here", tier="core")
+        assert isinstance(new_id, str)
+        assert new_id != mid
         # Original is now archived
         assert store.has_id(mid) is False
         # Can still fetch the archived row by id (audit)
         archived = store.get_by_id(mid)
         assert archived["metadata"]["state"] == "archived"
-        assert archived["metadata"]["superseded_by"] is not None
-        new_id = archived["metadata"]["superseded_by"]
+        assert archived["metadata"]["superseded_by"] == new_id
         new_row = store.get_by_id(new_id)
         assert new_row is not None
         assert new_row["text"] == "updated text content here"
         assert new_row["metadata"]["tier"] == "core"
         assert new_row["metadata"]["supersedes"] == mid
         assert new_row["metadata"]["access_count"] == 0
+        # The README workflow chains has_id on the return value
+        assert store.has_id(new_id)
 
     def test_update_metadata_only(self, store):
         mid = store.store(text="immutable text content")
-        assert store.update(mid, importance=0.95, tier="core") is True
+        # Metadata-only update returns the same id (no supersede, no new row)
+        ret = store.update(mid, importance=0.95, tier="core")
+        assert ret == mid
         row = store.get_by_id(mid)
         assert row["importance"] == pytest.approx(0.95)
         assert row["metadata"]["tier"] == "core"
@@ -123,7 +129,7 @@ class TestCrud:
         assert "category" not in row["metadata"]
 
     def test_update_unknown_id(self, store):
-        assert store.update("not-a-real-id", text="anything") is False
+        assert store.update("not-a-real-id", text="anything") is None
 
     def test_forget(self, store):
         mid = store.store(text="will be deleted soon")
@@ -203,6 +209,25 @@ class TestQueries:
             results = store.search("alpha", limit=5, mode=mode)
             assert isinstance(results, list)
             assert all(isinstance(r, dict) for r in results), f"mode={mode} returned non-dict"
+
+    def test_search_results_have_normalised_score(self, store):
+        # Every result must carry a normalised `score` field in [0, 1]
+        # regardless of which underlying mode produced it. The raw
+        # mode-specific fields (`_rrf_score`, `_distance`, `_score`)
+        # are still preserved for advanced callers.
+        store.store_many([
+            {"text": f"beta normalised score entry {i} content here", "importance": 0.5}
+            for i in range(3)
+        ])
+        for mode in ("vector", "bm25", "hybrid"):
+            results = store.search("beta", limit=5, mode=mode)
+            assert results, f"no results for mode={mode}"
+            for r in results:
+                assert "score" in r, f"mode={mode} missing normalised score field"
+                assert isinstance(r["score"], float), f"mode={mode} score not a float"
+                assert 0.0 <= r["score"] <= 1.0, (
+                    f"mode={mode} score out of bounds: {r['score']}"
+                )
 
     def test_search_empty_query(self, store):
         store.store(text="some real content here for search")

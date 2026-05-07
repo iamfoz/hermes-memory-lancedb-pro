@@ -76,6 +76,11 @@ class MemoryRetriever:
         # Lazy: only constructed on first rerank call. Reuses connections
         # across reranks (cheap latency win on repeated retrievals).
         self._rerank_session: requests.Session | None = None
+        # Set to True when we hit a persistent auth/rate-limit error from
+        # LangSearch (401/403/429). Once tripped, we skip the rerank call
+        # for the rest of this retriever's lifetime so we don't spam the
+        # API or the logs. Cleared only by re-instantiating the retriever.
+        self._rerank_disabled: bool = False
 
     # ----- public -----
 
@@ -325,6 +330,8 @@ class MemoryRetriever:
         approach: any error returns the input list unmutated."""
         if not LANGSEARCH_API_KEY:
             return results
+        if self._rerank_disabled:
+            return results
         if len(results) <= 1:
             return results
 
@@ -364,6 +371,18 @@ class MemoryRetriever:
                     json=payload,
                     timeout=LANGSEARCH_TIMEOUT,
                 )
+                # Persistent auth or rate-limit failures: trip the disable
+                # flag so subsequent calls short-circuit. A bad/exhausted
+                # API key shouldn't spam the API or the logs forever.
+                if resp.status_code in (401, 403, 429):
+                    self._rerank_disabled = True
+                    logger.warning(
+                        "LangSearch rerank disabled for this session "
+                        "(HTTP %d). Check LANGSEARCH_API_KEY or quota. "
+                        "Falling back to fusion-only ranking.",
+                        resp.status_code,
+                    )
+                    return results
                 if 500 <= resp.status_code < 600 and attempt == 0:
                     last_err = Exception(f"5xx on rerank: {resp.status_code}")
                     continue
