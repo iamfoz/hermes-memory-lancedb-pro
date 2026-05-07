@@ -96,6 +96,105 @@ ACCESS_COUNT_THROTTLE_SECONDS: int = int(
     os.environ.get("MEMORY_ACCESS_COUNT_THROTTLE_S", "300")
 )
 
+# Auto-promote a memory to cross_session=True after it's been recalled in
+# this many distinct session_ids. Closes a loop in the session-scoping
+# design: memories that are useful across many conversations earn the
+# cross-session flag without manual intervention. 0 disables auto-promotion.
+CROSS_SESSION_PROMOTION_THRESHOLD: int = int(
+    os.environ.get("MEMORY_CROSS_SESSION_PROMOTION_K", "3")
+)
+
+# Prompt-injection guard mode — applied at every write site that takes
+# free-form text. Stops a malicious tool result or pasted snippet from
+# planting `<system>...</system>` / "ignore previous instructions" / etc.
+# into the memory store, where it would later be injected into a system
+# prompt and influence the agent. Modes:
+#   "off"      — no check (legacy behaviour; not recommended)
+#   "warn"     — log a warning, allow the write (default)
+#   "reject"   — raise ValueError
+#   "sanitize" — replace the offending content with a placeholder
+INJECTION_GUARD_MODE: str = os.environ.get(
+    "MEMORY_INJECTION_GUARD", "warn",
+).lower().strip()
+
+
+def _check_injection_guard(text: str, *, where: str) -> str:
+    """Apply the prompt-injection guard. Returns the (possibly sanitised)
+    text, or raises ValueError when mode == 'reject'.
+
+    `where` is a short label for log lines (e.g. "store", "supersede").
+
+    The guard reuses the same patterns as `reflection.slices` since
+    duplicating the regex list would let the two implementations drift."""
+    if not text or INJECTION_GUARD_MODE in ("off", ""):
+        return text
+
+    # Lazy import to avoid coupling store.py module load to reflection/.
+    try:
+        from .reflection.slices import is_unsafe_injectable_reflection_line
+    except ImportError:
+        return text
+
+    # The reflection helper checks per line. For free-form memory text
+    # (potentially multi-line) we check each line and decide based on
+    # the worst case across them.
+    lines = text.split("\n")
+    flagged: list[int] = []
+    for i, line in enumerate(lines):
+        if line.strip() and is_unsafe_injectable_reflection_line(line):
+            flagged.append(i)
+
+    if not flagged:
+        return text
+
+    preview = text[:120].replace("\n", "\\n")
+    if INJECTION_GUARD_MODE == "reject":
+        raise ValueError(
+            f"injection guard ({where}): refused to store text matching "
+            f"a prompt-injection pattern (preview={preview!r})"
+        )
+    if INJECTION_GUARD_MODE == "sanitize":
+        cleaned = [
+            "[content removed: prompt-injection guard]" if i in flagged else line
+            for i, line in enumerate(lines)
+        ]
+        logger.warning(
+            "injection guard (%s): sanitised %d line(s) before write (preview=%r)",
+            where, len(flagged), preview,
+        )
+        return "\n".join(cleaned)
+    # "warn" mode — log and pass through
+    logger.warning(
+        "injection guard (%s): %d suspicious line(s) in text being stored (preview=%r)",
+        where, len(flagged), preview,
+    )
+    return text
+
+
+def _append_relation(
+    existing: Any,
+    *,
+    relation_type: str,
+    target_id: str,
+) -> list[dict[str, str]]:
+    """Append `{type, target_id}` to a relations array, dedup on the
+    (type, target_id) pair. Used by the supersede path so that lineage
+    chains are walkable from either direction.
+
+    Mirrors the smaller helper in `smart_metadata.append_relation` but
+    without the dependency cycle (store.py can't import smart_metadata
+    at module load — `_handle_supersede` calls smart_metadata back the
+    other way)."""
+    out: list[dict[str, str]] = []
+    if isinstance(existing, list):
+        for r in existing:
+            if isinstance(r, dict):
+                out.append({"type": str(r.get("type", "")), "target_id": str(r.get("target_id", ""))})
+    seen = {(r["type"], r["target_id"]) for r in out}
+    if (relation_type, target_id) not in seen:
+        out.append({"type": relation_type, "target_id": target_id})
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -172,8 +271,31 @@ class MemoryStore:
             logger.debug("Loading embedding model: %s", self.embedding_model_name)
             self._embedder = SentenceTransformer(self.embedding_model_name)
 
+    def warmup(self) -> None:
+        """Pre-load the embedding model + run a throwaway encode.
+
+        First-time users pay a 10-30 s cold-start cost (model download +
+        torch JIT) on the very first `encode()` call. Hermes-agent should
+        call this on session init so that latency lands during boot
+        rather than the user's first turn. Idempotent; safe to call
+        repeatedly."""
+        self._initialise()
+        self._load_embedder()
+        try:
+            self._embedder.encode(  # type: ignore[union-attr]
+                "warmup", normalize_embeddings=True,
+            )
+        except Exception as e:
+            logger.warning("MemoryStore.warmup encode failed: %s", e)
+
     def _ensure_table(self):
-        """Open or create the memories table; create the FTS index on `text`."""
+        """Open or create the memories table; create the FTS index on `text`.
+
+        Tolerates a TOCTOU race between `list_tables()` and `create_table()`
+        — when two stores connect to the same path concurrently (common in
+        tests, possible in multi-process setups), the second one can see
+        an empty list and then collide on create. Treat "already exists"
+        as "open instead"."""
         table_name = "memories"
         # `list_tables()` is the supported API; `table_names()` is deprecated
         # in modern LanceDB but still present as a back-compat shim.
@@ -185,7 +307,14 @@ class MemoryStore:
             self._table = self._db.open_table(table_name)
             return
 
-        self._table = self._db.create_table(table_name, schema=MemorySchema)
+        try:
+            self._table = self._db.create_table(table_name, schema=MemorySchema)
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                self._table = self._db.open_table(table_name)
+                return
+            raise
+
         try:
             self._table.create_fts_index("text")
         except Exception as e:  # pragma: no cover — defensive
@@ -306,6 +435,7 @@ class MemoryStore:
         """Store a new memory entry. Returns the new memory ID."""
         if not text or not text.strip():
             raise ValueError("MemoryStore.store: `text` must be non-empty")
+        text = _check_injection_guard(text, where="store")
 
         category, tier, importance, confidence = self._normalise_inputs(
             category, tier, importance, confidence
@@ -353,6 +483,7 @@ class MemoryStore:
             text = entry["text"]
             if not text or not str(text).strip():
                 raise ValueError("store_many: every entry must have non-empty `text`")
+            text = _check_injection_guard(text, where="store_many")
 
             category, tier, importance, confidence = self._normalise_inputs(
                 entry.get("category", "other"),
@@ -410,6 +541,7 @@ class MemoryStore:
             raise ValueError("MemoryStore.store_raw: `text` must be non-empty")
         if not vector:
             raise ValueError("MemoryStore.store_raw: `vector` must be non-empty")
+        text = _check_injection_guard(text, where="store_raw")
 
         mem_id = str(uuid.uuid4())
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
@@ -528,18 +660,27 @@ class MemoryStore:
         metadata_extra: dict[str, Any] | None,
         now_ms: int,
     ) -> bool:
+        text = _check_injection_guard(text, where="supersede")
         old_id = existing["id"]
         new_id = str(uuid.uuid4())
 
-        # 1. Archive the old row (still readable for audit, hidden from queries)
+        # 1. Archive the old row (still readable for audit, hidden from queries).
+        # Also append a `superseded_by` relation to the relations chain so
+        # downstream tooling can walk the lineage.
         archived_meta = dict(old_metadata)
         archived_meta["state"] = ARCHIVED_STATE
         archived_meta["superseded_by"] = new_id
         archived_meta["invalidated_at"] = now_ms
+        archived_meta["relations"] = _append_relation(
+            archived_meta.get("relations"),
+            relation_type="superseded_by",
+            target_id=new_id,
+        )
 
         # 2. Fresh metadata for the new row — start from the old metadata so
         # custom fields (fact_key, source, relations…) carry forward, but
-        # reset lifecycle counters and link back to the predecessor.
+        # reset lifecycle counters and link back to the predecessor via both
+        # the `supersedes` field AND a relations entry.
         new_meta = dict(old_metadata)
         new_meta.pop("invalidated_at", None)
         new_meta.pop("superseded_by", None)
@@ -551,6 +692,11 @@ class MemoryStore:
         new_meta["access_count"] = 0
         new_meta["injected_count"] = 0
         new_meta["bad_recall_count"] = 0
+        new_meta["relations"] = _append_relation(
+            new_meta.get("relations"),
+            relation_type="supersedes",
+            target_id=old_id,
+        )
 
         # Apply caller overrides
         new_tier = tier if tier in MEMORY_TIERS else new_meta.get("tier", "working")
@@ -645,14 +791,78 @@ class MemoryStore:
         )
         return True
 
-    def mark_recall_used(self, mem_ids: Sequence[str]) -> int:
-        """Definitively mark memories as having been used (e.g. injected
-        into a prompt and meaningfully referenced). Bypasses the access
-        count throttle. Returns the number of memories actually updated."""
+    def mark_recall_used(
+        self,
+        mem_ids: Sequence[str],
+        *,
+        session_id: str | None = None,
+    ) -> int:
+        """Definitively mark memories as having been used (injected into
+        a prompt and meaningfully referenced). Bypasses the access-count
+        throttle. Returns the number of memories actually updated.
+
+        Batched: one IN-clause read + one update per id (the per-id
+        update is necessary because each row's metadata diverges).
+
+        When `session_id` is provided, also tracks the recall against
+        the row's `cross_session_recalls` set. Once a memory has been
+        recalled in `CROSS_SESSION_PROMOTION_THRESHOLD` distinct sessions
+        within the recent window, it's auto-promoted to
+        `cross_session=True` — closing a feedback loop in the design.
+        Memories that are useful across many conversations earn the
+        cross-session flag without manual intervention."""
+        if not mem_ids:
+            return 0
+
+        unique_ids = list(dict.fromkeys(mem_ids))
+        in_clause = ",".join(f"'{_escape_sql(mid)}'" for mid in unique_ids)
+        try:
+            rows = (
+                self._table.search()
+                .where(f"id IN ({in_clause})")
+                .limit(max(len(unique_ids), 1))
+                .to_list()
+            )
+        except Exception as e:
+            logger.warning("mark_recall_used batch fetch failed: %s", e)
+            return 0
+
+        now_ms = int(time.time() * 1000)
         updated = 0
-        for mem_id in mem_ids:
-            if self.increment_access_count(mem_id, force=True):
+        for row in rows:
+            mem_id = row.get("id")
+            if not mem_id:
+                continue
+            metadata = _parse_metadata(row.get("metadata"))
+            metadata["access_count"] = int(metadata.get("access_count", 0) or 0) + 1
+            metadata["last_accessed_at"] = now_ms
+
+            # Cross-session promotion ledger
+            if session_id and not metadata.get("cross_session"):
+                ledger = list(metadata.get("cross_session_recalls") or [])
+                if session_id not in ledger:
+                    ledger.append(session_id)
+                    # Cap the ledger to the most recent K entries; we only
+                    # need to know "K distinct sessions" not the full history.
+                    if len(ledger) > CROSS_SESSION_PROMOTION_THRESHOLD * 2:
+                        ledger = ledger[-CROSS_SESSION_PROMOTION_THRESHOLD * 2:]
+                    metadata["cross_session_recalls"] = ledger
+                    if len(ledger) >= CROSS_SESSION_PROMOTION_THRESHOLD:
+                        metadata["cross_session"] = True
+                        metadata["cross_session_promoted_at"] = now_ms
+                        logger.debug(
+                            "auto-promoted %s to cross_session after %d sessions",
+                            mem_id, len(ledger),
+                        )
+
+            try:
+                self._table.update(
+                    where=f"id = '{_escape_sql(mem_id)}'",
+                    values={"metadata": json.dumps(metadata)},
+                )
                 updated += 1
+            except Exception as e:
+                logger.warning("mark_recall_used update %s failed: %s", mem_id, e)
         return updated
 
     # ----- CRUD: read -----
