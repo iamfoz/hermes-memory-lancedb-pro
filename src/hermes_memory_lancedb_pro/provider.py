@@ -33,6 +33,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Any
 
+from .memory_compactor import record_compaction_run, should_run_compaction
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
 from .store import MemoryStore
 
@@ -47,6 +48,23 @@ PROVIDER_NAME = "lancedb_pro"
 # Default recall limit when prefetch fires. The hermes-agent prefetch path
 # currently doesn't pass an explicit limit, so we own the default.
 DEFAULT_PREFETCH_LIMIT: int = int(os.environ.get("MEMORY_PREFETCH_LIMIT", "5"))
+
+# ---------------------------------------------------------------------------
+# Auto-purge configuration
+# ---------------------------------------------------------------------------
+# Purge cooldown: minimum hours between automatic purge runs.  Set 0 to
+# disable auto-purge entirely (you'll need to call purge_archived() manually
+# or use `hermes-memory doctor` to see the recommendation).
+_AUTO_PURGE_COOLDOWN_HOURS: int = int(
+    os.environ.get("MEMORY_AUTO_PURGE_COOLDOWN_HOURS", "24")
+)
+# Grace period: archived rows younger than this many days are left alone even
+# when a purge runs.  30 days gives a comfortable audit window.
+_AUTO_PURGE_GRACE_DAYS: int = int(
+    os.environ.get("MEMORY_PURGE_GRACE_DAYS", "30")
+)
+# State-file name — lives alongside the database so it follows the store.
+_PURGE_STATE_FILENAME = ".purge-state.json"
 
 
 def _load_memory_provider_base():
@@ -135,6 +153,44 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
         score = r.get("_final_score") or r.get("_rrf_score") or 0.0
         lines.append(f"- [{cat}] {text} (score={score:.2f})")
     return "\n".join(lines) if lines else ""
+
+
+def _maybe_auto_purge(store: MemoryStore) -> None:
+    """Run purge_archived() if the cooldown has elapsed since the last run.
+
+    Called from ``LanceDBProMemoryProvider.shutdown()`` at session end.
+    The check is a fast JSON stat; the purge only executes every
+    ``MEMORY_AUTO_PURGE_COOLDOWN_HOURS`` hours (default: 24).
+
+    Set ``MEMORY_AUTO_PURGE_COOLDOWN_HOURS=0`` to disable entirely.
+    Adjust the minimum age of rows to delete with ``MEMORY_PURGE_GRACE_DAYS``
+    (default: 30 days).
+    """
+    if _AUTO_PURGE_COOLDOWN_HOURS <= 0:
+        return
+
+    state_file = os.path.join(store.db_path, _PURGE_STATE_FILENAME)
+    if not should_run_compaction(state_file, cooldown_hours=_AUTO_PURGE_COOLDOWN_HOURS):
+        return
+
+    try:
+        n = store.purge_archived(grace_period_days=_AUTO_PURGE_GRACE_DAYS)
+        record_compaction_run(state_file)
+        if n:
+            logger.info(
+                "Auto-purge: removed %d archived row(s) "
+                "(grace_period_days=%d). Next run in ~%dh.",
+                n,
+                _AUTO_PURGE_GRACE_DAYS,
+                _AUTO_PURGE_COOLDOWN_HOURS,
+            )
+        else:
+            logger.debug(
+                "Auto-purge: no archived rows older than %d days to remove.",
+                _AUTO_PURGE_GRACE_DAYS,
+            )
+    except Exception as e:
+        logger.warning("Auto-purge failed (will retry next session): %s", e)
 
 
 def _build_provider_class():
@@ -469,6 +525,7 @@ def _build_provider_class():
 
         def shutdown(self) -> None:
             self._pending_used_ids.clear()
+            _maybe_auto_purge(self._store)
 
     return LanceDBProMemoryProvider
 

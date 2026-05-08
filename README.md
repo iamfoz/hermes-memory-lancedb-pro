@@ -88,9 +88,12 @@ mem_id = store.store(
 )
 
 # Bulk store — one batched embed call, one write transaction
+# Note: extra metadata is passed as `metadata_extra` (not `metadata`,
+# which is the raw JSON column name and is managed internally).
 ids = store.store_many([
     {"text": "fact one with enough length to pass the noise filter",
-     "importance": 0.6, "category": "fact"},
+     "importance": 0.6, "category": "fact",
+     "metadata_extra": {"source": "import"}},
     {"text": "fact two with enough length to pass the noise filter",
      "importance": 0.5},
 ])
@@ -555,6 +558,8 @@ Environment variables (all optional):
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
+| `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
+| `MEMORY_PURGE_GRACE_DAYS`      | `30`                               | Archived rows younger than this many days are left alone during auto-purge. Raise this for a longer audit window; lower it to reclaim space sooner. |
 
 ## Scripts
 
