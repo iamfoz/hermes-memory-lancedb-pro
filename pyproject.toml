@@ -35,6 +35,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6.0",
 ]
+google = [
+    "google-auth>=2.0.0",
+]
 
 [project.scripts]
 hermes-memory-smoke = "hermes_memory_lancedb_pro._cli:smoke_main"
@@ -67,7 +70,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["PLR2004", "E402"]
+"tests/*" = ["PLR2004", "E402", "PLC0415", "F401"]
 "scripts/*" = ["PLR0912", "PLR0915"]
 # Lazy heavy-dependency imports inside __init__.py and store.py are intentional —
 # importing the package shouldn't pull in lancedb/torch.

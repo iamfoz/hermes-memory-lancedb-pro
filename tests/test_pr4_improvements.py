@@ -424,15 +424,15 @@ from hermes_memory_lancedb_pro.retriever import MemoryRetriever
 class TestRerankSessionPooling:
     def test_session_lazy_until_first_rerank(self, store):
         retriever = MemoryRetriever(store)
-        # Before first rerank, session is None
-        assert retriever._rerank_session is None
+        # Both per-backend sessions start as None (lazily created on first call)
+        assert retriever._langsearch_session is None
+        assert retriever._google_session is None
 
-    def test_session_unaffected_when_no_api_key(self, store, monkeypatch):
-        # Without API key, rerank short-circuits — session stays None
-        monkeypatch.setattr(
-            "hermes_memory_lancedb_pro.retriever.LANGSEARCH_API_KEY", "",
-        )
+    def test_session_unaffected_when_no_active_reranker(self, store):
+        # With no active reranker, _rerank short-circuits — sessions stay None
         retriever = MemoryRetriever(store)
+        retriever._active_reranker = ""  # override to "no reranker" for this test
         result = retriever._rerank("query", [{"text": "a"}, {"text": "b"}], top_n=2)
         assert result == [{"text": "a"}, {"text": "b"}]
-        assert retriever._rerank_session is None
+        assert retriever._langsearch_session is None
+        assert retriever._google_session is None

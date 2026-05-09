@@ -42,14 +42,70 @@ A production-grade memory store that gives Hermes Agent persistent, searchable r
 
 ### Install
 
+There are **two pieces** to a working install, and they live in different
+places. People sometimes confuse them — the actual code is **always** the
+pip-installed package; the path under `~/.hermes/plugins/` is just a small
+discovery shim that imports from the package.
+
+**1. Install the package itself** (this is where the code runs from):
+
 ```bash
-# As a regular package (recommended)
+# From a clone of this repo:
 pip install -e .
 
-# Or drop into your Hermes plugins directory:
-# ~/.hermes/plugins/lancedb_pro/
-# (dependencies still installed via pip; see pyproject.toml)
+# Or, once published, straight from PyPI:
+pip install hermes-memory-lancedb-pro
 ```
+
+**2. Add the discovery shim** so hermes-agent can find the provider:
+
+```bash
+mkdir -p ~/.hermes/plugins/lancedb_pro
+cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
+from hermes_memory_lancedb_pro.provider import (
+    LanceDBProMemoryProvider,
+    register_memory_provider,
+)
+__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+EOF
+```
+
+That's it. The shim is ~5 lines; all real logic lives in the pip package
+and gets updated whenever you `pip install -U`.
+
+#### Upgrading from pre-0.2 installs
+
+Earlier releases told users to clone the repo *into*
+`~/.hermes/plugins/lancedb_pro/`. If you did that, the directory still
+contains a stale full copy of the source. Replace it with the shim:
+
+```bash
+# Back up first if you've made local edits
+mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old
+
+# Install the current version as a pip package
+pip install -U hermes-memory-lancedb-pro   # or `pip install -e .` from a clone
+
+# Recreate the discovery shim (see step 2 above)
+mkdir -p ~/.hermes/plugins/lancedb_pro
+cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
+from hermes_memory_lancedb_pro.provider import (
+    LanceDBProMemoryProvider,
+    register_memory_provider,
+)
+__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+EOF
+```
+
+Verify which copy is actually loading:
+
+```bash
+python -c "import hermes_memory_lancedb_pro as m; print(m.__version__, m.__file__)"
+```
+
+If `__file__` points inside `~/.hermes/plugins/lancedb_pro/` and the
+version is old, the stale checkout is still shadowing the pip install —
+remove or rename that directory, then recreate the shim above.
 
 ### Initialise
 
@@ -103,6 +159,16 @@ results = store.search("concise responses", limit=5, mode="hybrid")  # default
 results = store.search("concise responses", limit=5, mode="vector")
 results = store.search("concise responses", limit=5, mode="bm25")
 
+# Every result has a portable `score` field (no underscore, 0..1, higher
+# is better) that's safe to use across all three search modes. Use this
+# for filtering/ranking in your own code:
+for r in results:
+    print(r["id"], r["score"], r["text"])
+
+# Mode-specific raw fields prefixed with `_` (e.g. `_rrf_score`,
+# `_distance`, `_score`) are internal/debug-only and only set on the
+# mode that produced them. Don't rely on them — use `score` instead.
+
 # Session-scoped search — only memories from this session, plus
 # memories explicitly marked cross_session or core-tier (see below).
 results = store.search(
@@ -112,11 +178,15 @@ results = store.search(
     min_score=0.2,   # drop weak matches that would otherwise pollute context
 )
 
-# Update (supersede pattern — archives old, creates new)
-store.update(mem_id=mem_id, text="Updated text here.", tier="core")
+# Update (supersede pattern — archives old, creates new).
+# Returns the *new* memory ID after a text-changing supersede,
+# the *same* mem_id after a metadata-only update, or None if not found.
+new_id = store.update(mem_id=mem_id, text="Updated text here.", tier="core")
+assert store.has_id(new_id)
 
-# Or metadata-only — no re-embedding, no supersede
-store.update(mem_id=mem_id, importance=0.95, tier="core")
+# Metadata-only — no re-embedding, no supersede; returns the same id.
+same_id = store.update(mem_id=new_id, importance=0.95, tier="core")
+assert same_id == new_id
 
 # Delete
 store.forget(mem_id=mem_id)
@@ -549,7 +619,10 @@ Environment variables (all optional):
 | `MEMORY_MD`                    | `~/.hermes/memory/MEMORY.md`       | Seed file for `memory_init.sh`                                    |
 | `HERMES_PYTHON`                | auto-detected                      | Python interpreter for the init script                            |
 | `HF_TOKEN`                     | *(none)*                           | HuggingFace token (avoids rate limits on embedding model download) |
-| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables cross-encoder reranking in `MemoryRetriever`              |
+| `MEMORY_RERANKER`              | `auto`                             | Which reranker to use: `langsearch`, `google`, `disabled`, or `auto`. In `auto` mode the system picks whichever service is configured; if **both** are present it logs a warning and disables reranking until you set this explicitly. |
+| `LANGSEARCH_API_KEY`           | *(none)*                           | Enables LangSearch cross-encoder reranking. In `auto` mode, set this **or** `GOOGLE_CLOUD_PROJECT` (not both). On persistent 401/403/429 the reranker is disabled for the session with one warning. |
+| `GOOGLE_CLOUD_PROJECT`         | *(none)*                           | Enables Google Discovery Engine Ranking API. Also accepted as `GOOGLE_PROJECT_ID` or `GOOGLE_PROJECT`. Ensure the [Discovery Engine API](https://console.cloud.google.com/apis/library/discoveryengine.googleapis.com) is enabled for the project. Free tier: 1,000 queries/month; ~$0.001/query thereafter. **No API key needed** — authentication uses Application Default Credentials (see below). |
+| `MEMORY_GOOGLE_RANKING_MODEL`  | `semantic-ranker-512@latest`       | Google ranking model name (advanced). |
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
 | `MEMORY_TIER_EVAL_BATCH`       | `500`                              | Rows fetched per tier evaluation                                  |
@@ -560,6 +633,70 @@ Environment variables (all optional):
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
 | `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
 | `MEMORY_PURGE_GRACE_DAYS`      | `30`                               | Archived rows younger than this many days are left alone during auto-purge. Raise this for a longer audit window; lower it to reclaim space sooner. |
+
+### Google Ranking API — Authentication Setup
+
+The Google Discovery Engine Ranking API uses **OAuth2 authentication** —
+API keys are explicitly rejected. The plugin uses the `google-auth` library's
+[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
+(ADC) chain, which tries credential sources in this order:
+
+1. **Service account JSON** — recommended for production/server deployments:
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+   ```
+
+2. **Developer workstation** — run once on your local machine:
+   ```bash
+   gcloud auth application-default login
+   ```
+   Credentials are cached at
+   `~/.config/gcloud/application_default_credentials.json`.
+
+3. **GCP Metadata Server** — no configuration needed when running inside
+   GCP Compute Engine, Cloud Run, GKE, etc.
+
+Install `google-auth` before enabling this backend:
+
+```bash
+pip install 'hermes-memory-lancedb-pro[google]'
+# or: pip install google-auth
+```
+
+Then set `GOOGLE_CLOUD_PROJECT` (and optionally `MEMORY_RERANKER=google`)
+in `~/.hermes/.env`. No API key is required.
+
+### LLM extraction (Smart Extractor)
+
+The LLM-driven Smart Extractor needs to know which provider to call. By
+default it falls back to `OPENAI_API_KEY` then `ANTHROPIC_API_KEY`, but
+you almost always want the dedicated `MEMORY_EXTRACTION_*` overrides so
+the extractor doesn't accidentally hit a different model than the agent.
+
+| Variable                     | Purpose                                                                                  |
+|------------------------------|------------------------------------------------------------------------------------------|
+| `MEMORY_EXTRACTION_API_KEY`  | API key for the extraction provider. Required to enable LLM extraction.                  |
+| `MEMORY_EXTRACTION_BASE_URL` | OpenAI-compatible base URL (e.g. `http://127.0.0.1:7883/v1` for jmunch).                 |
+| `MEMORY_EXTRACTION_MODEL`    | Model id (e.g. `Qwen3.6`, `gpt-4o-mini`, `claude-3-5-haiku-latest`).                     |
+| `MEMORY_EXTRACTION_PROVIDER` | `openai` (default, OpenAI-compatible) or `anthropic` (native Anthropic SDK).             |
+
+If you're routing through a local OpenAI-compatible proxy like
+[**jmunch**](https://github.com/) — which is the recommended setup
+when hermes-agent is configured with a `custom_providers` entry — point
+the extractor at the same proxy:
+
+```bash
+# ~/.hermes/.env
+MEMORY_EXTRACTION_PROVIDER=openai
+MEMORY_EXTRACTION_BASE_URL=http://127.0.0.1:7883/v1
+MEMORY_EXTRACTION_MODEL=Qwen3.6
+MEMORY_EXTRACTION_API_KEY=local        # jmunch usually ignores the value
+```
+
+Without `MEMORY_EXTRACTION_*` set the extractor falls back to whichever
+of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` it finds first; if neither is
+set, extraction is disabled and writes go in raw (the rest of the
+pipeline still works — decay, dedup, search etc.).
 
 ## Scripts
 

@@ -21,6 +21,7 @@ __all__ = [
     "CORRECTION_INDICATORS",
     "DECISION_INDICATORS",
     "ACKNOWLEDGMENT_PATTERNS",
+    "GREETING_PATTERNS",
     "score_text",
     "compress_texts",
     "estimate_conversation_value",
@@ -67,8 +68,13 @@ CORRECTION_INDICATORS: list[re.Pattern[str]] = [
     re.compile(r"\bactually\b", re.IGNORECASE),
     re.compile(r"\binstead\b", re.IGNORECASE),
     re.compile(r"\bwrong\b", re.IGNORECASE),
-    re.compile(r"\bcorrect(ion)?\b", re.IGNORECASE),
-    re.compile(r"\bfix\b", re.IGNORECASE),
+    # Allow inflections — "correct", "corrected", "correcting", "correction",
+    # "corrections" should all match. The previous \bcorrect(ion)?\b only
+    # caught "correct" and "correction".
+    re.compile(r"\bcorrect(ed|ing|ion|ions|s)?\b", re.IGNORECASE),
+    # Same idea for "fix" — "fixed", "fixes", "fixing", "fixed it" all
+    # signal a correction. The old \bfix\b missed every inflected form.
+    re.compile(r"\bfix(ed|es|ing)?\b", re.IGNORECASE),
     re.compile(r"不对"),
     re.compile(r"应该是"),
     re.compile(r"應該是"),
@@ -80,13 +86,13 @@ CORRECTION_INDICATORS: list[re.Pattern[str]] = [
 
 DECISION_INDICATORS: list[re.Pattern[str]] = [
     re.compile(r"\blet'?s go with\b", re.IGNORECASE),
-    re.compile(r"\bconfirmed?\b", re.IGNORECASE),
-    re.compile(r"\bapproved?\b", re.IGNORECASE),
-    re.compile(r"\bdecided?\b", re.IGNORECASE),
+    re.compile(r"\bconfirm(ed|ing|s)?\b", re.IGNORECASE),
+    re.compile(r"\bapprov(e|ed|ing|es)\b", re.IGNORECASE),
+    re.compile(r"\bdecid(e|ed|ing|es)\b", re.IGNORECASE),
     re.compile(r"\bwe'?ll use\b", re.IGNORECASE),
     re.compile(r"\bgoing forward\b", re.IGNORECASE),
     re.compile(r"\bfrom now on\b", re.IGNORECASE),
-    re.compile(r"\bagreed\b", re.IGNORECASE),
+    re.compile(r"\bagreed?\b", re.IGNORECASE),
     re.compile(r"决定"),
     re.compile(r"決定"),
     re.compile(r"确认"),
@@ -95,6 +101,23 @@ DECISION_INDICATORS: list[re.Pattern[str]] = [
     re.compile(r"選擇了"),
     re.compile(r"就这样"),
     re.compile(r"就這樣"),
+]
+
+# Greetings score very low. Without this pattern "Hi" / "Hello" fell
+# through to `short_statement` (0.4), giving them more weight than
+# substantive technical content under 80 chars.
+GREETING_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"^(hi|hello|hey|howdy|yo|hiya|sup|hola|greetings|good\s+(morning|afternoon|evening|day))"
+        r"[\s.!,]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^how\s+are\s+(you|things|things\s+going|you\s+doing)\b[\s.?!]*$", re.IGNORECASE),
+    re.compile(r"^how'?s\s+(it\s+going|things|life)\b[\s.?!]*$", re.IGNORECASE),
+    re.compile(r"^你好[。！]?$"),
+    re.compile(r"^您好[。！]?$"),
+    re.compile(r"^早上?好[。！]?$"),
+    re.compile(r"^晚上?好[。！]?$"),
 ]
 
 ACKNOWLEDGMENT_PATTERNS: list[re.Pattern[str]] = [
@@ -153,6 +176,11 @@ def score_text(text: str, index: int) -> ScoredText:
     if any(p.search(trimmed) for p in DECISION_INDICATORS):
         return ScoredText(index=index, text=text, score=0.85, reason="decision")
 
+    # Greetings → very low value (kept above acknowledgments because the
+    # greeting patterns are stricter — both end up at 0.1).
+    if any(p.match(trimmed) for p in GREETING_PATTERNS):
+        return ScoredText(index=index, text=text, score=0.1, reason="greeting")
+
     # Acknowledgments → very low value
     if any(p.search(trimmed) for p in ACKNOWLEDGMENT_PATTERNS):
         return ScoredText(index=index, text=text, score=0.1, reason="acknowledgment")
@@ -160,8 +188,14 @@ def score_text(text: str, index: int) -> ScoredText:
     # Substantive content vs short questions.
     # CJK characters carry ~2-3x more meaning per character, so use a lower
     # threshold (same approach as adaptive-retrieval).
+    #
+    # The non-CJK threshold dropped from 80 → 40 chars: at 80 a meaningful
+    # technical statement like "The deployment failed because of a port
+    # conflict" (49 chars) was falling into `short_statement` (0.4),
+    # *below* a generic "How are you?" short-question (0.5). 40 chars is
+    # still above one-word answers and short interjections.
     has_cjk = bool(_CJK_RE.search(trimmed))
-    substantive_min_length = 30 if has_cjk else 80
+    substantive_min_length = 30 if has_cjk else 40
     if len(trimmed) > substantive_min_length:
         # Check for boilerplate (XML tags, system messages)
         if _XML_OPEN_RE.match(trimmed) and _XML_CLOSE_RE.search(trimmed):
@@ -304,13 +338,25 @@ def compress_texts(
 # ---------------------------------------------------------------------------
 
 
-def estimate_conversation_value(texts: list[str]) -> float:
+def estimate_conversation_value(texts: list[str] | str | None) -> float:
     """
     Estimate the overall value of a conversation for memory extraction.
     Returns a number between 0.0 and 1.0.
 
     Used by the adaptive extraction throttle to skip low-value conversations.
+
+    Accepts a list of text turns; for convenience also accepts a single
+    string (treated as one turn) or None (treated as empty). Substantive
+    conversations always return at least a small positive baseline so the
+    throttle distinguishes them from empty/trivial input.
     """
+    # Defensive input coercion: callers in the wild sometimes pass a single
+    # string (a joined transcript) rather than a list of turns. Treat that
+    # as one turn rather than iterating its characters.
+    if texts is None:
+        return 0.0
+    if isinstance(texts, str):
+        texts = [texts] if texts.strip() else []
     if not texts:
         return 0.0
 
@@ -333,15 +379,30 @@ def estimate_conversation_value(texts: list[str]) -> float:
     if has_correction_or_decision:
         value += 0.3
 
-    # Total substantive text > 200 chars? +0.2
+    # Substantive content scoring: graduated rather than a single 200-char
+    # cliff. A typical troubleshooting exchange (300-600 chars) should
+    # comfortably clear the throttle floor; the previous threshold left
+    # such conversations stuck at 0.0 if they didn't trigger any of the
+    # pattern-based bumps.
     substantive_chars = sum(
         len(t) for t in texts if len(t.strip()) > 20
     )
-    if substantive_chars > 200:
+    if substantive_chars > 500:
+        value += 0.3
+    elif substantive_chars > 200:
         value += 0.2
+    elif substantive_chars > 100:
+        value += 0.15
 
     # Has multi-turn exchanges (>6 texts)? +0.1
     if len(texts) > 6:
         value += 0.1
+
+    # Baseline floor for any non-trivial conversation: anything with at
+    # least one substantive turn (> 20 chars stripped) gets a small
+    # positive value so the throttle treats it as "worth considering",
+    # even if no specific intent/tool/correction pattern fires.
+    if value == 0.0 and any(len(t.strip()) > 20 for t in texts):
+        value = 0.1
 
     return min(value, 1.0)
