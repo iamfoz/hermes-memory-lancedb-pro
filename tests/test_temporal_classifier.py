@@ -244,3 +244,254 @@ def test_zh_day_after_tomorrow_beats_tomorrow_rule() -> None:
     result = infer_expiry("后天明天", now_ms=NOW_MS)
     # 后天 appears first in rules (48h), so that should win
     assert result == NOW_MS + 48 * _MS_PER_HOUR
+
+
+# ===========================================================================
+# Expanded classifier tests
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# classify_temporal — new dynamic EN patterns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # time of day
+        "Let's talk this afternoon",
+        "I'll call you this evening",
+        "I'm busy this weekend",
+        # qualified day names
+        "The review is next Monday",
+        "I saw her last Thursday",
+        "Meeting on Friday at 10",
+        "This Tuesday we ship",
+        # relative future
+        "I'll be back in 3 days",
+        "Done in 2 hours",
+        "Ready in 1 week",
+        "Back in an hour",
+        # relative past
+        "I submitted it 3 days ago",
+        "She called a few hours ago",
+        # scheduling / deadline
+        "My dentist appointment is booked",
+        "The project deadline is approaching",
+        "The invoice is due on Monday",
+        "The trial expires next month",
+        "The session is scheduled for Thursday",
+        # explicit time (colon-format required to avoid "I always wake up at 7am")
+        "Stand-up at 9:30am every day",
+        # explicit dates
+        "The conference is March 15",
+        "May 7 is the launch date",
+        "Jan. 3 we start the sprint",
+        "The event is 2026-05-07",
+        "Delivery on the 15th",
+    ],
+)
+def test_dynamic_en_new_patterns(text: str) -> None:
+    assert classify_temporal(text) == "dynamic"
+
+
+# ---------------------------------------------------------------------------
+# classify_temporal — new dynamic ZH patterns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "今下午有会议",         # 今下午
+        "今天下午见面",         # 今天下午
+        "这个周末出去玩",       # 这个周末
+        "即将发布新版本",       # 即将
+        "马上到",               # 马上
+        "截止明天",             # 截止
+        "截止日期快到了",       # 截止日期
+        "待会儿过来",           # 待会儿
+        "3天后出发",            # variable: 3天后
+        "2周后回来",            # variable: 2周后
+    ],
+)
+def test_dynamic_zh_new_patterns(text: str) -> None:
+    assert classify_temporal(text) == "dynamic"
+
+
+# ---------------------------------------------------------------------------
+# classify_temporal — new static EN patterns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # UK spelling
+        "My favourite colour is green",
+        # habitual / recurring
+        "I never drink alcohol",
+        "I usually start work at 9",
+        "I typically read before bed",
+        "I generally avoid meetings on Fridays",
+        # relationships
+        "My wife is a doctor",
+        "My husband works in finance",
+        "My partner is called Sam",
+        "My son just started school",
+        "My daughter loves painting",
+        "My dad is retired",
+        "My mom lives in Edinburgh",
+        # dietary / medical
+        "I am vegetarian",
+        "She is vegan",
+        "I eat gluten-free",
+        "I am lactose-intolerant",
+        "He is diabetic",
+        # tools / skills
+        "I use Python for everything",
+        "I code in Rust at work",
+        "I work with React and TypeScript",
+        "I write in Go for backend services",
+        "My editor is Neovim",
+        "My IDE is VS Code",
+        "My setup uses tmux and zsh",
+    ],
+)
+def test_static_en_new_patterns(text: str) -> None:
+    assert classify_temporal(text) == "static"
+
+
+# ---------------------------------------------------------------------------
+# classify_temporal — new static ZH patterns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我妻子是护士",         # 妻子
+        "我老婆喜欢旅游",       # 老婆
+        "我儿子在上学",         # 儿子
+        "我女儿很聪明",         # 女儿
+        "我通常八点起床",       # 通常
+        "我从不喝咖啡",         # 从不
+        "我一般不吃辣",         # 一般
+        "我是素食者",           # 素食
+        "她吃纯素",             # 纯素
+    ],
+)
+def test_static_zh_new_patterns(text: str) -> None:
+    assert classify_temporal(text) == "static"
+
+
+# ---------------------------------------------------------------------------
+# classify_temporal — false-positive guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Bare day name without temporal qualifier → static (recurring schedule)
+        "I work Monday to Friday",
+        "The office is open Monday through Saturday",
+        # 'May' as modal verb without following digit → static
+        "I may consider changing jobs",
+        "You may want to check this",
+        # 'due' without a following qualifier → static
+        "I am due for a promotion",
+    ],
+)
+def test_no_false_positive_static(text: str) -> None:
+    assert classify_temporal(text) == "static"
+
+
+# ---------------------------------------------------------------------------
+# infer_expiry — new named-day rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected_offset_ms",
+    [
+        ("The review is next Monday", 7 * _MS_PER_DAY),
+        ("next Friday is the deadline", 7 * _MS_PER_DAY),
+        ("Meeting on Friday", 4 * _MS_PER_DAY),
+        ("This Tuesday we ship", 4 * _MS_PER_DAY),
+        ("on Thursday at noon", 4 * _MS_PER_DAY),
+    ],
+)
+def test_infer_expiry_named_days(text: str, expected_offset_ms: int) -> None:
+    result = infer_expiry(text, now_ms=NOW_MS)
+    assert result == NOW_MS + expected_offset_ms
+
+
+# ---------------------------------------------------------------------------
+# infer_expiry — new time-of-day rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected_offset_ms",
+    [
+        ("I'll call you this morning", 18 * _MS_PER_HOUR),
+        ("Let's meet this afternoon", 18 * _MS_PER_HOUR),
+        ("Dinner this evening", 18 * _MS_PER_HOUR),
+        ("I'm busy this weekend", 4 * _MS_PER_DAY),
+        ("这个周末出去玩", 4 * _MS_PER_DAY),
+    ],
+)
+def test_infer_expiry_time_of_day(text: str, expected_offset_ms: int) -> None:
+    result = infer_expiry(text, now_ms=NOW_MS)
+    assert result == NOW_MS + expected_offset_ms
+
+
+# ---------------------------------------------------------------------------
+# infer_expiry — variable-offset rules ("in N days/hours/weeks")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected_offset_ms",
+    [
+        ("I'll be back in 3 days", 3 * _MS_PER_DAY),
+        ("Done in 1 day", 1 * _MS_PER_DAY),
+        ("Ready in 2 weeks", 2 * 7 * _MS_PER_DAY),
+        ("Call in 4 hours", 4 * _MS_PER_HOUR),
+        ("In 10 days we ship", 10 * _MS_PER_DAY),
+        # Chinese variable
+        ("3天后出发", 3 * _MS_PER_DAY),
+        ("2周后回来", 2 * 7 * _MS_PER_DAY),
+        ("4小时后见", 4 * _MS_PER_HOUR),
+    ],
+)
+def test_infer_expiry_variable_offset(text: str, expected_offset_ms: int) -> None:
+    result = infer_expiry(text, now_ms=NOW_MS)
+    assert result == NOW_MS + expected_offset_ms
+
+
+# ---------------------------------------------------------------------------
+# infer_expiry — rule ordering: variable before fixed
+# ---------------------------------------------------------------------------
+
+
+def test_variable_rule_wins_over_fixed_this_week() -> None:
+    """'in 3 days' should use the variable rule (72h), not 'this week' (3d).
+    They're the same value here but confirm it's the variable path that fires."""
+    # Disambiguate by using "in 5 days" — no fixed rule produces 5d.
+    result = infer_expiry("in 5 days", now_ms=NOW_MS)
+    assert result == NOW_MS + 5 * _MS_PER_DAY
+
+
+def test_next_day_rule_wins_over_next_week() -> None:
+    """'next Monday' should produce +7d via the named-day rule.
+    'next week' also produces +7d but via a different code path — verify
+    both produce 7d and don't conflict."""
+    assert infer_expiry("next Monday", now_ms=NOW_MS) == NOW_MS + 7 * _MS_PER_DAY
+    assert infer_expiry("next week", now_ms=NOW_MS) == NOW_MS + 7 * _MS_PER_DAY
+
+
+def test_later_alone_returns_no_expiry() -> None:
+    """'later' is a dynamic indicator but has no specific expiry offset."""
+    assert infer_expiry("I'll handle it later", now_ms=NOW_MS) is None
