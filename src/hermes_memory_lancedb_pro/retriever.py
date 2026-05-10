@@ -8,40 +8,87 @@ Architecture from CortexReach memory-lancedb-pro:
      - Length normalisation
      - Hard min score filter (BEFORE decay)
      - Composite decay scoring (Weibull)
-     - Noise filter
-     - MMR diversity
-  4. BM25 ghost entry protection via store.hasId()
-  5. Lifecycle hooks: access count increment + tier evaluation on recall
+  4. Optional cross-encoder reranking (LangSearch or Google Ranking API)
+  5. MMR diversity demotion
+  6. BM25 ghost entry protection via store.check_ids()
+  7. Lifecycle hooks: access count increment + tier evaluation on recall
+
+Reranker selection
+------------------
+Set ``MEMORY_RERANKER`` to choose explicitly:
+
+  - ``langsearch``  — LangSearch cross-encoder (requires LANGSEARCH_API_KEY)
+  - ``google``      — Google Discovery Engine Ranking API (requires
+                      GOOGLE_CLOUD_PROJECT + Application Default Credentials;
+                      see ``_get_google_auth_token`` for credential sources)
+  - ``disabled``    — skip reranking entirely
+  - ``auto``        — (default) choose the one whose keys are present;
+                      if both are configured, log a warning and disable
+                      until the user sets MEMORY_RERANKER explicitly.
+
+Env-var timing note
+-------------------
+API keys are read inside ``MemoryRetriever.__init__``, not at module-import
+time.  This is intentional: hermes-agent (and many other hosts) load
+``~/.hermes/.env`` into ``os.environ`` *after* Python imports the plugin
+modules, so a module-level ``os.environ.get("GOOGLE_API_KEY")`` would
+always return ``""`` even when the key is present in the file.  By
+deferring to ``__init__`` — which is called at provider-instantiation time,
+well after dotenv loading — the retriever always sees the fully-populated
+environment.
 """
 
-import json
+from __future__ import annotations
+
 import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import requests
 
-from .store import MemoryStore
 from .decay import (
     ScoringPipeline,
-    mmr_diversity_filter,
-    is_noise,
+    _coerce_metadata,
     evaluate_all_tiers,
+    is_noise,
+    mmr_diversity_filter,
 )
+from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
-# LangSearch Reranking API config
-LANGSEARCH_API_KEY = os.environ.get("LANGSEARCH_API_KEY", "")
+# ---------------------------------------------------------------------------
+# Static config — safe at module level because these never come from .env
+# ---------------------------------------------------------------------------
+
 LANGSEARCH_BASE_URL = "https://api.langsearch.com/v1/rerank"
 LANGSEARCH_MODEL = "langsearch-reranker-v1"
-LANGSEARCH_MAX_DOCS = 50  # API limit per request
-LANGSEARCH_TIMEOUT = 15  # seconds
+LANGSEARCH_MAX_DOCS = 50   # API limit per request
+LANGSEARCH_TIMEOUT = 15    # seconds
+
+GOOGLE_RANKING_BASE_URL = (
+    "https://discoveryengine.googleapis.com/v1/projects/{project}"
+    "/locations/global/rankingConfigs/default_ranking_config:rank"
+)
+GOOGLE_RANKING_MAX_DOCS = 200   # API limit per request
+GOOGLE_RANKING_TIMEOUT = 15     # seconds
+
+# ---------------------------------------------------------------------------
+# Tuning constants — these are non-secret; reading at import is fine because
+# they're set in the system environment, not in the user's .env file, and
+# their defaults are always usable even if the env var isn't present yet.
+# ---------------------------------------------------------------------------
+
+TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
+TIER_EVAL_BATCH = int(os.environ.get("MEMORY_TIER_EVAL_BATCH", "500"))
+DEFAULT_MIN_RECALL_SCORE: float = float(
+    os.environ.get("MEMORY_MIN_RECALL_SCORE", "0.0")
+)
 
 
-class HybridRetriever:
+class MemoryRetriever:
     """
     Hybrid retrieval with vector-dominant fusion and spec-compliant scoring.
 
@@ -49,137 +96,248 @@ class HybridRetriever:
       - Vector score is the primary signal
       - BM25 hit provides a confirmation boost (not a full parallel ranking)
       - Pure BM25 hits allowed but with a lower floor
-      - BM25 ghost entries filtered via store.hasId()
+      - BM25 ghost entries filtered via store.check_ids()
       - Preservation floor for high BM25 lexical hits to prevent reranker kills
     """
 
     def __init__(self, store: MemoryStore):
         self.store = store
         self.scoring = ScoringPipeline()
+        self._lifecycle_call_count = 0
+
+        # -----------------------------------------------------------------
+        # Read API keys HERE, not at module level.
+        #
+        # hermes-agent loads ~/.hermes/.env into os.environ during startup,
+        # AFTER Python has already imported all plugin modules.  Reading keys
+        # at module level (e.g. at the top of this file) means they're always
+        # empty because the import runs before dotenv loading.
+        #
+        # MemoryRetriever.__init__ is called when the provider is
+        # instantiated, which happens after dotenv loading, so by this point
+        # os.environ is fully populated.
+        # -----------------------------------------------------------------
+        self._langsearch_api_key: str = os.environ.get("LANGSEARCH_API_KEY", "")
+        self._google_cloud_project: str = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GOOGLE_PROJECT_ID")
+            or os.environ.get("GOOGLE_PROJECT")
+            or ""
+        )
+        self._google_ranking_model: str = os.environ.get(
+            "MEMORY_GOOGLE_RANKING_MODEL", "semantic-ranker-512@latest"
+        )
+
+        # Resolve which backend to use (logs once, here at construction time)
+        self._active_reranker: str = self._resolve_reranker(
+            langsearch_key=self._langsearch_api_key,
+            google_project=self._google_cloud_project,
+            setting=os.environ.get("MEMORY_RERANKER", "auto").strip().lower(),
+        )
+
+        # One requests.Session per backend, created lazily on first use
+        self._langsearch_session: requests.Session | None = None
+        self._google_session: requests.Session | None = None
+
+        # Google OAuth2 credentials — obtained lazily via ADC on first use
+        self._google_credentials: object | None = None
+
+        # Per-backend kill-switch: tripped on persistent 401/403/429
+        self._langsearch_disabled: bool = False
+        self._google_disabled: bool = False
+
+    # ----- public -----
 
     def retrieve(
         self,
         query: str,
         limit: int = 10,
-        category: Optional[str] = None,
-        scope: Optional[str] = None,
+        category: str | None = None,
+        scope: str | None = None,
         source: str = "manual",
-    ) -> List[Dict[str, Any]]:
-        """
-        Perform hybrid retrieval with full scoring pipeline.
+        *,
+        session_id: str | None = None,
+        min_score: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run the full hybrid retrieval pipeline.
 
         Args:
-            query: Search query text
-            limit: Maximum number of results
-            category: Optional category filter
-            scope: Optional scope filter
-            source: Retrieval source ("manual", "auto-recall", "cli")
-
-        Returns:
-            List of memory entries with scores
+            query: search text (the user's current message, typically).
+            limit: maximum number of results to return.
+            category, scope: optional column filters.
+            source: "manual" / "auto-recall" / "cli" — drives the recall
+                lifecycle hooks. Use "cli" to skip access-count bumps.
+            session_id: when set, results are restricted to memories whose
+                ``metadata.source_session`` matches this id, plus memories
+                explicitly flagged ``cross_session`` or living in the core
+                tier.
+            min_score: drop final results below this threshold. Defaults to
+                ``DEFAULT_MIN_RECALL_SCORE`` (env ``MEMORY_MIN_RECALL_SCORE``).
         """
         if not query or not query.strip():
             return []
 
         query = query.strip()
         now_ms = int(time.time() * 1000)
+        if min_score is None:
+            min_score = DEFAULT_MIN_RECALL_SCORE
 
-        # Step 1: Parallel vector + BM25 search
-        candidate_pool = min(limit * 4, 40)  # Wide initial net
+        # 1. Parallel vector + BM25 search (wide initial net)
+        candidate_pool = min(max(limit * 4, 16), 40)
+        vector_results = self.store._vector_search(
+            query, candidate_pool, category, scope, session_id=session_id,
+        )
+        bm25_results = self.store._bm25_search(
+            query, candidate_pool, category, scope, session_id=session_id,
+        )
 
-        vector_results = self.store._vector_search(query, candidate_pool, category, scope)
-        bm25_results = self.store._bm25_search(query, candidate_pool, category, scope)
-
-        # Step 1.5: BM25 ghost entry protection
+        # 1.5 BM25 ghost entry protection
         bm25_results = self._filter_bm25_ghosts(bm25_results, vector_results)
 
-        # Step 2: Vector-dominant fusion with BM25 confirmation bonus
+        # 2. Vector-dominant fusion with BM25 confirmation bonus
         fused = self._vector_dominant_fusion(vector_results, bm25_results)
-
         if not fused:
             return []
 
-        # Step 3: Apply scoring pipeline (length norm -> hardMinScore -> decay -> sort)
+        # 3. Scoring pipeline (length norm -> hardMinScore -> decay -> sort)
         scored = self.scoring.apply_scoring(fused, now_ms)
 
-        # Step 4: Noise filter
+        # 4. Noise filter
         scored = [e for e in scored if not is_noise(e.get("text", ""))]
 
-        # Step 5: MMR diversity
-        scored_tuples = [(e, e.get("_final_score", 0)) for e in scored]
+        # 5. Cross-encoder rerank (best relevance signal — runs before MMR
+        # so diversity operates on the most accurate ordering)
+        scored = self._rerank(query, scored, top_n=min(5, limit))
+
+        # 6. MMR diversity (demotes near-duplicates)
+        scored_tuples = [(e, float(e.get("_final_score", 0.0))) for e in scored]
         diverse = mmr_diversity_filter(scored_tuples, similarity_threshold=0.85)
-        scored = [e for e, _ in diverse]
+        scored = [e for e, score in diverse]
+        for entry, score in diverse:
+            entry["_mmr_score"] = score
 
-        # Step 5.5: Cross-encoder reranking (LLM-based)
-        scored = self._rerank(query, scored, top_n=5)
+        # 7. Apply min_score gate
+        if min_score and min_score > 0.0:
+            scored = [
+                e for e in scored
+                if float(e.get("_final_score", 0.0)) >= min_score
+            ]
 
-        # Step 6: Lifecycle hooks — increment access count for recalled items
+        # 8. Lifecycle hooks
         if source in ("manual", "auto-recall"):
-            self._run_recall_lifecycle(scored)
+            self._run_recall_lifecycle(scored[:limit])
 
-        # Step 7: Limit
         return scored[:limit]
+
+    # ----- reranker resolution -----
+
+    @staticmethod
+    def _resolve_reranker(
+        *,
+        langsearch_key: str,
+        google_project: str,
+        setting: str,
+    ) -> str:
+        """
+        Choose which reranker backend to activate.
+
+        Returns ``"langsearch"``, ``"google"``, or ``""`` (disabled).
+
+        Accepts the key values and the ``MEMORY_RERANKER`` setting as
+        explicit arguments rather than reading ``os.environ`` directly, so
+        that tests can call it without environment manipulation.
+
+        Note: the Google backend authenticates via Application Default
+        Credentials (ADC), not an API key — ``GOOGLE_CLOUD_PROJECT`` is the
+        only env var needed for detection.  Credential problems surface at
+        the first rerank call, not here.
+        """
+        have_langsearch = bool(langsearch_key)
+        # Google only needs a project ID in the URL; auth is handled via ADC.
+        have_google = bool(google_project)
+
+        if setting == "disabled":
+            return ""
+
+        if setting == "langsearch":
+            if not have_langsearch:
+                logger.warning(
+                    "MEMORY_RERANKER=langsearch but LANGSEARCH_API_KEY is not set; "
+                    "reranking disabled."
+                )
+                return ""
+            return "langsearch"
+
+        if setting == "google":
+            if not have_google:
+                logger.warning(
+                    "MEMORY_RERANKER=google but GOOGLE_CLOUD_PROJECT (or "
+                    "GOOGLE_PROJECT_ID) is not set; reranking disabled."
+                )
+                return ""
+            return "google"
+
+        # auto — pick the configured one; warn if ambiguous
+        if have_langsearch and have_google:
+            logger.warning(
+                "Both LANGSEARCH_API_KEY and GOOGLE_CLOUD_PROJECT are set. "
+                "Set MEMORY_RERANKER=langsearch or MEMORY_RERANKER=google to "
+                "choose one. Reranking is disabled until configured."
+            )
+            return ""
+        if have_langsearch:
+            logger.info("Reranker: LangSearch (auto-selected, LANGSEARCH_API_KEY found)")
+            return "langsearch"
+        if have_google:
+            logger.info(
+                "Reranker: Google Ranking API (auto-selected, GOOGLE_CLOUD_PROJECT found)"
+            )
+            return "google"
+
+        return ""
+
+    # ----- helpers -----
 
     def _filter_bm25_ghosts(
         self,
-        bm25_results: List[Dict[str, Any]],
-        vector_results: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Filter BM25-only results that are ghost entries (not in vector index).
-
-        Per spec: BM25-only results checked via store.hasId() to avoid FTS
-        residual ghost entries. Here we filter BM25 results whose IDs don't
-        exist in the vector result set AND aren't confirmed in the store.
-        """
+        bm25_results: list[dict[str, Any]],
+        vector_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop BM25-only hits that don't exist (or are archived) in the store."""
         vector_ids = {r["id"] for r in vector_results}
-        filtered = []
-        for entry in bm25_results:
-            mid = entry["id"]
-            # Keep if also in vector results (definitely real)
-            if mid in vector_ids:
-                filtered.append(entry)
-            else:
-                # Check store to confirm entry exists (not a ghost)
-                if self.store.has_id(mid):
-                    filtered.append(entry)
-                # Otherwise it's a ghost — drop it
-        return filtered
+        bm25_only_ids = [
+            entry["id"] for entry in bm25_results if entry["id"] not in vector_ids
+        ]
+        confirmed = (
+            set(self.store.check_ids(bm25_only_ids)) if bm25_only_ids else set()
+        )
+        return [
+            entry for entry in bm25_results
+            if entry["id"] in vector_ids or entry["id"] in confirmed
+        ]
 
     def _vector_dominant_fusion(
         self,
-        vector_results: List[Dict[str, Any]],
-        bm25_results: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Vector-score-dominant fusion with BM25 confirmation bonus.
-
-        Strategy (per CortexReach spec):
-          - For vector hits: fusion_score = 1 - vector_distance (normalised)
-          - BM25 confirmation bonus: if entry also appears in BM25 results,
-            apply a multiplicative boost (1.0 + 0.3 / bm25_rank)
-          - Pure BM25 hits: allowed with a base score (0.3 / rank)
-          - High BM25 lexical hits get a preservation floor to prevent
-            reranker kills
-
-        Returns:
-            List of entries with _fusion_score set
-        """
-        # Build lookup maps
+        vector_results: list[dict[str, Any]],
+        bm25_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Vector-score-dominant fusion with BM25 confirmation bonus."""
         vector_map = {r["id"]: r for r in vector_results}
+        vector_ranks = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
         bm25_map = {r["id"]: r for r in bm25_results}
         bm25_ranks = {r["id"]: i + 1 for i, r in enumerate(bm25_results)}
 
-        all_ids = set(vector_map.keys()) | set(bm25_map.keys())
+        ordered_ids = list(vector_map.keys()) + [
+            mid for mid in bm25_map if mid not in vector_map
+        ]
 
-        # Normalise vector distances to [0, 1] range across this batch
-        # (raw cosine distances can exceed 1.0 for very dissimilar vectors)
         vector_dists = [r.get("_distance", 0.0) for r in vector_results]
         max_dist = max(vector_dists) if vector_dists else 1.0
         min_dist = min(vector_dists) if vector_dists else 0.0
+        dist_range = max_dist - min_dist
 
-        fused = []
-        for mid in all_ids:
+        fused: list[dict[str, Any]] = []
+        for mid in ordered_ids:
             entry = vector_map.get(mid) or bm25_map.get(mid)
             if entry is None:
                 continue
@@ -188,167 +346,425 @@ class HybridRetriever:
             in_bm25 = mid in bm25_map
 
             if in_vector:
-                # Primary signal: normalised vector proximity
                 raw_dist = entry.get("_distance", 0.0)
-                if max_dist > min_dist:
-                    norm_dist = (raw_dist - min_dist) / (max_dist - min_dist)
-                else:
-                    norm_dist = 0.0
-                # Score: close to 1.0 for good matches, clamped to [0.01, 1.0]
+                norm_dist = (raw_dist - min_dist) / dist_range if dist_range > 0 else 0.0
                 fusion_score = max(0.01, 1.0 - norm_dist)
-
-                # BM25 confirmation bonus
                 if in_bm25:
                     bm25_rank = bm25_ranks[mid]
-                    bonus = 1.0 + (0.3 / (1 + math.log1p(bm25_rank)))
-                    fusion_score *= bonus
-
+                    fusion_score *= 1.0 + (0.3 / (1 + math.log1p(bm25_rank)))
                 entry["_fusion_source"] = "both" if in_bm25 else "vector"
-
-            elif in_bm25:
-                # Pure BM25 hit — lower base score, but with preservation floor
-                # for high-importance entries (per spec: prevent reranker kills)
+            else:
                 bm25_rank = bm25_ranks[mid]
                 fusion_score = 0.15 / (1 + math.log1p(bm25_rank))
-                # Importance preservation floor
-                metadata = entry.get("metadata", {})
-                if isinstance(metadata, str):
-                    metadata = json.loads(metadata)
-                importance = metadata.get("importance", 0.5)
+                importance = self._extract_importance(entry)
                 if importance >= 0.8:
                     fusion_score = max(fusion_score, 0.12)
                 elif importance >= 0.6:
                     fusion_score = max(fusion_score, 0.08)
                 entry["_fusion_source"] = "bm25"
-            else:
-                continue
 
             entry["_fusion_score"] = fusion_score
-            entry["_vector_rank"] = (list(vector_map.keys()).index(mid) + 1) if in_vector else None
+            entry["_vector_rank"] = vector_ranks.get(mid) if in_vector else None
             entry["_bm25_rank"] = bm25_ranks.get(mid)
             fused.append(entry)
 
-        # Sort by fusion score descending
-        fused.sort(key=lambda e: e.get("_fusion_score", 0), reverse=True)
-
+        fused.sort(key=lambda e: e.get("_fusion_score", 0.0), reverse=True)
         return fused
 
-    def _run_recall_lifecycle(
-        self,
-        results: List[Dict[str, Any]],
-    ) -> None:
-        """
-        Lifecycle hooks after recall (per CortexReach spec):
-          1. Increment access count for each recalled item
-          2. Update last_accessed_at
-          3. Evaluate tier promotions/demotions for affected scope
-        """
+    @staticmethod
+    def _extract_importance(entry: dict[str, Any]) -> float:
+        val = entry.get("importance")
+        if val is None:
+            val = _coerce_metadata(entry.get("metadata", {})).get("importance", 0.5)
+        try:
+            return max(0.0, min(1.0, float(val)))
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _run_recall_lifecycle(self, results: list[dict[str, Any]]) -> None:
+        """Lifecycle hooks after recall: access-count increment + tier eval."""
+        self._lifecycle_call_count += 1
+
         for entry in results:
             mem_id = entry.get("id")
             if mem_id:
-                self.store.increment_access_count(mem_id)
+                try:
+                    self.store.increment_access_count(mem_id)
+                except Exception as e:
+                    logger.warning("increment_access_count failed for %s: %s", mem_id, e)
 
-        # Evaluate tier changes across the full store (not just recalled items)
-        # This is the "scoreAll" + "evaluateAll" cycle from the spec
-        all_memories = self.store.list_memories(limit=500)
-        tier_changes = evaluate_all_tiers(all_memories)
+        if TIER_EVAL_FREQUENCY <= 0:
+            return
+        if self._lifecycle_call_count % TIER_EVAL_FREQUENCY != 0:
+            return
 
-        # Write back tier changes
+        try:
+            all_memories = self.store.list_memories(limit=TIER_EVAL_BATCH)
+        except Exception as e:
+            logger.warning("Tier eval list_memories failed: %s", e)
+            return
+
+        try:
+            tier_changes = evaluate_all_tiers(all_memories)
+        except Exception as e:
+            logger.warning("evaluate_all_tiers failed: %s", e)
+            return
+
         for mem_id, new_tier in tier_changes.items():
-            self.store.update(mem_id, tier=new_tier)
+            try:
+                self.store.update(mem_id, tier=new_tier)
+            except Exception as e:
+                logger.warning("Tier update for %s failed: %s", mem_id, e)
+
+    # ----- Google OAuth2 token acquisition -----
+
+    def _get_google_auth_token(self) -> str | None:
+        """Obtain an OAuth2 bearer token via Application Default Credentials.
+
+        Google's Discovery Engine Ranking API requires OAuth2 authentication;
+        API keys are explicitly rejected with a 401.  This method uses the
+        ``google-auth`` library's ADC chain, which resolves credentials in
+        this priority order:
+
+        1. **Service account JSON** — set ``GOOGLE_APPLICATION_CREDENTIALS``
+           to the path of a downloaded service account key file.
+        2. **Developer workstation** — run
+           ``gcloud auth application-default login`` once; credentials are
+           cached at ``~/.config/gcloud/application_default_credentials.json``.
+        3. **GCP Metadata Server** — running inside GCP Compute, Cloud Run,
+           GKE, etc. — credentials are fetched automatically from the instance
+           metadata endpoint.
+
+        The first call acquires credentials and caches them on
+        ``self._google_credentials``.  Subsequent calls refresh the token
+        only when it is about to expire (``creds.valid`` is False).  On any
+        unrecoverable failure the Google reranker is disabled for the session.
+
+        Returns the OAuth2 access token string, or ``None`` on failure.
+        """
+        try:
+            import google.auth
+            import google.auth.transport.requests
+        except ImportError:
+            logger.warning(
+                "google-auth is not installed; cannot use the Google Ranking API. "
+                "Install it with: pip install 'hermes-memory-lancedb-pro[google]' "
+                "or: pip install google-auth"
+            )
+            self._google_disabled = True
+            return None
+
+        if self._google_credentials is None:
+            try:
+                creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                self._google_credentials = creds
+            except Exception as e:
+                logger.warning(
+                    "Google Application Default Credentials not found: %s. "
+                    "To authenticate, either: (1) set GOOGLE_APPLICATION_CREDENTIALS "
+                    "to a service account JSON path, (2) run "
+                    "'gcloud auth application-default login', or (3) deploy on GCP. "
+                    "Google reranking disabled for this session.",
+                    e,
+                )
+                self._google_disabled = True
+                return None
+
+        creds = self._google_credentials
+        if not creds.valid:
+            try:
+                auth_req = google.auth.transport.requests.Request()
+                creds.refresh(auth_req)
+            except Exception as e:
+                logger.warning(
+                    "Google auth token refresh failed: %s. "
+                    "Google reranking disabled for this session.",
+                    e,
+                )
+                self._google_disabled = True
+                return None
+
+        return creds.token
+
+    # ----- reranking dispatcher -----
 
     def _rerank(
         self,
         query: str,
-        results: List[Dict[str, Any]],
+        results: list[dict[str, Any]],
         top_n: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """
-        Semantic reranking using the LangSearch Reranking API.
+    ) -> list[dict[str, Any]]:
+        """Dispatch to the active reranker backend, or return results unchanged."""
+        if self._active_reranker == "langsearch":
+            return self._rerank_langsearch(query, results, top_n)
+        if self._active_reranker == "google":
+            return self._rerank_google(query, results, top_n)
+        return results
 
-        Sends the top-N fused results to LangSearch's dedicated reranker
-        which scores each document's semantic relevance to the query
-        (0.0–1.0). Far more accurate than the previous LLM-prompt approach.
+    # ----- LangSearch backend -----
 
-        Args:
-            query: Original search query
-            results: Pre-fused and scored results
-            top_n: Number of results to return after reranking
-
-        Returns:
-            Reranked list of results
-        """
-        if not LANGSEARCH_API_KEY:
-            logger.warning("LANGSEARCH_API_KEY not set, skipping reranking")
+    def _rerank_langsearch(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Cross-encoder reranking via LangSearch."""
+        if self._langsearch_disabled:
             return results
-
         if len(results) <= 1:
             return results
 
-        # LangSearch accepts up to 50 documents; cap reasonably
-        candidates = results[:min(top_n * 3, LANGSEARCH_MAX_DOCS)]
-
-        # Extract document texts for LangSearch
-        documents = []
-        for entry in candidates:
-            text = entry.get("text", "") or ""
-            documents.append(text)
-
-        if not documents or all(not d for d in documents):
+        candidate_count = min(top_n * 3, LANGSEARCH_MAX_DOCS, len(results))
+        if candidate_count <= 1:
             return results
 
-        try:
-            resp = requests.post(
-                LANGSEARCH_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": LANGSEARCH_MODEL,
-                    "query": query,
-                    "documents": documents,
-                    "top_n": top_n,
-                    "return_documents": False,
-                },
-                timeout=LANGSEARCH_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        candidates = results[:candidate_count]
+        documents = [str(c.get("text", "") or "") for c in candidates]
+        if not any(documents):
+            return results
 
-            if data.get("code") != 200:
-                logger.warning("LangSearch rerank returned error: %s", data.get("msg", "unknown"))
-                return results
+        if self._langsearch_session is None:
+            self._langsearch_session = requests.Session()
+            self._langsearch_session.headers.update({
+                "Authorization": f"Bearer {self._langsearch_api_key}",
+                "Content-Type": "application/json",
+            })
 
-            lang_results = data.get("results", [])
-            if not lang_results:
-                return results
+        payload = {
+            "model": LANGSEARCH_MODEL,
+            "query": query,
+            "documents": documents,
+            "top_n": min(top_n, candidate_count),
+            "return_documents": False,
+        }
 
-            # Build a map: index -> relevance_score
-            score_map = {}
-            for item in lang_results:
-                idx = item.get("index")
-                score = item.get("relevance_score", 0.0)
-                if idx is not None:
-                    score_map[idx] = score
-
-            # Apply reranking scores — blend: 70% LangSearch, 30% fusion
-            for i, entry in enumerate(candidates):
-                if i in score_map:
-                    entry["_rerank_score"] = score_map[i]
-                    entry["_final_score"] = (
-                        entry.get("_final_score", 0) * 0.3
-                        + score_map[i] * 0.7
+        data = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._langsearch_session.post(
+                    LANGSEARCH_BASE_URL,
+                    json=payload,
+                    timeout=LANGSEARCH_TIMEOUT,
+                )
+                if resp.status_code in (401, 403, 429):
+                    self._langsearch_disabled = True
+                    logger.warning(
+                        "LangSearch rerank disabled for this session "
+                        "(HTTP %d). Check LANGSEARCH_API_KEY or quota. "
+                        "Falling back to fusion-only ranking.",
+                        resp.status_code,
                     )
+                    return results
+                if 500 <= resp.status_code < 600 and attempt == 0:
+                    last_err = Exception(f"5xx on rerank: {resp.status_code}")
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.RequestException as e:
+                last_err = e
+                if attempt == 0 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    continue
+                break
+            except ValueError as e:
+                last_err = e
+                break
 
-            # Re-sort by final score descending
-            results[:len(candidates)] = sorted(
-                candidates,
-                key=lambda e: e.get("_final_score", 0),
-                reverse=True,
+        if data is None:
+            if last_err is not None:
+                logger.warning("LangSearch rerank failed: %s", last_err)
+            return results
+
+        if isinstance(data, dict) and data.get("code") not in (None, 200):
+            logger.warning(
+                "LangSearch rerank returned error: %s",
+                data.get("msg", "unknown"),
             )
             return results
 
-        except Exception as e:
-            logger.warning("LangSearch reranking failed: %s", e)
+        lang_results = (data or {}).get("results") or []
+        if not lang_results:
             return results
+
+        score_map: dict[int, float] = {}
+        for item in lang_results:
+            idx = item.get("index")
+            score = item.get("relevance_score")
+            if isinstance(idx, int) and isinstance(score, (int, float)):
+                score_map[idx] = float(score)
+        if not score_map:
+            return results
+
+        return self._apply_rerank_scores(candidates, results, candidate_count, score_map)
+
+    # ----- Google Ranking API backend -----
+
+    def _rerank_google(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Cross-encoder reranking via Google Discovery Engine Ranking API.
+
+        Authenticates with an OAuth2 bearer token obtained via Application
+        Default Credentials (see ``_get_google_auth_token``).  The GCP
+        project ID comes from ``GOOGLE_CLOUD_PROJECT`` (also accepted as
+        ``GOOGLE_PROJECT_ID`` or ``GOOGLE_PROJECT``), read at
+        ``MemoryRetriever.__init__`` time so dotenv-loaded values are seen.
+
+        Model: ``semantic-ranker-512@latest`` (overridable via
+        ``MEMORY_GOOGLE_RANKING_MODEL``).
+
+        Pricing: 1,000 free queries/month; ~$0.001/query thereafter.
+        """
+        if self._google_disabled:
+            return results
+        if len(results) <= 1:
+            return results
+
+        candidate_count = min(top_n * 3, GOOGLE_RANKING_MAX_DOCS, len(results))
+        if candidate_count <= 1:
+            return results
+
+        candidates = results[:candidate_count]
+        if not any(c.get("text") for c in candidates):
+            return results
+
+        # Obtain a fresh OAuth2 bearer token (refreshed transparently when expired)
+        token = self._get_google_auth_token()
+        if token is None:
+            return results
+
+        if self._google_session is None:
+            self._google_session = requests.Session()
+            self._google_session.headers["Content-Type"] = "application/json"
+        # Set/refresh the Authorization header on every call — tokens expire (~1 hr)
+        self._google_session.headers["Authorization"] = f"Bearer {token}"
+
+        records = [
+            {"id": str(i), "content": str(c.get("text", "") or "")}
+            for i, c in enumerate(candidates)
+        ]
+        payload = {
+            "model": self._google_ranking_model,
+            "topN": candidate_count,
+            "query": query,
+            "records": records,
+        }
+        url = GOOGLE_RANKING_BASE_URL.format(project=self._google_cloud_project)
+
+        data = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._google_session.post(
+                    url,
+                    json=payload,
+                    timeout=GOOGLE_RANKING_TIMEOUT,
+                )
+                if resp.status_code in (401, 403, 429):
+                    self._google_disabled = True
+                    logger.warning(
+                        "Google rerank disabled for this session "
+                        "(HTTP %d). Check Application Default Credentials and "
+                        "GOOGLE_CLOUD_PROJECT, or quota. "
+                        "Falling back to fusion-only ranking.",
+                        resp.status_code,
+                    )
+                    return results
+                if resp.status_code == 404:
+                    self._google_disabled = True
+                    logger.warning(
+                        "Google rerank got 404. Ensure the Discovery Engine API "
+                        "is enabled for project %r and GOOGLE_CLOUD_PROJECT is "
+                        "correct. Falling back to fusion-only ranking.",
+                        self._google_cloud_project,
+                    )
+                    return results
+                if 500 <= resp.status_code < 600 and attempt == 0:
+                    last_err = Exception(f"5xx on Google rerank: {resp.status_code}")
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                last_err = None
+                break
+            except requests.RequestException as e:
+                last_err = e
+                if attempt == 0 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    continue
+                break
+            except ValueError as e:
+                last_err = e
+                break
+
+        if data is None:
+            if last_err is not None:
+                logger.warning("Google rerank failed: %s", last_err)
+            return results
+
+        google_records = (data or {}).get("records") or []
+        if not google_records:
+            return results
+
+        score_map: dict[int, float] = {}
+        for rec in google_records:
+            try:
+                idx = int(rec["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            score = rec.get("relevanceScore")
+            if isinstance(score, (int, float)):
+                score_map[idx] = float(score)
+        if not score_map:
+            return results
+
+        # Normalise within the batch — Google's scores cluster in a narrow
+        # band and need rescaling before the 70/30 blend.
+        if score_map:
+            max_s = max(score_map.values())
+            min_s = min(score_map.values())
+            span = max_s - min_s
+            if span > 0:
+                score_map = {k: (v - min_s) / span for k, v in score_map.items()}
+
+        return self._apply_rerank_scores(candidates, results, candidate_count, score_map)
+
+    # ----- shared rerank blend logic -----
+
+    @staticmethod
+    def _apply_rerank_scores(
+        candidates: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        candidate_count: int,
+        score_map: dict[int, float],
+    ) -> list[dict[str, Any]]:
+        """
+        Blend reranker scores into ``_final_score`` and re-sort.
+
+        ``score_map`` maps candidate-list index → normalised relevance score.
+        Candidates without a score entry are penalised.  The tail of
+        ``results`` beyond ``candidate_count`` is preserved unchanged.
+        """
+        for i, entry in enumerate(candidates):
+            existing = float(entry.get("_final_score", 0.0))
+            if i in score_map:
+                rerank = score_map[i]
+                entry["_rerank_score"] = rerank
+                entry["_final_score"] = 0.7 * rerank + 0.3 * existing
+            else:
+                entry["_final_score"] = 0.3 * existing
+                entry["_rerank_score"] = 0.0
+
+        candidates.sort(key=lambda e: e.get("_final_score", 0.0), reverse=True)
+        results[:candidate_count] = candidates
+        return results
+
+
+# Back-compat alias for callers that imported the old name
+HybridRetriever = MemoryRetriever

@@ -1,11 +1,12 @@
 name: lancedb_pro
-version: 1.0.0
+version: 0.9.4
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 pip_dependencies:
   - lance
-  - lancedb
-  - numpy
-  - sentence-transformers
+  - lancedb>=0.20.0
+  - numpy>=1.24.0
+  - sentence-transformers>=3.0.0
+  - requests>=2.31.0
 hooks:
   - prefetch
   - on_memory_write

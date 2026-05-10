@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.1.0"
+version = "0.9.4"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["memory", "lancedb", "hermes-agent", "embedding", "bm25", "semantic-search"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -26,16 +26,72 @@ dependencies = [
     "lancedb>=0.20.0",
     "numpy>=1.24.0",
     "sentence-transformers>=3.0.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "ruff>=0.6.0",
+]
+google = [
+    "google-auth>=2.0.0",
 ]
 
 [project.scripts]
-memory-smoke-test = "scripts.memory_smoke_test:main"
+hermes-memory-smoke = "hermes_memory_lancedb_pro._cli:smoke_main"
+hermes-memory = "hermes_memory_lancedb_pro._cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hermes_memory_lancedb_pro = ["plugin.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with -m \"not slow\")",
+    "integration: requires LanceDB and embedding model (deselect with -m \"not integration\")",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PL"]
+ignore = [
+    "E501",   # line too long (line-length already configured)
+    "PLR2004",  # magic numbers
+    "PLR0913",  # too many arguments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR2004", "E402", "PLC0415", "F401"]
+"scripts/*" = ["PLR0912", "PLR0915"]
+# Lazy heavy-dependency imports inside __init__.py and store.py are intentional —
+# importing the package shouldn't pull in lancedb/torch.
+"src/hermes_memory_lancedb_pro/__init__.py" = ["PLC0415"]
+"src/hermes_memory_lancedb_pro/store.py" = ["PLC0415"]
+# provider.py imports `agent.memory_provider` from hermes-agent only when
+# hermes-agent is on PYTHONPATH; the lazy import is by design.
+"src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415"]
+"src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912", "PLR0915"]
+# smart_extractor's process_candidate is a long dispatch table over the 7
+# dedup decisions — collapsing it via a function-table hurts readability
+# and the per-branch logic is what reviewers want to read.
+"src/hermes_memory_lancedb_pro/smart_extractor.py" = ["PLR0911", "PLR0912", "PLR0915", "PLC0415"]
+# llm_client has multi-step env-detection + JSON-repair state machine that
+# read more cleanly with explicit early returns than nested gates.
+"src/hermes_memory_lancedb_pro/llm_client.py" = ["PLR0911", "PLR0912"]
+# smart_metadata's defaults / context-normalisation switch on many enum
+# values — flat returns are clearer than match/case here.
+"src/hermes_memory_lancedb_pro/smart_metadata.py" = ["PLR0911"]
+# score_text is a flat lookup over many score buckets — collapsing the
+# returns into a single expression hurts readability.
+"src/hermes_memory_lancedb_pro/session_compressor.py" = ["PLR0911", "PLR1714"]
+# The rerank function has many fail-soft early returns by design.
+"src/hermes_memory_lancedb_pro/retriever.py" = ["PLR0911", "PLR0912", "PLR0915"]
