@@ -32,7 +32,7 @@ Heuristics:
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -345,7 +345,7 @@ def parse_section_bullets(md: str, heading: str) -> list[str]:
 
 def _extract_reflection_slices_with_sanitizer(
     reflection_text: str,
-    sanitize_lines: collections.abc.Callable[[Sequence[str]], list[str]],  # type: ignore[name-defined]  # noqa: F821
+    sanitize_lines: Callable[[Sequence[str]], list[str]],
 ) -> ReflectionSlices:
     """Internal port of extractReflectionSlicesWithSanitizer."""
 
@@ -430,7 +430,7 @@ _MAPPED_SECTIONS: list[tuple[str, Literal["user-model", "agent-model", "lesson",
 
 def _extract_reflection_mapped_memory_items_with_sanitizer(
     reflection_text: str,
-    sanitize_lines: collections.abc.Callable[[Sequence[str]], list[str]],  # type: ignore[name-defined]  # noqa: F821
+    sanitize_lines: Callable[[Sequence[str]], list[str]],
 ) -> list[ReflectionMappedMemoryItem]:
     """Internal port of extractReflectionMappedMemoryItemsWithSanitizer."""
     result: list[ReflectionMappedMemoryItem] = []

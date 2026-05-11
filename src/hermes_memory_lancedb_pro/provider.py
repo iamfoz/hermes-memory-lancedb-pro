@@ -152,7 +152,7 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
         if not text:
             continue
         cat = r.get("category") or "other"
-        score = r.get("_final_score") or r.get("_rrf_score") or 0.0
+        score = r.get("_final_score") or r.get("_rrf_score") or r.get("score") or 0.0
         lines.append(f"- [{cat}] {text} (score={score:.2f})")
     return "\n".join(lines) if lines else ""
 
@@ -245,6 +245,9 @@ def _build_provider_class():
             self._prefetch_limit = prefetch_limit
             self._session_id: str = ""
             self._sync_thread: threading.Thread | None = None
+            # Protects _sync_thread reference against concurrent sync_turn /
+            # on_session_end / shutdown calls from different threads.
+            self._thread_lock = threading.Lock()
             # Lock protecting _pending_used_ids — dict is mutated from the
             # calling thread (prefetch/before_prompt_build) and from the
             # sync_turn daemon thread simultaneously.
@@ -291,7 +294,10 @@ def _build_provider_class():
                     self._smart_extractor = _maybe_build_default_smart_extractor(
                         self._store
                     )
-            self._store._initialise()
+            elif self._explicit_store:
+                # get_instance() calls _initialise() internally, but an
+                # explicitly-supplied store may not have been opened yet.
+                self._store._initialise()
 
         def get_tool_schemas(self) -> list[dict[str, Any]]:
             return []  # context-only provider; no tool calls
@@ -334,10 +340,46 @@ def _build_provider_class():
                     "secret": False,
                     "required": False,
                 },
+                {
+                    "key": "purge_grace_days",
+                    "env_var": "MEMORY_PURGE_GRACE_DAYS",
+                    "description": "Min age in days before archived rows are deleted (default: 30)",
+                    "secret": False,
+                    "required": False,
+                },
             ]
 
         def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
-            """No-op: this provider is configured entirely via env vars."""
+            """Persist setup values to ``<hermes_home>/.env``.
+
+            Reads the existing file, replaces lines for any env vars
+            being updated, then appends new ones. Empty/None values are
+            skipped — the user can clear them by editing the file directly."""
+            if not values or not hermes_home:
+                return
+            schema = {entry["key"]: entry["env_var"] for entry in self.get_config_schema()}
+            to_write = {
+                schema[key]: str(val)
+                for key, val in values.items()
+                if key in schema and val is not None and str(val).strip()
+            }
+            if not to_write:
+                return
+            env_path = os.path.join(hermes_home, ".env")
+            existing: list[str] = []
+            if os.path.exists(env_path):
+                with open(env_path, encoding="utf-8") as fh:
+                    existing = fh.readlines()
+            # Drop lines we're overwriting, preserve everything else.
+            kept = [
+                line for line in existing
+                if not any(line.startswith(f"{var}=") for var in to_write)
+            ]
+            for env_var, value in to_write.items():
+                kept.append(f"{env_var}={value}\n")
+            os.makedirs(hermes_home, exist_ok=True)
+            with open(env_path, "w", encoding="utf-8") as fh:
+                fh.writelines(kept)
 
         # ---- Read path ----------------------------------------------------
 
@@ -416,11 +458,16 @@ def _build_provider_class():
             fall back to writing raw user / assistant turns — same shape
             this provider has always used."""
             effective_session_id = session_id or self._session_id
+            # Capture store and extractor at dispatch time so a concurrent
+            # initialize() call cannot swap them out mid-write and redirect
+            # this turn's data to a different session's database.
+            _extractor = self._smart_extractor
+            _store = self._store
 
             def _do() -> None:
-                if self._smart_extractor is not None:
+                if _extractor is not None:
                     try:
-                        self._smart_extractor.extract_and_persist(
+                        _extractor.extract_and_persist(
                             user_content=user_content,
                             assistant_content=assistant_content,
                             session_key=effective_session_id,
@@ -435,11 +482,13 @@ def _build_provider_class():
                             "falling back to raw writes: %s", e,
                         )
                         self._raw_sync_turn(
-                            user_content, assistant_content, effective_session_id
+                            user_content, assistant_content, effective_session_id,
+                            _store_override=_store,
                         )
                 else:
                     self._raw_sync_turn(
-                        user_content, assistant_content, effective_session_id
+                        user_content, assistant_content, effective_session_id,
+                        _store_override=_store,
                     )
 
                 # Credit the memories the model saw in its prefetch — bypasses
@@ -453,31 +502,42 @@ def _build_provider_class():
                     )
                 if used:
                     try:
-                        self._store.mark_recall_used(used, session_id=effective_session_id)
+                        _store.mark_recall_used(used, session_id=effective_session_id)
                     except Exception as e:
                         logger.warning("lancedb_pro mark_recall_used failed: %s", e)
 
-            if self._sync_thread and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
-            self._sync_thread = threading.Thread(target=_do, daemon=True)
-            self._sync_thread.start()
+            with self._thread_lock:
+                prev = self._sync_thread
+            if prev and prev.is_alive():
+                prev.join(timeout=5.0)
+            new_thread = threading.Thread(target=_do, daemon=True)
+            with self._thread_lock:
+                self._sync_thread = new_thread
+            new_thread.start()
 
         def _raw_sync_turn(
             self,
             user_content: str,
             assistant_content: str,
             session_id: str,
+            *,
+            _store_override: MemoryStore | None = None,
         ) -> None:
             """Legacy raw-turn write path. Used when no smart_extractor is
             configured, or as a fail-safe if the extractor orchestrator
-            itself raises (per-candidate failures don't reach here)."""
+            itself raises (per-candidate failures don't reach here).
+
+            ``_store_override`` lets the sync_turn daemon thread pass the
+            store it captured at dispatch time, preventing a concurrent
+            initialize() from redirecting writes to the wrong database."""
+            store = _store_override or self._store
             metadata_extra = (
                 {"source_session": session_id, "source": "agent_turn"}
                 if session_id else {"source": "agent_turn"}
             )
             try:
                 if user_content and user_content.strip():
-                    self._store.store(
+                    store.store(
                         text=user_content.strip(),
                         category="other",
                         scope="agent",
@@ -489,7 +549,7 @@ def _build_provider_class():
 
             try:
                 if assistant_content and assistant_content.strip():
-                    self._store.store(
+                    store.store(
                         text=assistant_content.strip(),
                         category="other",
                         scope="agent",
@@ -592,8 +652,21 @@ def _build_provider_class():
         ) -> None:
             """Mirror writes from the built-in memory tool into our store
             so hermes-agent's `/memory` commands and our recall stay in
-            sync. Idempotent on duplicate writes — we just add a row."""
-            if action != "add" or not content.strip():
+            sync. Idempotent on duplicate writes — we just add a row.
+
+            ``edit`` and ``delete`` actions are noted in the debug log but
+            not yet wired to store mutations — the exact `target`/`content`
+            semantics for those actions are not yet finalised in the spec."""
+            if action not in ("add", "edit", "delete"):
+                return
+            if action in ("edit", "delete"):
+                logger.debug(
+                    "lancedb_pro on_memory_write: action %r not yet handled "
+                    "(target=%r); built-in and LanceDB stores may diverge",
+                    action, target,
+                )
+                return
+            if not content.strip():
                 return
             sess = (metadata or {}).get("session_id") or ""
             extra = {"source": f"hermes_{target}"}
@@ -623,16 +696,20 @@ def _build_provider_class():
             Joins any pending sync_turn thread so writes complete before
             auto-purge runs, then flushes the pending-recall ledger and
             triggers the cooldown-gated auto-purge."""
-            if self._sync_thread and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=10.0)
+            with self._thread_lock:
+                thread = self._sync_thread
+            if thread and thread.is_alive():
+                thread.join(timeout=10.0)
             with self._pending_lock:
                 self._pending_used_ids.clear()
             _maybe_auto_purge(self._store)
 
         def shutdown(self) -> None:
             """Called by hermes-agent at process exit."""
-            if self._sync_thread and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
+            with self._thread_lock:
+                thread = self._sync_thread
+            if thread and thread.is_alive():
+                thread.join(timeout=5.0)
             with self._pending_lock:
                 self._pending_used_ids.clear()
             _maybe_auto_purge(self._store)
