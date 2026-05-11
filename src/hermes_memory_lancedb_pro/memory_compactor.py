@@ -363,7 +363,9 @@ def should_run_compaction(state_file: str, cooldown_hours: int) -> bool:
 
 def record_compaction_run(state_file: str) -> None:
     """Persist a `last_run_at` marker for `should_run_compaction`."""
-    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    # os.path.dirname returns "" for bare filenames; makedirs("") raises.
+    if parent := os.path.dirname(state_file):
+        os.makedirs(parent, exist_ok=True)
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump({"last_run_at": int(time.time() * 1000)}, f)
 

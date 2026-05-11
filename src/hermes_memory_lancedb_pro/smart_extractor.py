@@ -930,8 +930,11 @@ class SmartExtractor:
         # Update the row text + metadata. Our MemoryStore.update supports
         # text-supersede OR metadata-only path; for merge we want the
         # supersede behaviour (text changed → embed changed).
+        # store.update() returns the new row's ID after supersede — capture
+        # it so the support-stats update targets the live row, not the
+        # archived one.
         try:
-            self._store.update(
+            new_id = self._store.update(
                 match_id,
                 text=merged_abstract,
                 metadata_extra=merged_meta_extras,
@@ -940,20 +943,23 @@ class SmartExtractor:
             logger.warning("smart-extractor: merge update failed: %s", e)
             return
 
-        # Best-effort: update support stats on the merged memory
+        # Best-effort: update support stats on the merged (live) memory.
+        # Use new_id returned by the supersede; match_id now points at the
+        # archived predecessor and must not be used here.
         try:
-            updated = self._store.get_by_id(match_id)
+            live_id = new_id or match_id
+            updated = self._store.get_by_id(live_id)
             if updated:
                 meta = parse_smart_metadata(updated.get("metadata"), updated)
                 support = parse_support_info(meta.support_info)
                 new_support = update_support_stats(support, context_label, "support")
                 meta.support_info = new_support
                 self._store.update(
-                    match_id,
+                    live_id,
                     metadata_extra={"support_info": _support_info_to_dict(new_support)},
                 )
-        except Exception:
-            pass  # non-critical
+        except Exception as e:
+            logger.debug("smart-extractor: merge support-stats update failed (non-critical): %s", e)
 
     def _handle_supersede(
         self,

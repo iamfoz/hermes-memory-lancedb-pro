@@ -10,10 +10,7 @@ don't need hermes-agent installed.
 
 USAGE (in your `~/.hermes/plugins/lancedb_pro/__init__.py`):
 
-    from hermes_memory_lancedb_pro.provider import (
-        LanceDBProMemoryProvider,
-        register_memory_provider,
-    )
+    from hermes_memory_lancedb_pro.provider import register
 
 That's all hermes-agent's plugin discovery needs. The provider:
 
@@ -24,6 +21,10 @@ That's all hermes-agent's plugin discovery needs. The provider:
     don't get injected on weak matches
   * batches `sync_turn` writes and increments access counts via the
     throttled `mark_recall_used` API
+  * runs `sync_turn` in a daemon thread so hermes-agent is never
+    blocked by the write path
+  * isolates the database under `hermes_home` when supplied by
+    hermes-agent's `initialize()` call
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import TYPE_CHECKING, Any
 
 from .memory_compactor import record_compaction_run, should_run_compaction
@@ -158,9 +160,8 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
 def _maybe_auto_purge(store: MemoryStore) -> None:
     """Run purge_archived() if the cooldown has elapsed since the last run.
 
-    Called from ``LanceDBProMemoryProvider.shutdown()`` at session end.
-    The check is a fast JSON stat; the purge only executes every
-    ``MEMORY_AUTO_PURGE_COOLDOWN_HOURS`` hours (default: 24).
+    Called at session end. The check is a fast JSON stat; the purge only
+    executes every ``MEMORY_AUTO_PURGE_COOLDOWN_HOURS`` hours (default: 24).
 
     Set ``MEMORY_AUTO_PURGE_COOLDOWN_HOURS=0`` to disable entirely.
     Adjust the minimum age of rows to delete with ``MEMORY_PURGE_GRACE_DAYS``
@@ -235,12 +236,19 @@ def _build_provider_class():
             smart_extractor: Any = None,
             auto_smart_extraction: bool = True,
         ):
+            self._explicit_store = store is not None
             self._store = store or MemoryStore.get_instance()
             self._retriever = retriever or MemoryRetriever(self._store)
             self._min_score = (
                 min_score if min_score is not None else DEFAULT_MIN_RECALL_SCORE
             )
             self._prefetch_limit = prefetch_limit
+            self._session_id: str = ""
+            self._sync_thread: threading.Thread | None = None
+            # Lock protecting _pending_used_ids — dict is mutated from the
+            # calling thread (prefetch/before_prompt_build) and from the
+            # sync_turn daemon thread simultaneously.
+            self._pending_lock = threading.Lock()
             # Cache last-prefetched ids per session so we can mark them
             # "used" on the next sync_turn (i.e. only when we actually
             # forwarded the recall to the LLM and got a response back).
@@ -251,6 +259,7 @@ def _build_provider_class():
             # `ANTHROPIC_API_KEY`). When neither resolves, sync_turn falls
             # back to writing raw user/assistant turns — the same shape this
             # provider always wrote, so existing stores don't migrate.
+            self._auto_smart_extraction = auto_smart_extraction
             self._smart_extractor = smart_extractor
             if smart_extractor is None and auto_smart_extraction:
                 self._smart_extractor = _maybe_build_default_smart_extractor(self._store)
@@ -264,11 +273,71 @@ def _build_provider_class():
         def is_available(self) -> bool:
             return True
 
-        def initialize(self, session_id: str, **_kwargs: Any) -> None:
+        def initialize(self, session_id: str, **kwargs: Any) -> None:
+            """Called by hermes-agent before the first turn of each session.
+
+            Stores the session ID and re-points the store at the profile-
+            isolated ``hermes_home`` directory when hermes-agent supplies it.
+            Passing ``hermes_home`` keeps each Hermes profile's memories in
+            a separate database tree (e.g. ``~/.hermes/memory-lancedb``)
+            rather than the process-wide default path."""
+            self._session_id = session_id
+            hermes_home = kwargs.get("hermes_home")
+            if hermes_home and not self._explicit_store:
+                db_path = os.path.join(str(hermes_home), "memory-lancedb")
+                self._store = MemoryStore.get_instance(db_path=db_path)
+                self._retriever = MemoryRetriever(self._store)
+                if self._auto_smart_extraction:
+                    self._smart_extractor = _maybe_build_default_smart_extractor(
+                        self._store
+                    )
             self._store._initialise()
 
         def get_tool_schemas(self) -> list[dict[str, Any]]:
             return []  # context-only provider; no tool calls
+
+        def get_config_schema(self) -> list[dict[str, Any]]:
+            """Declare env-var configuration for `hermes memory setup`."""
+            return [
+                {
+                    "key": "extraction_api_key",
+                    "env_var": "MEMORY_EXTRACTION_API_KEY",
+                    "description": "API key for LLM-driven memory extraction (optional)",
+                    "secret": True,
+                    "required": False,
+                },
+                {
+                    "key": "extraction_base_url",
+                    "env_var": "MEMORY_EXTRACTION_BASE_URL",
+                    "description": "Base URL for LLM extraction endpoint (optional)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "extraction_model",
+                    "env_var": "MEMORY_EXTRACTION_MODEL",
+                    "description": "Model name for LLM extraction (optional)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "prefetch_limit",
+                    "env_var": "MEMORY_PREFETCH_LIMIT",
+                    "description": "Max memories injected per turn (default: 5)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "auto_purge_cooldown_hours",
+                    "env_var": "MEMORY_AUTO_PURGE_COOLDOWN_HOURS",
+                    "description": "Hours between automatic archive purges (default: 24; 0 = off)",
+                    "secret": False,
+                    "required": False,
+                },
+            ]
+
+        def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
+            """No-op: this provider is configured entirely via env vars."""
 
         # ---- Read path ----------------------------------------------------
 
@@ -292,12 +361,13 @@ def _build_provider_class():
                 return ""
 
             if results and session_id:
-                self._pending_used_ids[session_id] = [
-                    r["id"] for r in results if r.get("id")
-                ]
+                with self._pending_lock:
+                    self._pending_used_ids[session_id] = [
+                        r["id"] for r in results if r.get("id")
+                    ]
             return _format_recall(results)
 
-        def prefetch(self, query: str, *, session_id: str = "") -> str:
+        def prefetch(self, query: str) -> str:
             """User-message memory injection (legacy hermes-agent path).
 
             Returns the formatted recall block. On hermes-agent versions
@@ -305,7 +375,7 @@ def _build_provider_class():
             called — the host detects our override and skips prefetch
             to avoid double-injection. On older hermes-agent, this is
             the only injection point."""
-            return self._do_recall(query, session_id)
+            return self._do_recall(query, self._session_id)
 
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
             """System-prompt memory injection (new hermes-agent path).
@@ -322,7 +392,7 @@ def _build_provider_class():
             plugin keeps both methods so the SAME wheel works against
             both old and new hermes-agent."""
             query = str(turn_state.get("query") or "")
-            session_id = str(turn_state.get("session_id") or "")
+            session_id = str(turn_state.get("session_id") or "") or self._session_id
             return self._do_recall(query, session_id)
 
         # ---- Write path ---------------------------------------------------
@@ -334,46 +404,63 @@ def _build_provider_class():
             *,
             session_id: str = "",
         ) -> None:
-            """Persist a completed turn and credit the memories that were
-            actually used. We tag each new entry with `source_session` so
-            future recalls in this session can find them and other
-            sessions' recalls won't.
+            """Persist a completed turn in a daemon thread (non-blocking).
+
+            hermes-agent must not be blocked by the write path; all I/O
+            happens in a background daemon thread. We join any still-running
+            previous thread first (with a 5-second cap) so writes remain
+            ordered per session.
 
             When a `smart_extractor` is configured, sync_turn delegates the
             write to it (LLM-driven 6-category extraction). Otherwise we
             fall back to writing raw user / assistant turns — same shape
             this provider has always used."""
-            if self._smart_extractor is not None:
-                try:
-                    self._smart_extractor.extract_and_persist(
-                        user_content=user_content,
-                        assistant_content=assistant_content,
-                        session_key=session_id,
-                        scope="agent",
-                    )
-                except Exception as e:
-                    # The extractor's own pipeline catches per-candidate
-                    # errors; if the orchestrator itself blows up, fall
-                    # back to legacy raw writes so the turn still lands.
-                    logger.warning(
-                        "lancedb_pro smart_extractor sync_turn failed; "
-                        "falling back to raw writes: %s", e,
-                    )
-                    self._raw_sync_turn(user_content, assistant_content, session_id)
-            else:
-                self._raw_sync_turn(user_content, assistant_content, session_id)
+            effective_session_id = session_id or self._session_id
 
-            # Credit the memories the model saw in its prefetch — bypasses
-            # the per-recall throttle because we now know they were actually
-            # injected into a turn.
-            used = self._pending_used_ids.pop(session_id, None) if session_id else None
-            if used:
-                try:
-                    # Pass session_id so the cross-session auto-promotion
-                    # ledger can track distinct-session usage.
-                    self._store.mark_recall_used(used, session_id=session_id)
-                except Exception as e:
-                    logger.warning("lancedb_pro mark_recall_used failed: %s", e)
+            def _do() -> None:
+                if self._smart_extractor is not None:
+                    try:
+                        self._smart_extractor.extract_and_persist(
+                            user_content=user_content,
+                            assistant_content=assistant_content,
+                            session_key=effective_session_id,
+                            scope="agent",
+                        )
+                    except Exception as e:
+                        # The extractor's own pipeline catches per-candidate
+                        # errors; if the orchestrator itself blows up, fall
+                        # back to legacy raw writes so the turn still lands.
+                        logger.warning(
+                            "lancedb_pro smart_extractor sync_turn failed; "
+                            "falling back to raw writes: %s", e,
+                        )
+                        self._raw_sync_turn(
+                            user_content, assistant_content, effective_session_id
+                        )
+                else:
+                    self._raw_sync_turn(
+                        user_content, assistant_content, effective_session_id
+                    )
+
+                # Credit the memories the model saw in its prefetch — bypasses
+                # the per-recall throttle because we now know they were actually
+                # injected into a turn.
+                with self._pending_lock:
+                    used = (
+                        self._pending_used_ids.pop(effective_session_id, None)
+                        if effective_session_id
+                        else None
+                    )
+                if used:
+                    try:
+                        self._store.mark_recall_used(used, session_id=effective_session_id)
+                    except Exception as e:
+                        logger.warning("lancedb_pro mark_recall_used failed: %s", e)
+
+            if self._sync_thread and self._sync_thread.is_alive():
+                self._sync_thread.join(timeout=5.0)
+            self._sync_thread = threading.Thread(target=_do, daemon=True)
+            self._sync_thread.start()
 
         def _raw_sync_turn(
             self,
@@ -425,7 +512,8 @@ def _build_provider_class():
             # Drop any pending used-ids for the old session — we're not
             # going to credit recalls that were never confirmed.
             if parent_session_id:
-                self._pending_used_ids.pop(parent_session_id, None)
+                with self._pending_lock:
+                    self._pending_used_ids.pop(parent_session_id, None)
 
         def on_recall_used(
             self,
@@ -444,7 +532,13 @@ def _build_provider_class():
             When this hook fires, we consume the per-session
             `_pending_used_ids` ledger so `sync_turn`'s legacy
             timing-based crediting becomes a no-op (no double-credit)."""
-            ids = self._pending_used_ids.pop(session_id or "", None) if session_id else None
+            effective_session_id = session_id or self._session_id
+            with self._pending_lock:
+                ids = (
+                    self._pending_used_ids.pop(effective_session_id, None)
+                    if effective_session_id
+                    else None
+                )
             if not ids:
                 return
 
@@ -465,7 +559,7 @@ def _build_provider_class():
 
             if used:
                 try:
-                    self._store.mark_recall_used(used, session_id=session_id)
+                    self._store.mark_recall_used(used, session_id=effective_session_id)
                 except Exception as e:
                     logger.warning(
                         "lancedb_pro mark_recall_used (on_recall_used) failed: %s", e,
@@ -523,8 +617,24 @@ def _build_provider_class():
             except Exception as e:
                 logger.warning("lancedb_pro on_memory_write failed: %s", e)
 
+        def on_session_end(self, messages: list) -> None:
+            """Called by hermes-agent at conversation end (not process exit).
+
+            Joins any pending sync_turn thread so writes complete before
+            auto-purge runs, then flushes the pending-recall ledger and
+            triggers the cooldown-gated auto-purge."""
+            if self._sync_thread and self._sync_thread.is_alive():
+                self._sync_thread.join(timeout=10.0)
+            with self._pending_lock:
+                self._pending_used_ids.clear()
+            _maybe_auto_purge(self._store)
+
         def shutdown(self) -> None:
-            self._pending_used_ids.clear()
+            """Called by hermes-agent at process exit."""
+            if self._sync_thread and self._sync_thread.is_alive():
+                self._sync_thread.join(timeout=5.0)
+            with self._pending_lock:
+                self._pending_used_ids.clear()
             _maybe_auto_purge(self._store)
 
     return LanceDBProMemoryProvider
@@ -534,22 +644,34 @@ def _build_provider_class():
 LanceDBProMemoryProvider = _build_provider_class()
 
 
-def register_memory_provider(_ctx: Any = None) -> Any:
-    """Plugin entry point: returns a configured LanceDBProMemoryProvider.
+def register(ctx: Any) -> None:
+    """Plugin entry point per the Hermes memory-provider plugin spec.
 
-    Called by hermes-agent's `_load_provider_from_dir`. The `_ctx` arg is
-    accepted for compatibility with the plugin contract; we don't need
-    its contents because we read MemoryStore config from env vars.
+    Called by hermes-agent's plugin discovery when it loads
+    ``~/.hermes/plugins/lancedb_pro/``. Registers a configured
+    LanceDBProMemoryProvider with the host context.
 
-    A `~/.hermes/plugins/lancedb_pro/__init__.py` shim should look like:
+    A `~/.hermes/plugins/lancedb_pro/__init__.py` shim needs only:
 
-        from hermes_memory_lancedb_pro.provider import (
-            LanceDBProMemoryProvider,
-            register_memory_provider,
-        )
+        from hermes_memory_lancedb_pro.provider import register
 
-        __all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
+        __all__ = ["register"]
     """
+    base = _load_memory_provider_base()
+    if base is None:
+        raise ImportError(
+            "hermes-agent is not on PYTHONPATH; "
+            "register() can only be called from inside hermes-agent."
+        )
+    ctx.register_memory_provider(LanceDBProMemoryProvider())
+
+
+def register_memory_provider(_ctx: Any = None) -> Any:
+    """Backwards-compatible alias; prefer ``register(ctx)`` for new installs.
+
+    Returns a configured LanceDBProMemoryProvider for callers that use
+    the old return-value convention instead of the ``ctx.register_*``
+    pattern."""
     base = _load_memory_provider_base()
     if base is None:
         raise ImportError(
@@ -562,6 +684,7 @@ def register_memory_provider(_ctx: Any = None) -> Any:
 __all__ = [
     "LanceDBProMemoryProvider",
     "PROVIDER_NAME",
+    "register",
     "register_memory_provider",
 ]
 

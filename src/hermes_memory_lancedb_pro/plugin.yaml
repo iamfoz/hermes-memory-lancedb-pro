@@ -9,5 +9,11 @@ pip_dependencies:
   - requests>=2.31.0
 hooks:
   - prefetch
+  - before_prompt_build
+  - sync_turn
   - on_memory_write
+  - on_recall_used
+  - on_tool_call_observed
+  - on_session_switch
+  - shutdown
   - on_session_end

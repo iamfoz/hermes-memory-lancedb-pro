@@ -338,9 +338,12 @@ def evaluate_tier(
     ):
         return TIER_WORKING
 
-    # Peripheral demotion: low composite OR old + unused
-    if composite < config.peripheral_composite_threshold or (
-        age_days > config.peripheral_age_days and access_count < 2
+    # Peripheral demotion: low composite OR old + unused.
+    # Explicitly excludes CORE-tier memories — core can only be demoted to
+    # working (above), never directly to peripheral in a single step.
+    if current_tier != TIER_CORE and (
+        composite < config.peripheral_composite_threshold
+        or (age_days > config.peripheral_age_days and access_count < 2)
     ):
         return TIER_PERIPHERAL
 

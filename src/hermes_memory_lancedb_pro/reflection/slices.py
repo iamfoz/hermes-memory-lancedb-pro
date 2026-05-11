@@ -580,4 +580,8 @@ def is_recall_used(response: str, injected_ids: Sequence[str]) -> bool:
 
     response_lower = response.lower()
 
+    # Check whether any injected memory ID appears literally in the response.
+    if any(mem_id in response_lower for mem_id in injected_ids):
+        return True
+
     return any(marker.lower() in response_lower for marker in _RECALL_USAGE_MARKERS)
