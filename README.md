@@ -42,36 +42,42 @@ A production-grade memory store that gives Hermes Agent persistent, searchable r
 
 ### Install
 
-There are **two pieces** to a working install, and they live in different
-places. People sometimes confuse them — the actual code is **always** the
-pip-installed package; the path under `~/.hermes/plugins/` is just a small
-discovery shim that imports from the package.
-
-**1. Install the package itself** (this is where the code runs from):
+A working install has **two pieces** in different places: the pip
+package holds all the code; `~/.hermes/plugins/lancedb_pro/` holds a
+small discovery shim so hermes-agent can find the provider. The
+`hermes-memory install-plugin` command creates the shim for you.
 
 ```bash
-# From a clone of this repo:
+# 1. Install the package (where the code runs from)
+pip install hermes-memory-lancedb-pro
+# or from a clone:
 pip install -e .
 
-# Or, once published, straight from PyPI:
-pip install hermes-memory-lancedb-pro
+# 2. Drop the discovery shim into ~/.hermes/plugins/lancedb_pro/
+hermes-memory install-plugin
 ```
 
-**2. Add the discovery shim** so hermes-agent can find the provider:
+That's it. The shim is ~5 lines that import `register` from the pip
+package, so upgrades happen via `pip install -U` without touching the
+plugin directory.
+
+Newer hermes-agent versions that support entry-point discovery
+(`importlib.metadata.entry_points` group `hermes.plugins`) can find the
+provider without the shim — `pip install` is enough. The shim is
+maintained for compatibility with hermes-agent releases that only scan
+`~/.hermes/plugins/`.
+
+**Options**
 
 ```bash
-mkdir -p ~/.hermes/plugins/lancedb_pro
-cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
-from hermes_memory_lancedb_pro.provider import (
-    LanceDBProMemoryProvider,
-    register_memory_provider,
-)
-__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
-EOF
+hermes-memory install-plugin --hermes-home /path/to/profile   # non-default profile
+hermes-memory install-plugin --force                          # overwrite an existing shim
+hermes-memory uninstall-plugin                                # remove the shim
 ```
 
-That's it. The shim is ~5 lines; all real logic lives in the pip package
-and gets updated whenever you `pip install -U`.
+`uninstall-plugin` only removes files the installer created
+(`__init__.py`, `plugin.yaml`); a directory with unmanaged files in it
+is left in place.
 
 #### Upgrading from pre-0.2 installs
 
@@ -80,21 +86,12 @@ Earlier releases told users to clone the repo *into*
 contains a stale full copy of the source. Replace it with the shim:
 
 ```bash
-# Back up first if you've made local edits
+# Back up if you have local edits
 mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old
 
-# Install the current version as a pip package
-pip install -U hermes-memory-lancedb-pro   # or `pip install -e .` from a clone
-
-# Recreate the discovery shim (see step 2 above)
-mkdir -p ~/.hermes/plugins/lancedb_pro
-cat > ~/.hermes/plugins/lancedb_pro/__init__.py <<'EOF'
-from hermes_memory_lancedb_pro.provider import (
-    LanceDBProMemoryProvider,
-    register_memory_provider,
-)
-__all__ = ["LanceDBProMemoryProvider", "register_memory_provider"]
-EOF
+# Install the current version as a pip package + the shim
+pip install -U hermes-memory-lancedb-pro
+hermes-memory install-plugin
 ```
 
 Verify which copy is actually loading:
@@ -104,8 +101,8 @@ python -c "import hermes_memory_lancedb_pro as m; print(m.__version__, m.__file_
 ```
 
 If `__file__` points inside `~/.hermes/plugins/lancedb_pro/` and the
-version is old, the stale checkout is still shadowing the pip install —
-remove or rename that directory, then recreate the shim above.
+version is old, a stale checkout is still shadowing the pip install —
+remove or rename that directory, then re-run `hermes-memory install-plugin`.
 
 ### Initialise
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 from ._sql import parse_metadata as _parse_metadata
@@ -17,6 +19,21 @@ from .store import (
     VECTOR_DIM,
     MemoryStore,
 )
+
+PLUGIN_NAME = "lancedb_pro"
+PLUGIN_SHIM_CONTENT = '''\
+"""Hermes plugin discovery shim for hermes-memory-lancedb-pro.
+
+The heavy package (lancedb, sentence-transformers, ...) is installed via
+pip and lives in site-packages; this shim only re-exports `register` so
+hermes-agent's plugin loader can discover the plugin.
+
+Regenerate with: hermes-memory install-plugin
+"""
+from hermes_memory_lancedb_pro.provider import register
+
+__all__ = ["register"]
+'''
 
 SMOKE_PREFIX = "SMOKE_TEST_"
 
@@ -418,6 +435,108 @@ def _cmd_doctor(
 
 
 # ---------------------------------------------------------------------------
+# install-plugin / uninstall-plugin
+# ---------------------------------------------------------------------------
+
+
+def _resolve_hermes_home(explicit: str | None) -> Path:
+    """Pick the hermes profile dir: explicit arg > $HERMES_HOME > ~/.hermes."""
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env = os.environ.get("HERMES_HOME", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / ".hermes"
+
+
+def _packaged_plugin_yaml() -> Path:
+    """Return the path to the plugin.yaml shipped inside the installed wheel."""
+    return Path(__file__).resolve().parent / "plugin.yaml"
+
+
+def _cmd_install_plugin(args: argparse.Namespace) -> int:
+    """Create ``<hermes_home>/plugins/lancedb_pro/`` with the discovery shim
+    and a copy of plugin.yaml so hermes-agent can find this provider."""
+    hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
+    plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    init_path = plugin_dir / "__init__.py"
+    yaml_target = plugin_dir / "plugin.yaml"
+    yaml_source = _packaged_plugin_yaml()
+
+    if not yaml_source.exists():
+        _stderr(f"plugin.yaml missing from installed package at {yaml_source}", quiet=False)
+        return 1
+
+    existing_files = [p for p in (init_path, yaml_target) if p.exists()]
+    force = bool(getattr(args, "force", False))
+    if existing_files and not force:
+        _stderr(
+            f"Plugin already installed at {plugin_dir}\n"
+            f"Pass --force to overwrite, or remove with:\n"
+            f"    hermes-memory uninstall-plugin",
+            quiet=False,
+        )
+        return 1
+
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    init_path.write_text(PLUGIN_SHIM_CONTENT, encoding="utf-8")
+    shutil.copyfile(yaml_source, yaml_target)
+
+    quiet = bool(getattr(args, "quiet", False))
+    if not quiet:
+        action = "Reinstalled" if existing_files else "Installed"
+        sys.stdout.write(
+            f"{action} {PLUGIN_NAME} plugin at {plugin_dir}\n"
+            f"  - {init_path.name} (discovery shim)\n"
+            f"  - {yaml_target.name} (manifest)\n"
+            f"Next: configure with `hermes memory setup` or set the\n"
+            f"MEMORY_EXTRACTION_* env vars manually. See README for details.\n"
+        )
+    return 0
+
+
+def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
+    """Remove ``<hermes_home>/plugins/lancedb_pro/``. Only deletes files we
+    install (``__init__.py``, ``plugin.yaml``) and then the dir if empty —
+    refuses to delete a dir containing unknown files."""
+    hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
+    plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    quiet = bool(getattr(args, "quiet", False))
+
+    if not plugin_dir.exists():
+        if not quiet:
+            sys.stdout.write(f"{PLUGIN_NAME} plugin not installed at {plugin_dir}\n")
+        return 0
+
+    managed = {"__init__.py", "plugin.yaml"}
+    removed: list[str] = []
+    for name in managed:
+        target = plugin_dir / name
+        if target.exists():
+            target.unlink()
+            removed.append(name)
+
+    # Remove __pycache__ if present — it's a build artefact we own.
+    pycache = plugin_dir / "__pycache__"
+    if pycache.exists():
+        shutil.rmtree(pycache, ignore_errors=True)
+
+    remaining = [p.name for p in plugin_dir.iterdir()]
+    if remaining:
+        if not quiet:
+            sys.stdout.write(
+                f"Removed {', '.join(removed) or 'no managed files'} from {plugin_dir}\n"
+                f"Directory not deleted — contains unmanaged files: {remaining}\n"
+            )
+        return 0
+
+    plugin_dir.rmdir()
+    if not quiet:
+        sys.stdout.write(f"Uninstalled {PLUGIN_NAME} plugin from {plugin_dir}\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -506,6 +625,47 @@ def main() -> int:
     p_doctor.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
     p_doctor.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
+    # ---- install-plugin ----
+    p_install = subparsers.add_parser(
+        "install-plugin",
+        help="Install the Hermes discovery shim",
+        description=(
+            "Create <hermes_home>/plugins/lancedb_pro/ with the discovery "
+            "__init__.py and a copy of plugin.yaml so hermes-agent can find "
+            "this provider."
+        ),
+    )
+    p_install.add_argument(
+        "--hermes-home",
+        default=None,
+        metavar="PATH",
+        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes)",
+    )
+    p_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing shim",
+    )
+    p_install.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    # ---- uninstall-plugin ----
+    p_uninstall = subparsers.add_parser(
+        "uninstall-plugin",
+        help="Remove the Hermes discovery shim",
+        description=(
+            "Remove <hermes_home>/plugins/lancedb_pro/. Only files this "
+            "command installed (__init__.py, plugin.yaml) are removed; the "
+            "dir is left in place if it contains anything else."
+        ),
+    )
+    p_uninstall.add_argument(
+        "--hermes-home",
+        default=None,
+        metavar="PATH",
+        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes)",
+    )
+    p_uninstall.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
     args = parser.parse_args()
 
     if args.subcommand is None:
@@ -520,6 +680,8 @@ def main() -> int:
         "export": _cmd_export,
         "import": _cmd_import,
         "doctor": _cmd_doctor,
+        "install-plugin": _cmd_install_plugin,
+        "uninstall-plugin": _cmd_uninstall_plugin,
     }
     return dispatch[args.subcommand](args)
 
