@@ -413,6 +413,25 @@ def create_llm_client_from_env() -> LlmClient | None:
     mem_model = os.environ.get("MEMORY_EXTRACTION_MODEL", "").strip()
     mem_provider = os.environ.get("MEMORY_EXTRACTION_PROVIDER", "").strip().lower()
 
+    # Warn on partial MEMORY_EXTRACTION_* config — without all three of
+    # API_KEY/BASE_URL/MODEL we'd otherwise silently fall through to
+    # OPENAI_API_KEY/ANTHROPIC_API_KEY detection, which is rarely what the
+    # caller intended when they set any of the override vars.
+    _override_set = {
+        "MEMORY_EXTRACTION_API_KEY": bool(mem_api_key),
+        "MEMORY_EXTRACTION_BASE_URL": bool(mem_base_url),
+        "MEMORY_EXTRACTION_MODEL": bool(mem_model),
+    }
+    _set_count = sum(_override_set.values())
+    if 0 < _set_count < 3 and mem_provider != "anthropic":
+        _missing = [k for k, v in _override_set.items() if not v]
+        logger.warning(
+            "llm_client: partial MEMORY_EXTRACTION_* configuration — %s "
+            "missing; falling back to OPENAI_API_KEY / ANTHROPIC_API_KEY "
+            "detection. Set all three to use the override endpoint.",
+            ", ".join(_missing),
+        )
+
     # 1. Dedicated cheap-extractor override (OpenAI-compatible endpoint)
     if mem_api_key and mem_base_url and mem_model:
         try:

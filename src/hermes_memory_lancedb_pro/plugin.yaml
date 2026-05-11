@@ -7,6 +7,10 @@ pip_dependencies:
   - numpy>=1.24.0
   - sentence-transformers>=3.0.0
   - requests>=2.31.0
+optional_pip_dependencies:
+  - openai>=1.0.0           # MEMORY_EXTRACTION_PROVIDER=openai (default)
+  - anthropic>=0.30.0       # MEMORY_EXTRACTION_PROVIDER=anthropic
+  - google-auth>=2.0.0      # Google Discovery Engine reranker
 hooks:
   - prefetch
   - before_prompt_build

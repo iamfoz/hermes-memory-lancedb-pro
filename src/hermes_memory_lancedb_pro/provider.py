@@ -68,6 +68,37 @@ _AUTO_PURGE_GRACE_DAYS: int = int(
 # State-file name — lives alongside the database so it follows the store.
 _PURGE_STATE_FILENAME = ".purge-state.json"
 
+# ---------------------------------------------------------------------------
+# Session-summary configuration
+# ---------------------------------------------------------------------------
+# Char budget for the compressed transcript written on session end. Set 0 to
+# disable session-summary memory writes entirely.
+_SESSION_SUMMARY_MAX_CHARS: int = int(
+    os.environ.get("MEMORY_SESSION_SUMMARY_MAX_CHARS", "4000")
+)
+# Minimum number of messages before a session summary is written. Skips
+# trivial one-turn sessions.
+_SESSION_SUMMARY_MIN_MESSAGES: int = int(
+    os.environ.get("MEMORY_SESSION_SUMMARY_MIN_MESSAGES", "2")
+)
+
+
+def _extract_message_texts(messages: Any) -> list[str]:
+    """Coerce hermes-agent's session-end ``messages`` arg to a flat list of
+    text strings. Accepts a list of dicts (``{"content": ...}``) or raw
+    strings; silently drops anything else."""
+    texts: list[str] = []
+    for msg in messages or []:
+        if isinstance(msg, dict):
+            content = msg.get("content") or msg.get("text") or ""
+        elif isinstance(msg, str):
+            content = msg
+        else:
+            content = ""
+        if isinstance(content, str) and content.strip():
+            texts.append(content)
+    return texts
+
 
 def _load_memory_provider_base():
     """Import hermes-agent's MemoryProvider ABC. Returns None if hermes-agent
@@ -344,6 +375,13 @@ def _build_provider_class():
                     "key": "purge_grace_days",
                     "env_var": "MEMORY_PURGE_GRACE_DAYS",
                     "description": "Min age in days before archived rows are deleted (default: 30)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "session_summary_max_chars",
+                    "env_var": "MEMORY_SESSION_SUMMARY_MAX_CHARS",
+                    "description": "Char budget for session-summary memories (default: 4000; 0 = off)",
                     "secret": False,
                     "required": False,
                 },
@@ -693,16 +731,59 @@ def _build_provider_class():
         def on_session_end(self, messages: list) -> None:
             """Called by hermes-agent at conversation end (not process exit).
 
-            Joins any pending sync_turn thread so writes complete before
-            auto-purge runs, then flushes the pending-recall ledger and
-            triggers the cooldown-gated auto-purge."""
+            Joins any pending sync_turn thread so writes complete first,
+            writes a session-summary memory from the conversation history,
+            flushes the pending-recall ledger, then triggers the
+            cooldown-gated auto-purge."""
             with self._thread_lock:
                 thread = self._sync_thread
             if thread and thread.is_alive():
                 thread.join(timeout=10.0)
+
+            try:
+                self._write_session_summary(messages)
+            except Exception as e:
+                logger.warning("lancedb_pro session-summary write failed: %s", e)
+
             with self._pending_lock:
                 self._pending_used_ids.clear()
             _maybe_auto_purge(self._store)
+
+        def _write_session_summary(self, messages: Any) -> None:
+            """Compress the session transcript and write it as a single
+            ``metadata_type=session-summary`` memory.
+
+            Honours ``MEMORY_SESSION_SUMMARY_MAX_CHARS`` (0 disables) and
+            ``MEMORY_SESSION_SUMMARY_MIN_MESSAGES``. Decay's ``evaluate_tier``
+            already exempts ``session-summary`` rows from tier mutation so
+            the summary persists at its initial tier."""
+            if _SESSION_SUMMARY_MAX_CHARS <= 0:
+                return
+            if not self._session_id:
+                return
+            texts = _extract_message_texts(messages)
+            if len(texts) < _SESSION_SUMMARY_MIN_MESSAGES:
+                return
+            from .session_compressor import compress_texts
+            result = compress_texts(texts, max_chars=_SESSION_SUMMARY_MAX_CHARS)
+            if not result.texts:
+                return
+            summary = "\n".join(result.texts)
+            self._store.store(
+                text=summary,
+                category="other",
+                scope="agent",
+                importance=0.5,
+                metadata_extra={
+                    "metadata_type": "session-summary",
+                    "source": "session_end",
+                    "source_session": self._session_id,
+                    "summary_message_count": len(texts),
+                    "summary_kept_count": len(result.texts),
+                    "summary_dropped_count": result.dropped,
+                    "cross_session": False,
+                },
+            )
 
         def shutdown(self) -> None:
             """Called by hermes-agent at process exit."""

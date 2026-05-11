@@ -468,8 +468,8 @@ def main() -> int:
         metavar="N",
         help="Maximum rows to export (default: 100000)",
     )
-    p_export.add_argument("--path", default=None, metavar="PATH", help=argparse.SUPPRESS)
-    p_export.add_argument("-q", "--quiet", action="store_true", help=argparse.SUPPRESS)
+    p_export.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
+    p_export.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # ---- import ----
     p_import = subparsers.add_parser(
@@ -494,8 +494,8 @@ def main() -> int:
         action="store_true",
         help="Skip rows whose id already exists rather than aborting",
     )
-    p_import.add_argument("--path", default=None, metavar="PATH", help=argparse.SUPPRESS)
-    p_import.add_argument("-q", "--quiet", action="store_true", help=argparse.SUPPRESS)
+    p_import.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
+    p_import.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # ---- doctor ----
     p_doctor = subparsers.add_parser(
@@ -503,22 +503,18 @@ def main() -> int:
         help="Print a diagnostic report",
         description="Scan the store and report counts, anomalies, and recommendations.",
     )
-    p_doctor.add_argument("--path", default=None, metavar="PATH", help=argparse.SUPPRESS)
-    p_doctor.add_argument("-q", "--quiet", action="store_true", help=argparse.SUPPRESS)
+    p_doctor.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
+    p_doctor.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # Propagate top-level --path / --quiet to subcommand namespace when not
-    # overridden by a subcommand-level flag.
     if args.subcommand is None:
         parser.print_help()
         return 0
 
-    # Merge top-level flags into subcommand namespace (subcommand wins if set)
-    if not getattr(args, "path", None):
-        args.path = args.path  # already None; no-op, but explicit
-    if not getattr(args, "quiet", False):
-        args.quiet = getattr(args, "quiet", False)
+    # Subparser --path / --quiet use argparse.SUPPRESS so they only land in
+    # the namespace when the user explicitly provides them; absent that the
+    # top-level value is preserved. Nothing further to merge here.
 
     dispatch = {
         "export": _cmd_export,

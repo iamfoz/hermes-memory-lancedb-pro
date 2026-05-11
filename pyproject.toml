@@ -94,4 +94,6 @@ ignore = [
 # returns into a single expression hurts readability.
 "src/hermes_memory_lancedb_pro/session_compressor.py" = ["PLR0911", "PLR1714"]
 # The rerank function has many fail-soft early returns by design.
-"src/hermes_memory_lancedb_pro/retriever.py" = ["PLR0911", "PLR0912", "PLR0915"]
+# google-auth is an optional reranker dep imported lazily inside the
+# auth-token method so the rest of the module loads without it.
+"src/hermes_memory_lancedb_pro/retriever.py" = ["PLR0911", "PLR0912", "PLR0915", "PLC0415"]
