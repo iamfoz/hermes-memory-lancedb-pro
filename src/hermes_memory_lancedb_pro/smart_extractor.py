@@ -926,7 +926,10 @@ class SmartExtractor:
             "merged_from": candidate.abstract,
         }
         if admission_audit and self.config.persist_admission_audit:
-            merged_meta_extras["admission_control"] = json.dumps(self._audit_to_json(admission_audit))
+            # Store as a dict (not json.dumps'd) to match `_store_candidate`'s
+            # shape — otherwise the merge path produces a JSON-in-JSON string
+            # while the create path produces a nested object.
+            merged_meta_extras["admission_control"] = self._audit_to_json(admission_audit)
 
         # Update the row text + metadata. Our MemoryStore.update supports
         # text-supersede OR metadata-only path; for merge we want the

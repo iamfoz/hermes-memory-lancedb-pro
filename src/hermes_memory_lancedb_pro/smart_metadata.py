@@ -648,17 +648,20 @@ def append_relation(
 # Support-info parsing and update
 # ---------------------------------------------------------------------------
 
-def parse_support_info(raw: dict | str | None) -> SupportInfoV2 | None:
+def parse_support_info(raw: SupportInfoV2 | dict | str | None) -> SupportInfoV2 | None:
     """Parse a possibly-stale v1 or v2 support_info representation.
 
     v1 had a flat structure (``confirmations`` / ``contradictions`` at the
     top level); these are upgraded to v2 by treating them as a single
     ``"unknown"`` context slice.
 
-    Returns None for missing/invalid input.
+    Accepts an already-parsed :class:`SupportInfoV2` (returned unchanged),
+    a dict, a JSON string, or None. Returns None for missing / invalid input.
     """
     if raw is None:
         return None
+    if isinstance(raw, SupportInfoV2):
+        return raw
     if isinstance(raw, str):
         try:
             obj = json.loads(raw)
