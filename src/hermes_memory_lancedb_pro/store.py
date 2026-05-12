@@ -846,8 +846,13 @@ class MemoryStore:
             metadata["access_count"] = int(metadata.get("access_count", 0) or 0) + 1
             metadata["last_accessed_at"] = now_ms
 
-            # Cross-session promotion ledger
-            if session_id and not metadata.get("cross_session"):
+            # Cross-session promotion ledger. Threshold <= 0 disables both the
+            # ledger maintenance and the promotion (per docstring on the env var).
+            if (
+                CROSS_SESSION_PROMOTION_THRESHOLD > 0
+                and session_id
+                and not metadata.get("cross_session")
+            ):
                 ledger = list(metadata.get("cross_session_recalls") or [])
                 if session_id not in ledger:
                     ledger.append(session_id)

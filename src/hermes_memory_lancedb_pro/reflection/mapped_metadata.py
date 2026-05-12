@@ -120,19 +120,30 @@ def build_reflection_mapped_metadata(
         for sig in tool_error_signals
     ]
 
-    # Support both attribute access (dataclass/object) and dict access
+    # Support both attribute access (dataclass/object) and dict access.
+    # Accept either `kind` (per `ReflectionMappedMemoryItem`) or `mapped_kind`
+    # (per the older TS field name) so callers using either shape work.
     if isinstance(mapped_item, dict):
-        mapped_kind: ReflectionMappedKind = mapped_item["mapped_kind"]
+        mapped_kind: ReflectionMappedKind = (
+            mapped_item.get("kind") or mapped_item.get("mapped_kind")
+        )
         # `category` is read for input validation but not propagated;
         # the canonical mapped_category comes from _KIND_TO_CATEGORY below
         _ = mapped_item.get("category")
-        heading: str = mapped_item.get("heading", "")
+        heading: str = mapped_item.get("heading") or mapped_item.get("section") or ""
         ordinal: int = mapped_item.get("ordinal", 0)
         group_size: int = mapped_item.get("group_size", 0)
     else:
-        mapped_kind = mapped_item.mapped_kind
+        mapped_kind = (
+            getattr(mapped_item, "kind", None)
+            or getattr(mapped_item, "mapped_kind", None)
+        )
         _ = getattr(mapped_item, "category", None)
-        heading = getattr(mapped_item, "heading", "")
+        heading = (
+            getattr(mapped_item, "heading", None)
+            or getattr(mapped_item, "section", "")
+            or ""
+        )
         ordinal = getattr(mapped_item, "ordinal", 0)
         group_size = getattr(mapped_item, "group_size", 0)
 

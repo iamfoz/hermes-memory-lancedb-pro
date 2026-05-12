@@ -152,6 +152,33 @@ def build_clusters(
     return plans
 
 
+_TIER_RANK = {"core": 2, "working": 1, "peripheral": 0}
+
+
+def _merge_cluster_provenance(
+    members: Sequence[CompactionEntry],
+) -> tuple[str, bool]:
+    """Combine tier + cross_session across cluster members: pick the
+    highest-rank tier (core > working > peripheral) and OR cross_session
+    so a merged entry never silently downgrades existing provenance."""
+    best_tier = "working"
+    best_rank = -1
+    any_cross_session = False
+    for m in members:
+        try:
+            meta = json.loads(m.metadata) if isinstance(m.metadata, str) else (m.metadata or {})
+        except (json.JSONDecodeError, TypeError, ValueError):
+            meta = {}
+        member_tier = meta.get("tier", "working")
+        r = _TIER_RANK.get(member_tier, 1)
+        if r > best_rank:
+            best_rank = r
+            best_tier = member_tier
+        if meta.get("cross_session"):
+            any_cross_session = True
+    return best_tier, any_cross_session
+
+
 def build_merged_entry(members: Sequence[CompactionEntry]) -> ClusterMerged:
     """Merge a cluster into a single proposed entry.
 
@@ -192,10 +219,14 @@ def build_merged_entry(members: Sequence[CompactionEntry]) -> ClusterMerged:
         if top.category in tied:
             category = top.category
 
+    best_tier, any_cross_session = _merge_cluster_provenance(members)
     metadata = json.dumps({
         "compacted": True,
         "source_count": len(members),
         "compacted_at": int(time.time() * 1000),
+        "tier": best_tier,
+        "cross_session": any_cross_session,
+        "source": "compactor",
     })
 
     return ClusterMerged(

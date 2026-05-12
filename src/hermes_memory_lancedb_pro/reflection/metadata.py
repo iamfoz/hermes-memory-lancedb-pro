@@ -24,12 +24,17 @@ _REFLECTION_METADATA_TYPES = frozenset(
 )
 
 
-def parse_reflection_metadata(raw: str | None) -> dict[str, Any]:
-    """Best-effort JSON parse of a raw metadata string.
+def parse_reflection_metadata(raw: str | dict | None) -> dict[str, Any]:
+    """Best-effort metadata coercion to a dict.
 
-    Returns an empty dict on any failure (missing value, invalid JSON,
-    or non-object JSON).
+    Accepts:
+      * already-parsed ``dict`` (returned as-is) — the common case when called
+        on rows produced by ``MemoryStore._row_to_dict``;
+      * JSON string (parsed via ``json.loads``);
+      * ``None`` / empty / non-object JSON — yields ``{}``.
     """
+    if isinstance(raw, dict):
+        return raw
     if not raw:
         return {}
     try:

@@ -56,8 +56,13 @@ MERGE_SUPPORTED_CATEGORIES: frozenset[SmartCategory] = frozenset({
 })
 
 
-def normalize_category(value: Any) -> SmartCategory:
-    """Coerce arbitrary input to a valid SmartCategory; default `entities`."""
+def normalize_category(value: Any, *, warn: bool = True) -> SmartCategory:
+    """Coerce arbitrary input to a valid SmartCategory; default `entities`.
+
+    ``warn=False`` suppresses the warning log for callers that invoke this
+    on every LLM-emitted candidate (where unknown / missing categories are
+    expected and the noise is unhelpful).
+    """
     if isinstance(value, str):
         v = value.strip().lower()
         if v in MEMORY_CATEGORIES:
@@ -75,13 +80,15 @@ def normalize_category(value: Any) -> SmartCategory:
         mapped = legacy_map.get(v)
         if mapped is not None:
             return mapped  # type: ignore[return-value]
-        logger.warning(
-            "normalize_category: unknown category %r; defaulting to 'entities'", value
-        )
+        if warn:
+            logger.warning(
+                "normalize_category: unknown category %r; defaulting to 'entities'", value
+            )
         return "entities"  # type: ignore[return-value]
-    logger.warning(
-        "normalize_category: non-string input %r; defaulting to 'entities'", type(value).__name__
-    )
+    if warn:
+        logger.warning(
+            "normalize_category: non-string input %r; defaulting to 'entities'", type(value).__name__
+        )
     return "entities"
 
 

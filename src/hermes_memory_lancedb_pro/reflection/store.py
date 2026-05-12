@@ -479,7 +479,10 @@ def store_reflection_to_lancedb(
             if existing:
                 # `_distance` is cosine distance (lower = more similar).
                 # similarity = 1 - distance ≥ threshold → skip the write.
-                top_distance = float(existing[0].get("_distance", 1.0) or 1.0)
+                # Use an explicit None check — `0.0` is falsy and represents a
+                # *perfect* match, exactly the case we want to dedupe.
+                raw_dist = existing[0].get("_distance")
+                top_distance = float(raw_dist) if raw_dist is not None else 1.0
                 if (1.0 - top_distance) >= dedupe_threshold:
                     continue
 

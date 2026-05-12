@@ -242,7 +242,11 @@ def compress_texts(
     Strategy:
     1. Score all texts.
     2. If total chars <= budget, return all.
-    3. Always include first and last text (session boundaries).
+    3. Always include first and last text (session boundaries), even if a
+       single boundary text alone exceeds ``max_chars`` — the boundary
+       guarantee takes precedence and ``result.total_chars`` may then exceed
+       ``max_chars``. Callers needing a hard upper bound must truncate the
+       returned text themselves.
     4. Sort remaining by score descending (stable: tie → ascending index).
     5. Greedily select until budget exhausted.
     6. If a tool_call line is added, also try to add the next line as a

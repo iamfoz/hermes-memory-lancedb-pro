@@ -86,7 +86,12 @@ _SESSION_SUMMARY_MIN_MESSAGES: int = int(
 def _extract_message_texts(messages: Any) -> list[str]:
     """Coerce hermes-agent's session-end ``messages`` arg to a flat list of
     text strings. Accepts a list of dicts (``{"content": ...}``) or raw
-    strings; silently drops anything else."""
+    strings; silently drops anything else.
+
+    Also handles Anthropic-style content blocks (``content`` is a list of
+    ``{"type": "text", "text": "..."}`` dicts), which a tool-using model
+    routinely emits — without this branch those turns disappear from the
+    session-summary."""
     texts: list[str] = []
     for msg in messages or []:
         if isinstance(msg, dict):
@@ -95,6 +100,13 @@ def _extract_message_texts(messages: Any) -> list[str]:
             content = msg
         else:
             content = ""
+        if isinstance(content, list):
+            parts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            content = "\n".join(p for p in parts if p)
         if isinstance(content, str) and content.strip():
             texts.append(content)
     return texts
@@ -741,19 +753,24 @@ def _build_provider_class():
             Joins any pending sync_turn thread so writes complete first,
             writes a session-summary memory from the conversation history,
             flushes the pending-recall ledger, then triggers the
-            cooldown-gated auto-purge."""
-            with self._thread_lock:
-                thread = self._sync_thread
-            if thread and thread.is_alive():
-                thread.join(timeout=10.0)
+            cooldown-gated auto-purge.
 
-            try:
-                self._write_session_summary(messages)
-            except Exception as e:
-                logger.warning("lancedb_pro session-summary write failed: %s", e)
+            Holds `_dispatch_lock` for the whole barrier so a concurrent
+            `sync_turn` cannot launch a new write thread between our join
+            and the summary write."""
+            with self._dispatch_lock:
+                with self._thread_lock:
+                    thread = self._sync_thread
+                if thread and thread.is_alive():
+                    thread.join(timeout=10.0)
 
-            with self._pending_lock:
-                self._pending_used_ids.clear()
+                try:
+                    self._write_session_summary(messages)
+                except Exception as e:
+                    logger.warning("lancedb_pro session-summary write failed: %s", e)
+
+                with self._pending_lock:
+                    self._pending_used_ids.clear()
             _maybe_auto_purge(self._store)
 
         def _write_session_summary(self, messages: Any) -> None:
@@ -776,6 +793,13 @@ def _build_provider_class():
             if not result.texts:
                 return
             summary = "\n".join(result.texts)
+            # compress_texts honours max_chars softly: a single boundary
+            # message larger than the budget is preserved intact. Cap the
+            # stored summary at 2x the budget so a degenerate session
+            # can't write an unbounded blob.
+            hard_cap = _SESSION_SUMMARY_MAX_CHARS * 2
+            if len(summary) > hard_cap:
+                summary = summary[:hard_cap] + "\n[...truncated]"
             self._store.store(
                 text=summary,
                 category="other",

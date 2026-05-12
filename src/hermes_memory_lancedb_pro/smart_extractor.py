@@ -515,9 +515,10 @@ class SmartExtractor:
         for raw in memories:
             if not isinstance(raw, dict):
                 continue
-            category = normalize_category(raw.get("category"))
-            if not category:
-                continue
+            # warn=False — LLM candidates frequently omit category; the
+            # normaliser falls back to "entities", which is fine without
+            # flooding the warning log on every extraction.
+            category = normalize_category(raw.get("category"), warn=False)
             abstract = (raw.get("abstract") or "").strip()
             overview = (raw.get("overview") or "").strip()
             content = (raw.get("content") or "").strip()

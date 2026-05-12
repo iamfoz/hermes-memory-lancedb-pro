@@ -260,9 +260,9 @@ def _split_support_spans(conversation_text: str) -> list[str]:
     seen: set[str] = set()
     for line in conversation_text.split("\n"):
         trimmed = line.strip()
-        if not trimmed or trimmed in seen:
-            pass
-        else:
+        if not trimmed:
+            continue
+        if trimmed not in seen:
             spans.append(trimmed)
             seen.add(trimmed)
         for sentence in _SENTENCE_SPLIT_RE.split(trimmed):
