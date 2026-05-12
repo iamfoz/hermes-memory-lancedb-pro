@@ -18,6 +18,7 @@ __all__ = [
     "ScoredText",
     "CompressResult",
     "TOOL_CALL_INDICATORS",
+    "TOOL_RESULT_INDICATORS",
     "CORRECTION_INDICATORS",
     "DECISION_INDICATORS",
     "ACKNOWLEDGMENT_PATTERNS",
@@ -58,9 +59,15 @@ class CompressResult:
 
 TOOL_CALL_INDICATORS: list[re.Pattern[str]] = [
     re.compile(r"\btool_use\b", re.IGNORECASE),
-    re.compile(r"\btool_result\b", re.IGNORECASE),
     re.compile(r"\bfunction_call\b", re.IGNORECASE),
     re.compile(r"\b(memory_store|memory_recall|memory_forget|memory_update)\b", re.IGNORECASE),
+]
+
+# Separate from TOOL_CALL_INDICATORS so that tool_result texts get
+# reason="tool_result" and do NOT trigger forward-pair logic in compress_texts
+# (only tool_call lines should pull in their result partner, not vice versa).
+TOOL_RESULT_INDICATORS: list[re.Pattern[str]] = [
+    re.compile(r"\btool_result\b", re.IGNORECASE),
 ]
 
 CORRECTION_INDICATORS: list[re.Pattern[str]] = [
@@ -168,6 +175,11 @@ def score_text(text: str, index: int) -> ScoredText:
     if any(p.search(trimmed) for p in TOOL_CALL_INDICATORS):
         return ScoredText(index=index, text=text, score=1.0, reason="tool_call")
 
+    # Tool results score equally but get a distinct reason so compress_texts
+    # does not treat them as the "initiating" side of a pair.
+    if any(p.search(trimmed) for p in TOOL_RESULT_INDICATORS):
+        return ScoredText(index=index, text=text, score=1.0, reason="tool_result")
+
     # Corrections → very high value
     if any(p.search(trimmed) for p in CORRECTION_INDICATORS):
         return ScoredText(index=index, text=text, score=0.95, reason="correction")
@@ -261,22 +273,22 @@ def compress_texts(
     selected_indices: set[int] = set()
     used_chars = 0
 
-    def add_index(idx: int) -> bool:
+    def add_index(idx: int, *, force: bool = False) -> bool:
         nonlocal used_chars
         if idx in selected_indices or idx < 0 or idx >= len(texts):
             return False
         length = len(texts[idx])
-        if used_chars + length > max_chars:
-            # Hard cap: even the first/last text cannot exceed budget
+        if not force and used_chars + length > max_chars:
             return False
         selected_indices.add(idx)
         used_chars += length
         return True
 
-    # Always keep first and last
-    add_index(0)
+    # Always keep first and last regardless of budget — session boundaries
+    # must be present to give the summary temporal context.
+    add_index(0, force=True)
     if len(texts) > 1:
-        add_index(len(texts) - 1)
+        add_index(len(texts) - 1, force=True)
 
     # Build candidate list excluding first/last, sorted by score desc
     # (stable: tie → ascending index)

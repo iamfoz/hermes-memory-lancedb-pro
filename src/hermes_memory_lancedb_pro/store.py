@@ -952,8 +952,13 @@ class MemoryStore:
         if scope:
             clauses.append(f"scope = '{_escape_sql(scope)}'")
         if tier:
+            # Match both Python json.dumps spacing ("tier": "x") and compact
+            # serialisation ("tier":"x") so legacy or external-tool data isn't
+            # silently excluded.
+            safe_tier = _escape_sql(tier)
             clauses.append(
-                f"metadata LIKE '%\"tier\": \"{_escape_sql(tier)}\"%'"
+                f"(metadata LIKE '%\"tier\": \"{safe_tier}\"%' OR "
+                f"metadata LIKE '%\"tier\":\"{safe_tier}\"%')"
             )
 
         # Over-fetch when we'll filter archived/session rows post-query
@@ -1084,7 +1089,7 @@ class MemoryStore:
         if min_score is not None:
             rows = [
                 r for r in rows
-                if (1.0 - float(r.get("_distance") or 0.0)) >= min_score
+                if (d := r.get("_distance")) is not None and (1.0 - float(d)) >= min_score
             ]
         return rows[:limit]
 

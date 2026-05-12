@@ -33,7 +33,6 @@ class TestScoreText:
 
     @pytest.mark.parametrize("text", [
         "tool_use: memory_store",
-        "result from tool_result block",
         "function_call to the API",
         "memory_store called with payload",
         "memory_recall invoked",
@@ -44,6 +43,15 @@ class TestScoreText:
         result = score_text(text, 0)
         assert result.score == 1.0
         assert result.reason == "tool_call"
+
+    @pytest.mark.parametrize("text", [
+        "result from tool_result block",
+        "tool_result: the output was 42",
+    ])
+    def test_tool_result(self, text: str):
+        result = score_text(text, 0)
+        assert result.score == 1.0
+        assert result.reason == "tool_result"
 
     # --- correction ---
 
@@ -373,42 +381,25 @@ class TestCompressTexts:
         assert tool_result_text in result.texts
 
     def test_pairing_only_fires_for_tool_call_not_tool_result(self):
-        # A line scored as tool_result should NOT pull in the line after it
+        # tool_use lines (reason="tool_call") pull in the next line as a pair.
+        # tool_result lines (reason="tool_result") do NOT trigger forward pairing,
+        # so the line after a tool_result is not dragged in automatically.
         first = "session start"
         last = "session end"
-        tool_call_text = "tool_use: do something important"
-        tool_result_text = "tool_result: done"  # this is also tool_call scored (tool_result indicator)
+        tool_call_text = "tool_use: do something important"  # reason="tool_call" → pairs with next
+        tool_result_text = "tool_result: done"               # reason="tool_result" → no pairing
         unrelated_next = "unrelated line after tool_result"
         filler = ["short filler"] * 5
         texts = [first, tool_call_text, tool_result_text, unrelated_next] + filler + [last]
 
-        # Make budget just big enough for first, last, both tool lines,
-        # but NOT unrelated_next if it weren't paired.
-        # Actually: tool_result IS scored as tool_call (reason="tool_call") because
-        # \btool_result\b matches TOOL_CALL_INDICATORS. The pairing logic only
-        # pairs index i → i+1 when reason == "tool_call". So tool_result at index 2
-        # WILL try to pair with index 3 (unrelated_next). But the spec says
-        # "only pair from a tool_call line, NOT tool_result".
-        # Per the TS source: pairing fires for ANY reason=="tool_call" scored entry.
-        # The "not tool_result" comment refers to NOT pairing a tool_result-scored
-        # line (which would score reason=="tool_call" from the indicator match but
-        # still be a tool_result indicator). Since both tool_use and tool_result
-        # indicators score reason="tool_call", the pairing is based purely on
-        # reason=="tool_call" which both get. The TS comment clarifies: we DO pair
-        # tool_call lines; we do NOT pair tool_result lines (i.e. a line whose
-        # primary indicator is tool_result won't get its partner attached).
-        #
-        # In the TS code, ALL entries with reason "tool_call" (regardless of which
-        # indicator matched) get the pair map built. The comment is documenting
-        # that only tool_call lines (not a separate "tool_result" reason) fire the
-        # pairing — but since tool_result indicator also scores as reason "tool_call",
-        # both get the pairing treatment in practice.
-        #
-        # For the test: verify the tool_call at index 1 pulls in tool_result at index 2.
+        # Budget: fits first + last + tool_call + tool_result but not unrelated_next.
+        # tool_call (index 1) pairs with tool_result (index 2), so both land.
+        # tool_result (index 2) does NOT pair with unrelated_next (index 3).
         budget = len(first) + len(last) + len(tool_call_text) + len(tool_result_text) + 5
         result = compress_texts(texts, max_chars=budget)
         assert tool_call_text in result.texts
         assert tool_result_text in result.texts
+        assert unrelated_next not in result.texts
 
     def test_all_low_score_fallback_min_texts_honoured(self):
         # Feed only acknowledgments (score=0.1 < min_score_to_keep=0.3)

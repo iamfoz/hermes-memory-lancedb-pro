@@ -14,9 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 # ---------------------------------------------------------------------------
-# TS-spec temporal-versioned set
-# The Python memory_categories.py only has {"events"}; the TS source has
-# {"preferences", "entities"}.  We use the TS-authoritative set here.
+# TS-spec temporal-versioned set (mirrors memory_categories.TEMPORAL_VERSIONED_CATEGORIES)
 # ---------------------------------------------------------------------------
 _TEMPORAL_VERSIONED_CATEGORIES: frozenset[str] = frozenset({"preferences", "entities"})
 
@@ -364,8 +362,9 @@ def parse_smart_metadata(
         fallback_source = "legacy"
 
     source = _normalize_source(parsed.get("source", fallback_source))
-    default_state = "archived" if source == "session-summary" else "confirmed"
-    state = _normalize_state(parsed.get("state", default_state))
+    # Default to "confirmed" regardless of source — session-summary memories
+    # must be queryable immediately; an "archived" default silently hid them.
+    state = _normalize_state(parsed.get("state", "confirmed"))
     memory_layer = _normalize_layer(
         parsed.get("memory_layer")
         if parsed.get("memory_layer") is not None

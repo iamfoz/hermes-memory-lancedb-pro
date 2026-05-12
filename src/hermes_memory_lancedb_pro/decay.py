@@ -218,9 +218,13 @@ def compute_decay_score(
     effective_half_life = base_half_life * math.exp(
         config.importance_modulation * importance
     )
-    lam = math.log(2) / effective_half_life
     beta = TIER_BETA.get(tier, TIER_BETA[TIER_WORKING])
-    recency = math.exp(-lam * math.pow(days_since, beta))
+    # Correct Weibull half-life: solve exp(-(λ·t)^β) = 0.5 at t = half_life
+    # → λ = log(2)^(1/β) / half_life. Using log(2)/half_life is only correct
+    # for β=1; other values produce the wrong half-life by a factor of
+    # half_life^(β-1).
+    lam = math.pow(math.log(2), 1.0 / beta) / effective_half_life
+    recency = math.exp(-math.pow(lam * days_since, beta))
 
     # Frequency
     base_freq = 1 - math.exp(-access_count / 5)

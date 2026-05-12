@@ -11,8 +11,11 @@ Pure Python — no lancedb, no embedder dependency.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 # Smart memory categories — matches the CortexReach schema.
 SmartCategory = Literal[
@@ -69,7 +72,16 @@ def normalize_category(value: Any) -> SmartCategory:
             "reflection": "patterns",
             "other": "entities",
         }
-        return legacy_map.get(v, "entities")  # type: ignore[return-value]
+        mapped = legacy_map.get(v)
+        if mapped is not None:
+            return mapped  # type: ignore[return-value]
+        logger.warning(
+            "normalize_category: unknown category %r; defaulting to 'entities'", value
+        )
+        return "entities"  # type: ignore[return-value]
+    logger.warning(
+        "normalize_category: non-string input %r; defaulting to 'entities'", type(value).__name__
+    )
     return "entities"
 
 

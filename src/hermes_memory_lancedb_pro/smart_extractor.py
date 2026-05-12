@@ -833,7 +833,7 @@ class SmartExtractor:
         scope = scope_filter[0] if scope_filter else None
         try:
             similar = self._store.search_by_vector(
-                vector or [], limit=1, scope=scope, keep_vector=False,
+                vector or [], limit=5, scope=scope, keep_vector=False,
             )
         except Exception as e:
             logger.warning("smart-extractor: profile search failed: %s", e)

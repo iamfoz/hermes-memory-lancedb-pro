@@ -183,7 +183,10 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
         if not text:
             continue
         cat = r.get("category") or "other"
-        score = r.get("_final_score") or r.get("_rrf_score") or r.get("score") or 0.0
+        score = next(
+            (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
+            0.0,
+        )
         lines.append(f"- [{cat}] {text} (score={score:.2f})")
     return "\n".join(lines) if lines else ""
 
@@ -279,6 +282,9 @@ def _build_provider_class():
             # Protects _sync_thread reference against concurrent sync_turn /
             # on_session_end / shutdown calls from different threads.
             self._thread_lock = threading.Lock()
+            # Serializes the join+create+start sequence so two concurrent
+            # sync_turn callers cannot each launch their own write thread.
+            self._dispatch_lock = threading.Lock()
             # Lock protecting _pending_used_ids — dict is mutated from the
             # calling thread (prefetch/before_prompt_build) and from the
             # sync_turn daemon thread simultaneously.
@@ -447,7 +453,7 @@ def _build_provider_class():
                     ]
             return _format_recall(results)
 
-        def prefetch(self, query: str) -> str:
+        def prefetch(self, query: str, session_id: str | None = None) -> str:
             """User-message memory injection (legacy hermes-agent path).
 
             Returns the formatted recall block. On hermes-agent versions
@@ -455,7 +461,7 @@ def _build_provider_class():
             called — the host detects our override and skips prefetch
             to avoid double-injection. On older hermes-agent, this is
             the only injection point."""
-            return self._do_recall(query, self._session_id)
+            return self._do_recall(query, session_id or self._session_id)
 
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
             """System-prompt memory injection (new hermes-agent path).
@@ -544,14 +550,15 @@ def _build_provider_class():
                     except Exception as e:
                         logger.warning("lancedb_pro mark_recall_used failed: %s", e)
 
-            with self._thread_lock:
-                prev = self._sync_thread
-            if prev and prev.is_alive():
-                prev.join(timeout=5.0)
-            new_thread = threading.Thread(target=_do, daemon=True)
-            with self._thread_lock:
-                self._sync_thread = new_thread
-            new_thread.start()
+            with self._dispatch_lock:
+                with self._thread_lock:
+                    prev = self._sync_thread
+                if prev and prev.is_alive():
+                    prev.join(timeout=5.0)
+                new_thread = threading.Thread(target=_do, daemon=True)
+                with self._thread_lock:
+                    self._sync_thread = new_thread
+                new_thread.start()
 
         def _raw_sync_turn(
             self,

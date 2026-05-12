@@ -217,7 +217,7 @@ class MemoryRetriever:
             entry["_mmr_score"] = score
 
         # 7. Apply min_score gate
-        if min_score and min_score > 0.0:
+        if min_score is not None and min_score > 0.0:
             scored = [
                 e for e in scored
                 if float(e.get("_final_score", 0.0)) >= min_score
@@ -347,7 +347,9 @@ class MemoryRetriever:
 
             if in_vector:
                 raw_dist = entry.get("_distance", 0.0)
-                norm_dist = (raw_dist - min_dist) / dist_range if dist_range > 0 else 0.0
+                # When all distances are equal (single result or degenerate
+                # embedding) treat as neutral relevance, not perfect (1.0).
+                norm_dist = (raw_dist - min_dist) / dist_range if dist_range > 0 else 0.5
                 fusion_score = max(0.01, 1.0 - norm_dist)
                 if in_bm25:
                     bm25_rank = bm25_ranks[mid]
