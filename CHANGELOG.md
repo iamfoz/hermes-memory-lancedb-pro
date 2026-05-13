@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.1] — 2026-05-20
+
+### Fixed
+- `plugin.yaml` was missing `configurable: true` and the `env_vars` section,
+  causing the plugin to be invisible in `hermes memory setup`. Added both,
+  keeping the definitions in sync with `get_config_schema()`.
+- `plugin.yaml` version field was stale at `0.9.4`; now tracks the package version.
+
+---
+
 ## [0.11.0] — 2026-05-20
 
 ### Added
