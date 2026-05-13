@@ -2,12 +2,14 @@
 
 > LanceDB-backed persistent memory for [Hermes Agent](https://github.com/nousresearch/hermes-agent) — hybrid BM25+vector search with Weibull decay and tier management.
 
+See [CHANGELOG.md](CHANGELOG.md) for full version history.
+
 ## Overview
 
 A production-grade memory store that gives Hermes Agent persistent, searchable recall across sessions. Supports:
 
 - **Hybrid search** — RRF-fused BM25 (lexical) + cosine (semantic) retrieval, all modes return the same shape
-- **Weibull composite decay** — importance fades based on recency, access frequency, and recency bias
+- **Weibull stretched-exponential decay** — `recency = exp(-(λ·t)^β)` with per-tier `β` (core 0.8 / working 1.0 / peripheral 1.3) and `λ = ln(2)^(1/β) / half_life`; guarantees recency = 0.5 at exactly `half_life` for every tier. Composite score folds in access frequency and recency bias.
 - **Tier management** — core / working / peripheral memory tiers with automatic promotion / demotion
 - **Supersede pattern** — updates archive old rows and create new ones (no in-place mutation)
 - **Auto-recovery** — detects corrupted databases and re-seeds from MEMORY.md
@@ -341,6 +343,10 @@ from hermes_memory_lancedb_pro import compress_texts, estimate_conversation_valu
 result = compress_texts(turn_texts, max_chars=4000)
 # result.texts is the chronological subset; result.scored has per-turn scores
 # Decisions / corrections / tool_calls score 0.85-1.0; greetings 0.1.
+# Tool-call texts (function invocations) and tool-result texts (responses)
+# are scored separately — results score slightly lower than calls since
+# the call carries the intent signal. Check result.scored[i].reason for
+# "tool_call", "tool_result", "correction", "decision", "greeting", etc.
 ```
 
 `estimate_conversation_value(turn_texts)` returns a 0.0-1.0 estimate you can
@@ -578,6 +584,8 @@ if should_run_compaction(state_file, cooldown_hours=24):
 ```
 
 Set `dry_run=True` to see the plan without writing.
+
+When clusters are merged the compactor preserves the highest-rank tier across members (core > working > peripheral) and OR-combines their `cross_session` flags so a merged entry never silently loses cross-session visibility that any source entry had.
 
 ## Architecture
 
