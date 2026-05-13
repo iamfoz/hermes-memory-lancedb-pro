@@ -263,3 +263,27 @@ class TestReflectionWiring:
         p._reflection_block("sess-X")
         p._reflection_block("sess-X")
         assert len(calls) == 1, "second call for same session must hit the cache"
+
+
+# ---------------------------------------------------------------------------
+# on_session_switch session-ID tracking
+# ---------------------------------------------------------------------------
+
+class TestSessionSwitch:
+    def test_session_id_updated_on_switch(self, provider_cls, real_store):
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        p.initialize("sess-1")
+        assert p._session_id == "sess-1"
+        p.on_session_switch("sess-2", parent_session_id="sess-1")
+        assert p._session_id == "sess-2"
+
+    def test_old_session_cache_cleared_on_switch(self, provider_cls, real_store, monkeypatch):
+        monkeypatch.setattr(provider, "_REFLECTION_ENABLED", True)
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        p.initialize("sess-1")
+        # Seed the cache with a fake entry for sess-1
+        with p._reflection_lock:
+            p._reflection_cache["sess-1"] = "old-reflection"
+        p.on_session_switch("sess-2", parent_session_id="sess-1")
+        with p._reflection_lock:
+            assert "sess-1" not in p._reflection_cache

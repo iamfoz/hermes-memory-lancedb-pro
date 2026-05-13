@@ -641,6 +641,15 @@ class SmartExtractor:
             )
             if admission.decision == "reject":
                 stats.rejected += 1
+                if self._admission.config.persist_rejected_audits:
+                    self._persist_rejection_audit(
+                        candidate=candidate,
+                        audit=admission.audit,
+                        conversation_text=conversation_text,
+                        session_key=session_key,
+                        target_scope=target_scope,
+                        scope_filter=list(scope_filter or []),
+                    )
                 return
             admission_audit = admission.audit
 
@@ -835,6 +844,15 @@ class SmartExtractor:
                 candidate, conversation_text, scope_filter=scope_filter,
             )
             if admission.decision == "reject":
+                if self._admission.config.persist_rejected_audits:
+                    self._persist_rejection_audit(
+                        candidate=candidate,
+                        audit=admission.audit,
+                        conversation_text=conversation_text,
+                        session_key=session_key,
+                        target_scope=target_scope,
+                        scope_filter=list(scope_filter or []),
+                    )
                 return "rejected"
             admission_audit = admission.audit
 
@@ -1083,6 +1101,47 @@ class SmartExtractor:
                 "contexts": [context_label] if context_label else [],
             },
         )
+
+    # -- audit helpers --------------------------------------------------------
+
+    def _persist_rejection_audit(
+        self,
+        *,
+        candidate: CandidateMemory,
+        audit: AdmissionAuditRecord,
+        conversation_text: str,
+        session_key: str,
+        target_scope: str,
+        scope_filter: list[str],
+    ) -> None:
+        """Persist a JSONL rejection audit entry. Best-effort — any failure
+        is swallowed so the audit path never breaks the main pipeline."""
+        try:
+            from dataclasses import asdict
+            from .admission_control import (
+                AdmissionRejectionAuditEntry,
+                append_rejection_audit,
+                resolve_rejected_audit_path,
+            )
+            audit_path = resolve_rejected_audit_path(
+                self._store.db_path, self._admission.config if self._admission else None,
+            )
+            entry = AdmissionRejectionAuditEntry(
+                rejected_at=int(time.time() * 1000),
+                session_key=session_key,
+                target_scope=target_scope,
+                scope_filter=scope_filter,
+                candidate={
+                    "abstract": candidate.abstract,
+                    "category": candidate.category,
+                    "overview": candidate.overview,
+                },
+                audit=asdict(audit),
+                conversation_excerpt=conversation_text[-500:],
+            )
+            append_rejection_audit(audit_path, entry)
+        except Exception as e:
+            logger.debug("smart-extractor: rejection audit write failed: %s", e)
 
     # -- store helpers --------------------------------------------------------
 

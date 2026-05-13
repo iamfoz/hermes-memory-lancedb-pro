@@ -17,6 +17,7 @@ __all__ = [
     "build_extraction_prompt",
     "build_dedup_prompt",
     "build_merge_prompt",
+    "build_reflection_prompt",
 ]
 
 

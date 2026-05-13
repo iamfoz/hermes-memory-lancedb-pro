@@ -682,7 +682,9 @@ def _build_provider_class():
             lines. Best-effort: any failure yields an empty block."""
             try:
                 from .reflection import load_agent_reflection_slices_from_entries
-                entries = self._store.list_memories(limit=_REFLECTION_SCAN_LIMIT)
+                entries = self._store.list_memories(
+                    limit=_REFLECTION_SCAN_LIMIT, category="reflection"
+                )
                 slices = load_agent_reflection_slices_from_entries(
                     entries=entries, agent_id=self._agent_id,
                 )
@@ -854,6 +856,7 @@ def _build_provider_class():
             reset: bool = False,
             **_kwargs: Any,
         ) -> None:
+            self._session_id = new_session_id
             # Drop any pending used-ids for the old session — we're not
             # going to credit recalls that were never confirmed.
             if parent_session_id:
