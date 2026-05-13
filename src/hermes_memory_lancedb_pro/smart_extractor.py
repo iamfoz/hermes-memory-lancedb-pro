@@ -252,11 +252,13 @@ class SmartExtractor:
         llm: LlmClient | None = None,
         admission_controller: AdmissionController | None = None,
         config: SmartExtractorConfig | None = None,
+        rate_limiter: ExtractionRateLimiter | None = None,
     ):
         self._store = store
         self._llm = llm
         self._admission = admission_controller
         self.config = config or SmartExtractorConfig()
+        self._rate_limiter = rate_limiter
 
     # -- public properties -----------------------------------------------------
 
@@ -332,10 +334,25 @@ class SmartExtractor:
                 scope=target_scope,
             )
 
+        if self._rate_limiter is not None and self._rate_limiter.is_rate_limited():
+            logger.info(
+                "smart-extractor: rate limited (%d calls/hr cap); falling back to legacy",
+                self._rate_limiter.max_per_hour,
+            )
+            return self._legacy_fallback(
+                user_content=user_content,
+                assistant_content=assistant_content,
+                session_key=session_key,
+                scope=target_scope,
+            )
+
         if conversation_text is None:
             conversation_text = self._format_conversation(user_content, assistant_content)
         if not conversation_text or not conversation_text.strip():
             return ExtractionStats()
+
+        if self._rate_limiter is not None:
+            self._rate_limiter.record_extraction()
 
         return self._run_llm_pipeline(
             conversation_text=conversation_text,

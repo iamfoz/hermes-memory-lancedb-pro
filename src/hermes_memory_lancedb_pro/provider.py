@@ -127,6 +127,15 @@ _ADMISSION_PRESET: str = os.environ.get(
     "MEMORY_ADMISSION_PRESET", "balanced"
 ).strip().lower()
 
+# ---------------------------------------------------------------------------
+# Extraction rate-limit configuration
+# ---------------------------------------------------------------------------
+# Maximum LLM extraction calls per hour. When the cap is hit, sync_turn falls
+# back to legacy raw writes for the remainder of the hour. 0 disables the cap.
+_EXTRACTION_RATE_LIMIT: int = int(
+    os.environ.get("MEMORY_EXTRACTION_RATE_LIMIT", "0")
+)
+
 
 def _extract_message_texts(messages: Any) -> list[str]:
     """Coerce hermes-agent's session-end ``messages`` arg to a flat list of
@@ -176,7 +185,7 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
     NEVER fail to construct just because LLM detection went sideways."""
     try:
         from .llm_client import create_llm_client_from_env
-        from .smart_extractor import SmartExtractor
+        from .smart_extractor import ExtractionRateLimiter, SmartExtractor
     except ImportError as e:
         logger.debug("lancedb_pro: smart_extractor unavailable: %s", e)
         return None
@@ -188,8 +197,15 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
     if llm is None:
         return None
     admission = _maybe_build_admission_controller(store, llm)
+    rate_limiter = (
+        ExtractionRateLimiter(max_per_hour=_EXTRACTION_RATE_LIMIT)
+        if _EXTRACTION_RATE_LIMIT > 0
+        else None
+    )
     try:
-        return SmartExtractor(store, llm=llm, admission_controller=admission)
+        return SmartExtractor(
+            store, llm=llm, admission_controller=admission, rate_limiter=rate_limiter,
+        )
     except Exception as e:
         logger.debug("lancedb_pro: SmartExtractor construction failed: %s", e)
         return None
@@ -589,6 +605,13 @@ def _build_provider_class():
                     "key": "auto_compact_cooldown_hours",
                     "env_var": "MEMORY_AUTO_COMPACT_COOLDOWN_HOURS",
                     "description": "Hours between automatic memory compaction runs (default: 168; 0 = off)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "extraction_rate_limit",
+                    "env_var": "MEMORY_EXTRACTION_RATE_LIMIT",
+                    "description": "Max LLM extraction calls per hour; falls back to raw writes when hit (default: 0 = unlimited)",
                     "secret": False,
                     "required": False,
                 },

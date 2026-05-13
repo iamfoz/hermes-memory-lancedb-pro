@@ -436,6 +436,55 @@ class TestRateLimiter:
             rl.record_extraction()
         assert rl.get_recent_count() == 4
 
+    def test_rate_limited_extractor_falls_back_to_legacy(self):
+        """When the rate limiter is already saturated the extractor must fall
+        back to legacy writes without calling the LLM."""
+        from unittest.mock import MagicMock
+        from hermes_memory_lancedb_pro.smart_extractor import SmartExtractor
+
+        store = MagicMock()
+        store.encode.return_value = [0.0] * 768
+        store.encode_batch.return_value = [[0.0] * 768]
+        store.store.return_value = "fake-id"
+
+        llm = MagicMock()
+        llm.complete_json.return_value = {"memories": []}
+
+        rl = ExtractionRateLimiter(max_per_hour=2)
+        rl.record_extraction()
+        rl.record_extraction()
+        assert rl.is_rate_limited()
+
+        ex = SmartExtractor(store, llm=llm, rate_limiter=rl)
+        ex.extract_and_persist(user_content="hello", assistant_content="world", session_key="s")
+
+        # LLM must NOT have been called since we're over the cap
+        llm.complete_json.assert_not_called()
+        # Legacy fallback writes directly to the store
+        assert store.store.called
+
+    def test_rate_limiter_records_on_llm_use(self):
+        """Each successful LLM pipeline run must increment the rate limiter."""
+        from unittest.mock import MagicMock
+        from hermes_memory_lancedb_pro.smart_extractor import SmartExtractor
+
+        store = MagicMock()
+        store.encode.return_value = [0.0] * 768
+        store.encode_batch.return_value = [[0.0] * 768]
+        store.store.return_value = "fake-id"
+
+        llm = MagicMock()
+        # Return no candidates so the pipeline exits quickly
+        llm.complete_json.return_value = {"memories": []}
+
+        rl = ExtractionRateLimiter(max_per_hour=10)
+        assert rl.get_recent_count() == 0
+
+        ex = SmartExtractor(store, llm=llm, rate_limiter=rl)
+        ex.extract_and_persist(user_content="hello", assistant_content="world", session_key="s")
+
+        assert rl.get_recent_count() == 1
+
 
 # ---------------------------------------------------------------------------
 # Integration: real LanceDB MemoryStore + StubEmbedder + FakeLlm

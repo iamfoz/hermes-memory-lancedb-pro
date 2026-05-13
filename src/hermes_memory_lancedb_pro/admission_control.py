@@ -94,7 +94,6 @@ class AdmissionRecencyConfig:
 @dataclass
 class AdmissionControlConfig:
     preset: AdmissionPreset = "balanced"
-    enabled: bool = False
     utility_mode: UtilityMode = "standalone"
     weights: AdmissionWeights = field(default_factory=AdmissionWeights)
     reject_threshold: float = 0.45

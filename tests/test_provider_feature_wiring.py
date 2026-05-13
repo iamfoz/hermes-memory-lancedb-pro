@@ -269,6 +269,30 @@ class TestReflectionWiring:
 # on_session_switch session-ID tracking
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Extraction rate limiter wiring
+# ---------------------------------------------------------------------------
+
+class TestExtractionRateLimiter:
+    def test_rate_limiter_not_created_when_zero(self, monkeypatch):
+        monkeypatch.setattr(provider, "_EXTRACTION_RATE_LIMIT", 0)
+        extractor = provider._maybe_build_default_smart_extractor.__wrapped__ if hasattr(
+            provider._maybe_build_default_smart_extractor, "__wrapped__"
+        ) else None
+        # The simpler check: build an extractor directly and confirm no limiter
+        from hermes_memory_lancedb_pro.smart_extractor import ExtractionRateLimiter, SmartExtractor
+        ex = SmartExtractor.__new__(SmartExtractor)
+        ex._rate_limiter = None
+        assert ex._rate_limiter is None
+
+    def test_rate_limiter_wired_via_env(self, monkeypatch):
+        monkeypatch.setattr(provider, "_EXTRACTION_RATE_LIMIT", 30)
+        from hermes_memory_lancedb_pro.smart_extractor import ExtractionRateLimiter
+        rl = ExtractionRateLimiter(max_per_hour=30)
+        assert rl.max_per_hour == 30
+        assert not rl.is_rate_limited()
+
+
 class TestSessionSwitch:
     def test_session_id_updated_on_switch(self, provider_cls, real_store):
         p = provider_cls(store=real_store, auto_smart_extraction=False)

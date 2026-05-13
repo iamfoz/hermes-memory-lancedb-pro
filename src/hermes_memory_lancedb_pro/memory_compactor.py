@@ -49,7 +49,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CompactionConfig:
     """Knobs for `run_compaction`. All fields have working defaults."""
-    enabled: bool = False
     min_age_days: int = 7
     similarity_threshold: float = 0.88
     min_cluster_size: int = 2
