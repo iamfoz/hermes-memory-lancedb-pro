@@ -293,3 +293,48 @@ Return JSON:
       "overview": "Merged structured Markdown overview",
         "content": "Merged full content"
   }} """
+
+
+def build_reflection_prompt(conversation_text: str) -> str:
+    """Return the session-reflection prompt.
+
+    Asks the LLM to distil a completed session into two buckets:
+    ``invariants`` (durable truths, weeks-long relevance) and
+    ``derived`` (this-run takeaways and next-run actions, days-long
+    relevance). The reflection layer ranks each bucket with its own
+    logistic-decay curve, so the split matters.
+
+    Args:
+        conversation_text: The full session transcript to reflect on.
+
+    Returns:
+        The fully-rendered reflection prompt string.
+    """
+    return f"""Review this completed assistant session and distil a concise reflection.
+
+## Session Transcript
+{conversation_text}
+
+# Task
+
+Produce two lists:
+
+- **invariants** — durable truths about the user or the working
+  relationship that will still matter weeks from now: standing
+  preferences, hard constraints, settled decisions. Stable, not transient.
+- **derived** — this-session takeaways and concrete next-run actions.
+  Short-lived and specific to recent work.
+
+# Rules
+
+- Each entry is ONE short sentence. No markdown, no bullet characters.
+- At most 6 invariants, at most 8 derived.
+- Only include what the transcript actually supports — never invent.
+- If a list has nothing worth keeping, return it empty.
+- Skip infrastructure noise, tool logs, and one-off chatter.
+
+Return ONLY this JSON object:
+{{
+  "invariants": ["...", "..."],
+  "derived": ["...", "..."]
+}}"""

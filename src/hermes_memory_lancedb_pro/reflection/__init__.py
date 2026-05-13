@@ -80,6 +80,7 @@ from .slices import (
     sanitize_reflection_slice_lines,
 )
 from .store import (
+    MemoryStoreReflectionAdapter,
     ReflectionMappedSlices,
     ReflectionStoreAdapter,
     build_reflection_store_payloads,
@@ -138,6 +139,7 @@ __all__ = [
     "sanitize_injectable_reflection_lines",
     "sanitize_reflection_slice_lines",
     # store
+    "MemoryStoreReflectionAdapter",
     "ReflectionMappedSlices",
     "ReflectionStoreAdapter",
     "build_reflection_store_payloads",

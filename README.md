@@ -44,30 +44,38 @@ A production-grade memory store that gives Hermes Agent persistent, searchable r
 
 ### Install
 
-A working install has **two pieces** in different places: the pip
-package holds all the code; `~/.hermes/plugins/lancedb_pro/` holds a
-small discovery shim so hermes-agent can find the provider. The
-`hermes-memory install-plugin` command creates the shim for you.
+**Install into Hermes' Python environment with `hermes-pip`.** This is
+the single most common install mistake: a plain `pip install` puts the
+package in whatever Python happens to be active, but hermes-agent runs
+the discovery shim (`from hermes_memory_lancedb_pro.provider import
+register`) inside *its own* environment. If the package isn't there, the
+import fails silently and the plugin never loads. `hermes-pip` is the
+wrapper that targets the correct environment.
+
+A working install has **two pieces**: the package holds all the code;
+`~/.hermes/plugins/lancedb_pro/` holds a small discovery shim so
+hermes-agent can find the provider. `hermes-memory install-plugin`
+creates the shim for you.
 
 ```bash
-# 1. Install the package (where the code runs from)
-pip install hermes-memory-lancedb-pro
+# 1. Install the package INTO HERMES' ENVIRONMENT
+hermes-pip install hermes-memory-lancedb-pro
 # or from a clone:
-pip install -e .
+hermes-pip install -e .
 
 # 2. Drop the discovery shim into ~/.hermes/plugins/lancedb_pro/
 hermes-memory install-plugin
 ```
 
-That's it. The shim is ~5 lines that import `register` from the pip
-package, so upgrades happen via `pip install -U` without touching the
-plugin directory.
+That's it. The shim is ~5 lines that import `register` from the
+package, so upgrades happen via `hermes-pip install -U` without touching
+the plugin directory.
 
 Newer hermes-agent versions that support entry-point discovery
 (`importlib.metadata.entry_points` group `hermes.plugins`) can find the
-provider without the shim — `pip install` is enough. The shim is
-maintained for compatibility with hermes-agent releases that only scan
-`~/.hermes/plugins/`.
+provider without the shim — `hermes-pip install` alone is enough. The
+shim is maintained for compatibility with hermes-agent releases that
+only scan `~/.hermes/plugins/`.
 
 **Options**
 
@@ -91,8 +99,8 @@ contains a stale full copy of the source. Replace it with the shim:
 # Back up if you have local edits
 mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old
 
-# Install the current version as a pip package + the shim
-pip install -U hermes-memory-lancedb-pro
+# Install the current version into Hermes' environment + the shim
+hermes-pip install -U hermes-memory-lancedb-pro
 hermes-memory install-plugin
 ```
 
@@ -103,8 +111,9 @@ python -c "import hermes_memory_lancedb_pro as m; print(m.__version__, m.__file_
 ```
 
 If `__file__` points inside `~/.hermes/plugins/lancedb_pro/` and the
-version is old, a stale checkout is still shadowing the pip install —
-remove or rename that directory, then re-run `hermes-memory install-plugin`.
+version is old, a stale checkout is still shadowing the installed
+package — remove or rename that directory, then re-run
+`hermes-memory install-plugin`.
 
 ### Initialise
 
@@ -287,6 +296,19 @@ The adapter:
   access_count bumped, eliminating the recall feedback loop
 - mirrors built-in `/memory` tool writes via `on_memory_write`, marking
   them `cross_session=True` so user-curated facts surface in every session
+- **warms the embedding model** in a background thread from `initialize()`
+  so the cold-start cost never lands on the user's first turn
+- **runs the smart extractor with an admission-control gate** (AMAC-v1,
+  `balanced` preset by default — see `MEMORY_ADMISSION_PRESET`) so
+  low-value candidates are rejected before they reach the store
+- **captures a session reflection** at session end (durable *invariants*
+  + short-lived *derived* insights, LLM-generated) and replays the
+  ranked slices into every recall — see `MEMORY_REFLECTION`
+- **compacts the store** on a weekly cooldown, merging clusters of
+  near-duplicate old memories — see `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS`
+
+Everything above is wired automatically — no caller setup. Each piece
+has an env-var off switch (table below) if you need to disable it.
 
 The adapter has a soft, lazy dependency on hermes-agent: the rest of
 this package (MemoryStore, MemoryRetriever, decay, scoring) imports
@@ -473,8 +495,8 @@ they're imported lazily and only when the corresponding env vars resolve.
 A typical user installs one of:
 
 ```bash
-pip install openai      # for OpenAI / OpenRouter / Ollama / jmunch / etc.
-pip install anthropic   # for native Anthropic
+hermes-pip install openai      # for OpenAI / OpenRouter / Ollama / jmunch / etc.
+hermes-pip install anthropic   # for native Anthropic
 ```
 
 Without either, `create_llm_client_from_env()` returns `None` and the
@@ -638,6 +660,11 @@ Environment variables (all optional):
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
 | `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
 | `MEMORY_PURGE_GRACE_DAYS`      | `30`                               | Archived rows younger than this many days are left alone during auto-purge. Raise this for a longer audit window; lower it to reclaim space sooner. |
+| `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS` | `168`                        | Hours between automatic memory-compaction runs (clustering + merging near-duplicate old memories). Default weekly; set `0` to disable. |
+| `MEMORY_ADMISSION_PRESET`      | `balanced`                         | Admission-control gate wired into the smart extractor: `balanced` / `conservative` / `high-recall`, or `off` to disable the gate. |
+| `MEMORY_REFLECTION`            | `on`                               | Capture session reflections at session end and replay ranked invariant/derived slices on recall. Set `off` to disable both paths. |
+| `MEMORY_REFLECTION_SCAN_LIMIT` | `200`                              | Rows scanned when loading reflection slices for recall. |
+| `MEMORY_REFLECTION_AGENT_ID`   | `main`                             | Agent identity used for reflection ownership. Multi-agent hosts can instead pass `agent_id` to `initialize()`. |
 
 ### Google Ranking API — Authentication Setup
 
@@ -664,8 +691,8 @@ API keys are explicitly rejected. The plugin uses the `google-auth` library's
 Install `google-auth` before enabling this backend:
 
 ```bash
-pip install 'hermes-memory-lancedb-pro[google]'
-# or: pip install google-auth
+hermes-pip install 'hermes-memory-lancedb-pro[google]'
+# or: hermes-pip install google-auth
 ```
 
 Then set `GOOGLE_CLOUD_PROJECT` (and optionally `MEMORY_RERANKER=google`)
@@ -721,13 +748,12 @@ hermes-memory import --in backup.jsonl --reembed
 hermes-memory doctor               # diagnostic report; recommends purge / compaction
 ```
 
-`MemoryStore.warmup()` is also worth calling at agent boot so the
-embedding-model load + JIT cost doesn't land on the user's first turn:
-
-```python
-from hermes_memory_lancedb_pro import MemoryStore
-MemoryStore.get_instance().warmup()
-```
+The embedding model is warmed up automatically: `LanceDBProMemoryProvider`
+kicks off `MemoryStore.warmup()` in a background thread from `initialize()`,
+so the model-load + JIT cost lands during session boot rather than the
+user's first turn — no caller action needed. (Standalone library users
+who skip the provider can still call `MemoryStore.get_instance().warmup()`
+themselves.)
 
 ## Tests
 

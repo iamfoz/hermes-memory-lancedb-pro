@@ -265,6 +265,13 @@ class SmartExtractor:
         """True iff smart extraction is active. False → legacy fallback."""
         return self._llm is not None
 
+    @property
+    def llm(self) -> LlmClient | None:
+        """The configured LLM client, or None in fallback mode. Exposed so
+        callers (e.g. the provider's reflection writer) can reuse the same
+        client instead of constructing a second one."""
+        return self._llm
+
     def _llm_complete_json_with_retry(
         self,
         prompt: str,

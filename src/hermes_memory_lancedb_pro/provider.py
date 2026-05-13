@@ -33,9 +33,15 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
-from .memory_compactor import record_compaction_run, should_run_compaction
+from .memory_compactor import (
+    CompactionConfig,
+    record_compaction_run,
+    run_compaction,
+    should_run_compaction,
+)
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
 from .store import MemoryStore
 
@@ -81,6 +87,45 @@ _SESSION_SUMMARY_MAX_CHARS: int = int(
 _SESSION_SUMMARY_MIN_MESSAGES: int = int(
     os.environ.get("MEMORY_SESSION_SUMMARY_MIN_MESSAGES", "2")
 )
+
+# ---------------------------------------------------------------------------
+# Auto-compaction configuration
+# ---------------------------------------------------------------------------
+# Hours between automatic compaction runs. Compaction clusters near-duplicate
+# old memories and merges each cluster into one consolidated entry. Defaults
+# to weekly; set 0 to disable.
+_AUTO_COMPACT_COOLDOWN_HOURS: int = int(
+    os.environ.get("MEMORY_AUTO_COMPACT_COOLDOWN_HOURS", "168")
+)
+_COMPACT_STATE_FILENAME = ".compact-state.json"
+
+# ---------------------------------------------------------------------------
+# Reflection configuration
+# ---------------------------------------------------------------------------
+# Reflection captures durable "invariants" and short-lived "derived" insights
+# at session end (requires an LLM) and replays them on recall. Set
+# MEMORY_REFLECTION=off to disable both the write and the read path.
+_REFLECTION_ENABLED: bool = os.environ.get(
+    "MEMORY_REFLECTION", "on"
+).strip().lower() not in ("off", "0", "false", "no", "disabled")
+# Rows scanned when loading reflection slices for recall.
+_REFLECTION_SCAN_LIMIT: int = int(
+    os.environ.get("MEMORY_REFLECTION_SCAN_LIMIT", "200")
+)
+# Agent identity used for reflection ownership. Single-agent setups can leave
+# this at the default; multi-agent hosts pass `agent_id` to `initialize()`.
+_REFLECTION_AGENT_ID: str = os.environ.get(
+    "MEMORY_REFLECTION_AGENT_ID", "main"
+).strip() or "main"
+
+# ---------------------------------------------------------------------------
+# Admission-control configuration
+# ---------------------------------------------------------------------------
+# Preset for the AMAC-v1 admission gate wired into the smart extractor:
+# `balanced` / `conservative` / `high-recall`, or `off` to disable the gate.
+_ADMISSION_PRESET: str = os.environ.get(
+    "MEMORY_ADMISSION_PRESET", "balanced"
+).strip().lower()
 
 
 def _extract_message_texts(messages: Any) -> list[str]:
@@ -142,11 +187,116 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
         return None
     if llm is None:
         return None
+    admission = _maybe_build_admission_controller(store, llm)
     try:
-        return SmartExtractor(store, llm=llm)
+        return SmartExtractor(store, llm=llm, admission_controller=admission)
     except Exception as e:
         logger.debug("lancedb_pro: SmartExtractor construction failed: %s", e)
         return None
+
+
+def _maybe_build_admission_controller(store: MemoryStore, llm: Any) -> Any:
+    """Build an `AdmissionController` from `MEMORY_ADMISSION_PRESET`.
+
+    Returns None when the preset is `off` or construction fails — the
+    extractor then runs without an admission gate. An unrecognised preset
+    falls back to `balanced` rather than disabling the gate silently."""
+    if _ADMISSION_PRESET in ("off", "disabled", "none", ""):
+        return None
+    preset = (
+        _ADMISSION_PRESET
+        if _ADMISSION_PRESET in ("balanced", "conservative", "high-recall")
+        else "balanced"
+    )
+    try:
+        from .admission_control import AdmissionController, get_preset
+        return AdmissionController(store, config=get_preset(preset), llm=llm)
+    except Exception as e:
+        logger.debug("lancedb_pro: admission controller unavailable: %s", e)
+        return None
+
+
+def _spawn_warmup(store: MemoryStore) -> None:
+    """Pre-load the embedding model in a daemon thread.
+
+    First-time users pay a 10-30 s model-load + JIT cost on the first
+    `encode()`. Running it here, off the calling thread, means that cost
+    lands while the user is composing their first message instead of
+    stalling their first turn. Best-effort: failures are logged at debug."""
+    def _run() -> None:
+        try:
+            store.warmup()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("lancedb_pro warmup failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True, name="lancedb-pro-warmup").start()
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Coerce an LLM-returned field to a clean list of non-empty strings."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _build_reflection_markdown(
+    invariants: list[str], derived: list[str]
+) -> str:
+    """Render invariant / derived lines into the `## Invariants` /
+    `## Derived` markdown that the reflection layer's parser expects."""
+    parts: list[str] = []
+    if invariants:
+        parts.append("## Invariants")
+        parts.extend(f"- {line}" for line in invariants)
+    if derived:
+        if parts:
+            parts.append("")
+        parts.append("## Derived")
+        parts.extend(f"- {line}" for line in derived)
+    return "\n".join(parts)
+
+
+def _maybe_auto_compact(store: MemoryStore) -> None:
+    """Run cooldown-gated memory compaction.
+
+    Clusters near-duplicate old memories and merges each cluster into one
+    consolidated entry. Runs once per `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS`
+    (default: weekly). Compaction runs per-scope so a merge never spans
+    scopes. Set `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS=0` to disable."""
+    if _AUTO_COMPACT_COOLDOWN_HOURS <= 0:
+        return
+
+    state_file = os.path.join(store.db_path, _COMPACT_STATE_FILENAME)
+    if not should_run_compaction(
+        state_file, cooldown_hours=_AUTO_COMPACT_COOLDOWN_HOURS
+    ):
+        return
+
+    try:
+        cfg = CompactionConfig()
+        deleted = created = 0
+        for scope in ("agent", "user"):
+            result = run_compaction(store, cfg, scopes=[scope])
+            deleted += result.memories_deleted
+            created += result.memories_created
+        record_compaction_run(state_file)
+        if deleted or created:
+            logger.info(
+                "Auto-compaction: merged clusters → -%d +%d memories. "
+                "Next run in ~%dh.",
+                deleted, created, _AUTO_COMPACT_COOLDOWN_HOURS,
+            )
+        else:
+            logger.debug("Auto-compaction: no clusters to merge.")
+    except Exception as e:
+        logger.warning("Auto-compaction failed (will retry next session): %s", e)
 
 
 _TOKEN_RE = re.compile(r"[a-z']{2,}")
@@ -315,6 +465,15 @@ def _build_provider_class():
             self._smart_extractor = smart_extractor
             if smart_extractor is None and auto_smart_extraction:
                 self._smart_extractor = _maybe_build_default_smart_extractor(self._store)
+            # Embedding-model warmup runs once, off the first turn's path.
+            self._warmed_up = False
+            # Agent identity for reflection ownership; may be overridden by
+            # hermes-agent via `initialize(agent_id=...)`.
+            self._agent_id = _REFLECTION_AGENT_ID
+            # Reflection recall block cached per session — reflection rows
+            # only change at session end, so the set is stable mid-session.
+            self._reflection_lock = threading.Lock()
+            self._reflection_cache: dict[str, str] = {}
 
         # ---- ABC requirements --------------------------------------------
 
@@ -334,6 +493,9 @@ def _build_provider_class():
             a separate database tree (e.g. ``~/.hermes/memory-lancedb``)
             rather than the process-wide default path."""
             self._session_id = session_id
+            agent_id = kwargs.get("agent_id")
+            if agent_id and str(agent_id).strip():
+                self._agent_id = str(agent_id).strip()
             hermes_home = kwargs.get("hermes_home")
             if hermes_home and not self._explicit_store:
                 db_path = os.path.join(str(hermes_home), "memory-lancedb")
@@ -347,6 +509,12 @@ def _build_provider_class():
                 # get_instance() calls _initialise() internally, but an
                 # explicitly-supplied store may not have been opened yet.
                 self._store._initialise()
+
+            # Warm the embedding model once, in the background, so the
+            # cold-start cost never lands on the user's first turn.
+            if not self._warmed_up:
+                self._warmed_up = True
+                _spawn_warmup(self._store)
 
         def get_tool_schemas(self) -> list[dict[str, Any]]:
             return []  # context-only provider; no tool calls
@@ -403,6 +571,27 @@ def _build_provider_class():
                     "secret": False,
                     "required": False,
                 },
+                {
+                    "key": "admission_preset",
+                    "env_var": "MEMORY_ADMISSION_PRESET",
+                    "description": "Admission gate: balanced / conservative / high-recall / off (default: balanced)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "reflection",
+                    "env_var": "MEMORY_REFLECTION",
+                    "description": "Capture & replay session reflections: on / off (default: on)",
+                    "secret": False,
+                    "required": False,
+                },
+                {
+                    "key": "auto_compact_cooldown_hours",
+                    "env_var": "MEMORY_AUTO_COMPACT_COOLDOWN_HOURS",
+                    "description": "Hours between automatic memory compaction runs (default: 168; 0 = off)",
+                    "secret": False,
+                    "required": False,
+                },
             ]
 
         def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
@@ -443,7 +632,8 @@ def _build_provider_class():
             """Shared implementation for both `prefetch` and
             `before_prompt_build`. Runs a session-scoped recall, caches
             the returned ids in `_pending_used_ids[session_id]` so we
-            can credit them later, and returns the formatted block."""
+            can credit them later, prepends the reflection block, and
+            returns the combined text."""
             if not query or not query.strip():
                 return ""
             try:
@@ -456,14 +646,52 @@ def _build_provider_class():
                 )
             except Exception as e:
                 logger.warning("lancedb_pro recall failed: %s", e)
-                return ""
+                results = []
 
             if results and session_id:
                 with self._pending_lock:
                     self._pending_used_ids[session_id] = [
                         r["id"] for r in results if r.get("id")
                     ]
-            return _format_recall(results)
+
+            recall_block = _format_recall(results)
+            reflection_block = self._reflection_block(session_id)
+            if reflection_block and recall_block:
+                return f"{reflection_block}\n{recall_block}"
+            return reflection_block or recall_block
+
+        def _reflection_block(self, session_id: str) -> str:
+            """Return the formatted reflection-recall block for this
+            session. Computed once and cached for the session's lifetime
+            — reflection rows are only written at session end, so the set
+            is stable mid-session."""
+            if not _REFLECTION_ENABLED:
+                return ""
+            cache_key = session_id or "_global"
+            with self._reflection_lock:
+                cached = self._reflection_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            block = self._compute_reflection_block()
+            with self._reflection_lock:
+                self._reflection_cache[cache_key] = block
+            return block
+
+        def _compute_reflection_block(self) -> str:
+            """Load and rank reflection slices, format them as recall
+            lines. Best-effort: any failure yields an empty block."""
+            try:
+                from .reflection import load_agent_reflection_slices_from_entries
+                entries = self._store.list_memories(limit=_REFLECTION_SCAN_LIMIT)
+                slices = load_agent_reflection_slices_from_entries(
+                    entries=entries, agent_id=self._agent_id,
+                )
+            except Exception as e:
+                logger.debug("lancedb_pro reflection load failed: %s", e)
+                return ""
+            lines = [f"- [reflection/invariant] {s}" for s in slices.invariants]
+            lines += [f"- [reflection/derived] {s}" for s in slices.derived]
+            return "\n".join(lines)
 
         def prefetch(self, query: str, session_id: str | None = None) -> str:
             """User-message memory injection (legacy hermes-agent path).
@@ -631,6 +859,8 @@ def _build_provider_class():
             if parent_session_id:
                 with self._pending_lock:
                     self._pending_used_ids.pop(parent_session_id, None)
+                with self._reflection_lock:
+                    self._reflection_cache.pop(parent_session_id, None)
 
         def on_recall_used(
             self,
@@ -769,9 +999,63 @@ def _build_provider_class():
                 except Exception as e:
                     logger.warning("lancedb_pro session-summary write failed: %s", e)
 
+                try:
+                    self._maybe_write_reflection(_extract_message_texts(messages))
+                except Exception as e:
+                    logger.warning("lancedb_pro reflection write failed: %s", e)
+
                 with self._pending_lock:
                     self._pending_used_ids.clear()
+            with self._reflection_lock:
+                self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
+            _maybe_auto_compact(self._store)
+
+        def _maybe_write_reflection(self, texts: list[str]) -> None:
+            """Generate a session reflection via the extractor's LLM and
+            persist it through the reflection layer.
+
+            No-op when reflection is disabled, no LLM is configured (the
+            reflection summary needs one to be generated), or the
+            transcript is empty. Best-effort throughout — the caller
+            already wraps this in a try/except."""
+            if not _REFLECTION_ENABLED:
+                return
+            extractor = self._smart_extractor
+            if extractor is None or not getattr(extractor, "has_llm", False):
+                return
+            llm = getattr(extractor, "llm", None)
+            if llm is None:
+                return
+            conversation = "\n".join(texts).strip()
+            if not conversation:
+                return
+
+            from .extraction_prompts import build_reflection_prompt
+            result = llm.complete_json(
+                build_reflection_prompt(conversation), label="reflection",
+            )
+            if not isinstance(result, dict):
+                return
+            invariants = _coerce_str_list(result.get("invariants"))
+            derived = _coerce_str_list(result.get("derived"))
+            if not invariants and not derived:
+                return
+
+            from .reflection import (
+                MemoryStoreReflectionAdapter,
+                store_reflection_to_lancedb,
+            )
+            store_reflection_to_lancedb(
+                MemoryStoreReflectionAdapter(self._store),
+                reflection_text=_build_reflection_markdown(invariants, derived),
+                session_key=self._session_id or "unknown",
+                session_id=self._session_id or "unknown",
+                agent_id=self._agent_id,
+                command="session-end",
+                scope="agent",
+                run_at=int(time.time() * 1000),
+            )
 
         def _write_session_summary(self, messages: Any) -> None:
             """Compress the session transcript and write it as a single
@@ -824,7 +1108,10 @@ def _build_provider_class():
                 thread.join(timeout=5.0)
             with self._pending_lock:
                 self._pending_used_ids.clear()
+            with self._reflection_lock:
+                self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
+            _maybe_auto_compact(self._store)
 
     return LanceDBProMemoryProvider
 

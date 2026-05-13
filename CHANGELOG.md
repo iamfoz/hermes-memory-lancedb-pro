@@ -7,6 +7,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.0] — 2026-05-20
+
+### Added
+- **Background embedding-model warmup** — `LanceDBProMemoryProvider.initialize()` warms the embedding model in a daemon thread, so the 10-30 s cold-start cost lands during session boot instead of the user's first turn. No caller action required (previously the README asked users to call `warmup()` themselves).
+- **Automatic memory compaction** — the provider runs cooldown-gated compaction at session end, clustering and merging near-duplicate old memories. `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS` (default 168 = weekly; 0 disables). Runs per-scope so a merge never spans scopes. Previously `run_compaction()` was never invoked by the agent integration.
+- **Admission control enabled by default** — the smart extractor is now built with an AMAC-v1 `AdmissionController`. `MEMORY_ADMISSION_PRESET` selects `balanced` (default) / `conservative` / `high-recall` / `off`. Previously the extractor always ran without an admission gate.
+- **Reflection layer wired into the agent lifecycle** — at session end the provider generates a structured reflection (durable *invariants* + short-lived *derived* insights) via the extractor's LLM and persists it; on recall, ranked reflection slices are prepended to the memory-context block. `MEMORY_REFLECTION` (default on), `MEMORY_REFLECTION_SCAN_LIMIT`, `MEMORY_REFLECTION_AGENT_ID`. Previously the reflection subsystem was completely unwired — nothing wrote or read reflections.
+- `build_reflection_prompt()` in `extraction_prompts`; `SmartExtractor.llm` property exposing the configured client.
+- `initialize()` accepts an `agent_id` kwarg for multi-agent reflection ownership.
+
+### Fixed
+- Install instructions corrected to `hermes-pip` — a plain `pip install` lands the package outside Hermes' Python environment, so the discovery shim's `import` fails silently and the plugin never loads.
+- `MemoryStoreReflectionAdapter` was missing from `hermes_memory_lancedb_pro.reflection`'s exports despite the README documenting it as importable — added to the package `__all__`.
+
+---
+
 ## [0.10.0] — 2026-05-19
 
 ### Added
@@ -166,6 +182,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hermes-memory-smoke` end-to-end smoke test CLI.
 - LangSearch cross-encoder reranker (`LANGSEARCH_API_KEY`).
 
+[0.11.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.9.0...v0.9.3

@@ -24,9 +24,11 @@ PLUGIN_NAME = "lancedb_pro"
 PLUGIN_SHIM_CONTENT = '''\
 """Hermes plugin discovery shim for hermes-memory-lancedb-pro.
 
-The heavy package (lancedb, sentence-transformers, ...) is installed via
-pip and lives in site-packages; this shim only re-exports `register` so
-hermes-agent's plugin loader can discover the plugin.
+The heavy package (lancedb, sentence-transformers, ...) must be installed
+into Hermes' own Python environment with `hermes-pip install
+hermes-memory-lancedb-pro`; this shim only re-exports `register` so
+hermes-agent's plugin loader can discover it. If the import below fails,
+the package landed in the wrong environment — reinstall with hermes-pip.
 
 Regenerate with: hermes-memory install-plugin
 """
