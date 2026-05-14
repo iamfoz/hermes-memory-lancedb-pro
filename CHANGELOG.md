@@ -9,6 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.11.5] — 2026-05-20
 
+### Removed
+- `hermes-memory` console script alias removed. It looked like a generic
+  system-level command and shadowed unrelated tools. Use
+  `hermes-memory-lancedb-pro` instead. If you have a stale system install
+  run `pip uninstall hermes-memory-lancedb-pro` and reinstall via hermes-pip.
+
 ### Fixed
 - `plugin.yaml` now declares `kind: memory` so `PluginManager` routes the
   plugin to the memory manager instead of the generic standalone loader.
