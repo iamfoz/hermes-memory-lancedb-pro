@@ -37,6 +37,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from .decay import is_noise as _is_noise
 from .memory_compactor import (
     CompactionConfig,
     record_compaction_run,
@@ -805,6 +806,13 @@ def _build_provider_class():
             configured, or as a fail-safe if the extractor orchestrator
             itself raises (per-candidate failures don't reach here).
 
+            Only user-side content is stored, and only after passing the noise
+            filter. Assistant responses are deliberately excluded: they are
+            verbose, agent-side text that creates a feedback loop when recalled
+            (e.g. an early greeting gets injected back later, causing the agent
+            to re-greet). The smart_extractor path handles both sides properly
+            by extracting facts rather than storing raw turns.
+
             ``_store_override`` lets the sync_turn daemon thread pass the
             store it captured at dispatch time, preventing a concurrent
             initialize() from redirecting writes to the wrong database."""
@@ -814,9 +822,10 @@ def _build_provider_class():
                 if session_id else {"source": "agent_turn"}
             )
             try:
-                if user_content and user_content.strip():
+                text = (user_content or "").strip()
+                if text and not _is_noise(text):
                     store.store(
-                        text=user_content.strip(),
+                        text=text,
                         category="other",
                         scope="agent",
                         importance=0.4,
@@ -824,18 +833,6 @@ def _build_provider_class():
                     )
             except Exception as e:
                 logger.warning("lancedb_pro sync_turn user write failed: %s", e)
-
-            try:
-                if assistant_content and assistant_content.strip():
-                    store.store(
-                        text=assistant_content.strip(),
-                        category="other",
-                        scope="agent",
-                        importance=0.4,
-                        metadata_extra={**metadata_extra, "role": "assistant"},
-                    )
-            except Exception as e:
-                logger.warning("lancedb_pro sync_turn assistant write failed: %s", e)
 
         # ---- Lifecycle ----------------------------------------------------
 
