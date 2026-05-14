@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.3] — 2026-05-20
+
+### Fixed
+- `get_config_schema()` trimmed from 11 fields to 3 (the LLM extraction
+  key, base URL, and model). Per spec guidance, only fields the user must
+  actively configure belong in the setup wizard; the remaining 8 tuning
+  knobs (`MEMORY_PREFETCH_LIMIT`, `MEMORY_ADMISSION_PRESET`, etc.) are
+  documented in the README and set via environment variables directly.
+- `handle_tool_call(name, args)` stub added — the ABC may define it
+  abstractly even for providers with no tools; the no-op prevents potential
+  instantiation failure on strict ABC implementations.
+- Module docstring corrected: plugin path was still showing the old
+  `~/.hermes/plugins/lancedb_pro/`; now shows the correct
+  `~/.hermes/plugins/memory/lancedb_pro/`.
+
+---
+
 ## [0.11.2] — 2026-05-20
 
 ### Changed
@@ -213,6 +230,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hermes-memory-smoke` end-to-end smoke test CLI.
 - LangSearch cross-encoder reranker (`LANGSEARCH_API_KEY`).
 
+[0.11.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.10.0...v0.11.0

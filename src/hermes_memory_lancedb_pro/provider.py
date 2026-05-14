@@ -1,14 +1,15 @@
 """Hermes Agent MemoryProvider adapter.
 
 Wraps `MemoryStore` + `MemoryRetriever` in the `agent.memory_provider.MemoryProvider`
-ABC so hermes-agent can drop this plugin into `~/.hermes/plugins/lancedb_pro/`
-and have it be discoverable, with proper session scoping wired through.
+ABC so hermes-agent can drop this plugin into
+`~/.hermes/plugins/memory/lancedb_pro/` and have it be discoverable, with
+proper session scoping wired through.
 
 This module imports `agent.memory_provider` lazily — the rest of the package
 remains usable as a standalone library, and tests / non-Hermes consumers
 don't need hermes-agent installed.
 
-USAGE (in your `~/.hermes/plugins/lancedb_pro/__init__.py`):
+USAGE (in your `~/.hermes/plugins/memory/lancedb_pro/__init__.py`):
 
     from hermes_memory_lancedb_pro.provider import register
 
@@ -535,83 +536,50 @@ def _build_provider_class():
         def get_tool_schemas(self) -> list[dict[str, Any]]:
             return []  # context-only provider; no tool calls
 
+        def handle_tool_call(self, name: str, args: dict[str, Any]) -> Any:
+            return None  # no tools registered; should never be called
+
         def get_config_schema(self) -> list[dict[str, Any]]:
-            """Declare env-var configuration for `hermes memory setup`."""
+            """Declare configuration for `hermes memory setup`.
+
+            Kept minimal per spec guidance — only fields the user must
+            configure are prompted here. Advanced tuning knobs
+            (MEMORY_PREFETCH_LIMIT, MEMORY_ADMISSION_PRESET, etc.) are
+            documented in the README and set via environment variables
+            directly.
+            """
             return [
                 {
                     "key": "extraction_api_key",
                     "env_var": "MEMORY_EXTRACTION_API_KEY",
-                    "description": "API key for LLM-driven memory extraction (optional)",
+                    "description": (
+                        "API key for LLM-driven memory extraction (optional). "
+                        "Without this, the provider stores raw turns; with it, "
+                        "a 6-category smart extractor runs on every turn. "
+                        "Accepts OpenAI-compatible keys or ANTHROPIC_API_KEY."
+                    ),
                     "secret": True,
                     "required": False,
                 },
                 {
                     "key": "extraction_base_url",
                     "env_var": "MEMORY_EXTRACTION_BASE_URL",
-                    "description": "Base URL for LLM extraction endpoint (optional)",
+                    "description": (
+                        "Base URL for a custom or self-hosted LLM extraction "
+                        "endpoint (optional, e.g. http://localhost:11434/v1). "
+                        "Leave blank to use the default OpenAI / Anthropic endpoint."
+                    ),
                     "secret": False,
                     "required": False,
                 },
                 {
                     "key": "extraction_model",
                     "env_var": "MEMORY_EXTRACTION_MODEL",
-                    "description": "Model name for LLM extraction (optional)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "prefetch_limit",
-                    "env_var": "MEMORY_PREFETCH_LIMIT",
-                    "description": "Max memories injected per turn (default: 5)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "auto_purge_cooldown_hours",
-                    "env_var": "MEMORY_AUTO_PURGE_COOLDOWN_HOURS",
-                    "description": "Hours between automatic archive purges (default: 24; 0 = off)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "purge_grace_days",
-                    "env_var": "MEMORY_PURGE_GRACE_DAYS",
-                    "description": "Min age in days before archived rows are deleted (default: 30)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "session_summary_max_chars",
-                    "env_var": "MEMORY_SESSION_SUMMARY_MAX_CHARS",
-                    "description": "Char budget for session-summary memories (default: 4000; 0 = off)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "admission_preset",
-                    "env_var": "MEMORY_ADMISSION_PRESET",
-                    "description": "Admission gate: balanced / conservative / high-recall / off (default: balanced)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "reflection",
-                    "env_var": "MEMORY_REFLECTION",
-                    "description": "Capture & replay session reflections: on / off (default: on)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "auto_compact_cooldown_hours",
-                    "env_var": "MEMORY_AUTO_COMPACT_COOLDOWN_HOURS",
-                    "description": "Hours between automatic memory compaction runs (default: 168; 0 = off)",
-                    "secret": False,
-                    "required": False,
-                },
-                {
-                    "key": "extraction_rate_limit",
-                    "env_var": "MEMORY_EXTRACTION_RATE_LIMIT",
-                    "description": "Max LLM extraction calls per hour; falls back to raw writes when hit (default: 0 = unlimited)",
+                    "description": (
+                        "Model name for LLM extraction, e.g. gpt-4o-mini or "
+                        "claude-haiku-4-5-20251001 (optional). Defaults to the "
+                        "provider's own default when blank."
+                    ),
                     "secret": False,
                     "required": False,
                 },
