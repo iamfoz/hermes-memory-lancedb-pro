@@ -22,6 +22,9 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the stale archived one. Callers that explicitly want the archived row can
   pass `follow_chain=False`. A depth limit of 32 guards against malformed
   chains.
+- Development branch renamed from `claude/restructure-repo-branches-BiSQH`
+  to `fix/0.11.5` to remove tooling-generated names from the public
+  branch list.
 
 ---
 
