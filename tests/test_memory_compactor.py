@@ -344,6 +344,6 @@ class TestRunCompaction:
             ),
         )
         # The archived row should not be in the cluster pool — verify by
-        # checking we can still get_by_id the archived row (it's still
-        # present, just hidden from compaction)
-        assert store.get_by_id(a)["metadata"]["state"] == "archived"
+        # checking we can still retrieve the archived row directly (it's still
+        # present, just hidden from compaction and from chain-following).
+        assert store.get_by_id(a, follow_chain=False)["metadata"]["state"] == "archived"

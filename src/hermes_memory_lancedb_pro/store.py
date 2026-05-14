@@ -881,17 +881,34 @@ class MemoryStore:
 
     # ----- CRUD: read -----
 
-    def get_by_id(self, mem_id: str) -> dict[str, Any] | None:
-        """Retrieve a memory by ID (regardless of archive state)."""
-        results = (
-            self._table.search()
-            .where(f"id = '{_escape_sql(mem_id)}'")
-            .limit(1)
-            .to_list()
-        )
-        if not results:
-            return None
-        return self._row_to_dict(results[0])
+    def get_by_id(self, mem_id: str, *, follow_chain: bool = True) -> dict[str, Any] | None:
+        """Retrieve a memory by ID (regardless of archive state).
+
+        If *follow_chain* is True (the default) and the requested row is
+        archived with a ``superseded_by`` pointer, the method follows that
+        chain until it reaches the current live version, guarding against
+        cycles with a depth limit of 32.
+        """
+        seen: set[str] = set()
+        current_id = mem_id
+        while True:
+            results = (
+                self._table.search()
+                .where(f"id = '{_escape_sql(current_id)}'")
+                .limit(1)
+                .to_list()
+            )
+            if not results:
+                return None
+            row = self._row_to_dict(results[0])
+            if not follow_chain:
+                return row
+            meta = row.get("metadata") or {}
+            next_id: str | None = meta.get("superseded_by") if meta.get("state") == ARCHIVED_STATE else None
+            if not next_id or next_id in seen or len(seen) >= 32:
+                return row
+            seen.add(current_id)
+            current_id = next_id
 
     def has_id(self, mem_id: str) -> bool:
         """True if the ID exists and is not archived. Used for BM25 ghost

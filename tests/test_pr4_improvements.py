@@ -241,8 +241,8 @@ class TestSupersedeRelations:
         a = store.store(text="initial memory content here for supersede test")
         store.update(a, text="superseded by this new content for supersede test")
 
-        # Find the new (active) row via the supersede chain
-        archived = store.get_by_id(a)
+        # Read the archived row directly (chain-following would jump to the new row)
+        archived = store.get_by_id(a, follow_chain=False)
         assert archived["metadata"]["state"] == "archived"
         new_id = archived["metadata"]["superseded_by"]
         new_row = store.get_by_id(new_id)
@@ -258,7 +258,7 @@ class TestSupersedeRelations:
         a = store.store(text="another initial memory content for supersede test")
         store.update(a, text="this is the superseding entry text content")
 
-        archived = store.get_by_id(a)
+        archived = store.get_by_id(a, follow_chain=False)
         new_id = archived["metadata"]["superseded_by"]
         relations = archived["metadata"].get("relations", [])
         assert any(
