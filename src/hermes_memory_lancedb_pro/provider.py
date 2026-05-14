@@ -625,7 +625,13 @@ def _build_provider_class():
             `before_prompt_build`. Runs a session-scoped recall, caches
             the returned ids in `_pending_used_ids[session_id]` so we
             can credit them later, prepends the reflection block, and
-            returns the combined text."""
+            returns the combined text.
+
+            Relevance-based recall can miss earlier task framing when the
+            current query is semantically distant (e.g. "check slot 7"
+            doesn't match "stress test my memory"). To keep context
+            continuity, the two most-recently-written session memories are
+            injected as anchors, deduplicated against the relevance results."""
             if not query or not query.strip():
                 return ""
             try:
@@ -639,6 +645,20 @@ def _build_provider_class():
             except Exception as e:
                 logger.warning("lancedb_pro recall failed: %s", e)
                 results = []
+
+            # Recency anchors — always append the 2 most recently written
+            # memories for this session so task framing never silently drops
+            # out of the injected context window.
+            if session_id:
+                try:
+                    existing_ids = {r.get("id") for r in results}
+                    anchors = [
+                        m for m in self._store.recent_for_session(session_id, limit=2)
+                        if m.get("id") not in existing_ids
+                    ]
+                    results = results + anchors
+                except Exception as e:
+                    logger.debug("lancedb_pro recency anchor lookup failed: %s", e)
 
             if results and session_id:
                 with self._pending_lock:
