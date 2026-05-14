@@ -103,8 +103,8 @@ class TestCrud:
         assert new_id != mid
         # Original is now archived
         assert store.has_id(mid) is False
-        # Can still fetch the archived row by id (audit)
-        archived = store.get_by_id(mid)
+        # Can still fetch the archived row by id (audit) using follow_chain=False
+        archived = store.get_by_id(mid, follow_chain=False)
         assert archived["metadata"]["state"] == "archived"
         assert archived["metadata"]["superseded_by"] == new_id
         new_row = store.get_by_id(new_id)

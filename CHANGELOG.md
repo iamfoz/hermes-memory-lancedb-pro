@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.5] — 2026-05-20
+
+### Fixed
+- `plugin.yaml` now declares `kind: memory` so `PluginManager` routes the
+  plugin to the memory manager instead of the generic standalone loader.
+  Without this field the loader called `ctx.register()` on a context that
+  lacked `register_memory_provider()`, crashing with an `AttributeError`.
+- `_resolve_hermes_home()` default corrected from `~/.hermes` to
+  `~/.hermes/hermes-agent/` to match the actual hermes-agent installation
+  layout; `--hermes-home` help strings updated accordingly.
+- `MemoryStore.get_by_id()` now follows the `superseded_by` chain when the
+  requested row is archived, returning the current live version instead of
+  the stale archived one. Callers that explicitly want the archived row can
+  pass `follow_chain=False`. A depth limit of 32 guards against malformed
+  chains.
+
+---
+
 ## [0.11.4] — 2026-05-20
 
 ### Fixed
