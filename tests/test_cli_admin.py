@@ -1,8 +1,8 @@
-"""Tests for the hermes-memory multi-command CLI (export / import / doctor).
+"""Tests for the hermes-memory-lancedb-pro CLI and register_cli plugin commands.
 
 Integration tests use a temporary LanceDB store with StubEmbedder (same
 pattern as test_store_integration.py).  Plain unit tests patch sys.argv and
-call main() directly so they don't require LanceDB.
+call main() / register_cli() directly so they don't require LanceDB.
 """
 
 from __future__ import annotations
@@ -20,7 +20,13 @@ import pytest
 lancedb = pytest.importorskip("lancedb")
 pytest.importorskip("lancedb.pydantic")
 
-from hermes_memory_lancedb_pro._cli import _cmd_doctor, _cmd_export, _cmd_import, main
+from hermes_memory_lancedb_pro._cli import (
+    _cmd_doctor,
+    _cmd_export,
+    _cmd_import,
+    main,
+    register_cli,
+)
 from hermes_memory_lancedb_pro.store import VECTOR_DIM, MemoryStore
 
 pytestmark = pytest.mark.integration
@@ -308,23 +314,52 @@ class TestDoctor:
 
 
 # ---------------------------------------------------------------------------
-# TestCli  (argv-level tests; no LanceDB needed for --help)
+# TestCli  (argv-level tests for hermes-memory-lancedb-pro bootstrap CLI)
 # ---------------------------------------------------------------------------
 
 
 class TestCli:
-    def test_export_help_exits_zero(self, monkeypatch):
-        """hermes-memory export --help exits 0."""
-        monkeypatch.setattr(sys, "argv", ["hermes-memory", "export", "--help"])
+    def test_top_level_help_lists_bootstrap_commands(self, monkeypatch, capsys):
+        """hermes-memory-lancedb-pro --help lists install-plugin and uninstall-plugin."""
+        monkeypatch.setattr(sys, "argv", ["hermes-memory-lancedb-pro", "--help"])
         with pytest.raises(SystemExit) as exc_info:
             main()
         assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        help_text = captured.out
+        assert "install-plugin" in help_text
+        assert "uninstall-plugin" in help_text
 
-    def test_top_level_help_lists_subcommands(self, monkeypatch, capsys):
-        """hermes-memory --help lists all 3 subcommands."""
-        monkeypatch.setattr(sys, "argv", ["hermes-memory", "--help"])
+    def test_no_args_exits_zero(self, monkeypatch, capsys):
+        """hermes-memory-lancedb-pro with no args prints help and exits 0."""
+        monkeypatch.setattr(sys, "argv", ["hermes-memory-lancedb-pro"])
+        rc = main()
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert len(captured.out) > 0  # some help text
+
+    def test_unknown_subcommand_exits_nonzero(self, monkeypatch):
+        """hermes-memory-lancedb-pro bogus-cmd exits non-zero."""
+        monkeypatch.setattr(sys, "argv", ["hermes-memory-lancedb-pro", "bogus-cmd"])
         with pytest.raises(SystemExit) as exc_info:
             main()
+        assert exc_info.value.code != 0
+
+
+# ---------------------------------------------------------------------------
+# TestRegisterCli  (plugin CLI slot wired by hermes-agent)
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterCli:
+    def test_register_cli_adds_export_import_doctor(self, capsys):
+        """register_cli wires export, import, doctor onto the given subparser."""
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb-pro")
+        register_cli(parser)
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["--help"])
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         help_text = captured.out
@@ -332,17 +367,12 @@ class TestCli:
         assert "import" in help_text
         assert "doctor" in help_text
 
-    def test_no_args_exits_zero(self, monkeypatch, capsys):
-        """hermes-memory with no args prints help and exits 0."""
-        monkeypatch.setattr(sys, "argv", ["hermes-memory"])
-        rc = main()
-        assert rc == 0
-        captured = capsys.readouterr()
-        assert len(captured.out) > 0  # some help text
+    def test_export_help_via_register_cli(self, capsys):
+        """hermes lancedb-pro export --help exits 0."""
+        import argparse
 
-    def test_unknown_subcommand_exits_nonzero(self, monkeypatch):
-        """hermes-memory bogus-cmd exits non-zero."""
-        monkeypatch.setattr(sys, "argv", ["hermes-memory", "bogus-cmd"])
+        parser = argparse.ArgumentParser(prog="hermes lancedb-pro")
+        register_cli(parser)
         with pytest.raises(SystemExit) as exc_info:
-            main()
-        assert exc_info.value.code != 0
+            parser.parse_args(["export", "--help"])
+        assert exc_info.value.code == 0

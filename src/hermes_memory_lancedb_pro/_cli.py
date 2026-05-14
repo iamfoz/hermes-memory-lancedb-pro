@@ -37,6 +37,19 @@ from hermes_memory_lancedb_pro.provider import register
 __all__ = ["register"]
 '''
 
+PLUGIN_CLI_CONTENT = '''\
+"""Hermes plugin CLI shim for hermes-memory-lancedb-pro.
+
+Exposes register_cli() so hermes-agent can wire the lancedb-pro
+subcommands (export, import, doctor) into `hermes lancedb-pro`.
+
+Regenerate with: hermes-memory install-plugin
+"""
+from hermes_memory_lancedb_pro._cli import register_cli
+
+__all__ = ["register_cli"]
+'''
+
 SMOKE_PREFIX = "SMOKE_TEST_"
 
 
@@ -437,6 +450,71 @@ def _cmd_doctor(
 
 
 # ---------------------------------------------------------------------------
+# Plugin CLI — register_cli() wires hermes lancedb-pro <subcommand>
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
+    cmd = getattr(args, "lancedb_pro_command", None)
+    if cmd is None:
+        return 0
+    return {"export": _cmd_export, "import": _cmd_import, "doctor": _cmd_doctor}[cmd](args)
+
+
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    """Register hermes lancedb-pro subcommands with the hermes CLI.
+
+    hermes-agent calls this with the ArgumentParser for the provider's
+    top-level slot so commands appear as `hermes lancedb-pro <subcommand>`.
+    """
+    subs = subparser.add_subparsers(dest="lancedb_pro_command")
+
+    p_export = subs.add_parser(
+        "export",
+        help="Export memories to JSONL",
+        description="Stream memory rows to JSONL (one JSON object per line).",
+    )
+    p_export.add_argument("--out", "-o", default="-", metavar="PATH",
+                          help="Output file path (default: stdout)")
+    p_export.add_argument("--include-archived", action="store_true",
+                          help="Include archived rows (excluded by default)")
+    p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
+                          help="Maximum rows to export (default: 100000)")
+    p_export.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_export.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential stderr output")
+
+    p_import = subs.add_parser(
+        "import",
+        help="Import memories from JSONL",
+        description="Read a JSONL file produced by 'export' and write rows into the store.",
+    )
+    p_import.add_argument("--in", dest="input", default="-", metavar="PATH",
+                          help="Input file path (default: stdin)")
+    p_import.add_argument("--reembed", action="store_true",
+                          help="Re-encode text with the current embedder instead of stored vectors")
+    p_import.add_argument("--allow-existing", action="store_true",
+                          help="Skip rows whose id already exists rather than aborting")
+    p_import.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_import.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential stderr output")
+
+    p_doctor = subs.add_parser(
+        "doctor",
+        help="Print a diagnostic report",
+        description="Scan the store and report counts, anomalies, and recommendations.",
+    )
+    p_doctor.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_doctor.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential stderr output")
+
+    subparser.set_defaults(func=_dispatch_plugin_cli)
+
+
+# ---------------------------------------------------------------------------
 # install-plugin / uninstall-plugin
 # ---------------------------------------------------------------------------
 
@@ -457,11 +535,12 @@ def _packaged_plugin_yaml() -> Path:
 
 
 def _cmd_install_plugin(args: argparse.Namespace) -> int:
-    """Create ``<hermes_home>/plugins/memory/lancedb_pro/`` with the discovery shim
-    and a copy of plugin.yaml so hermes-agent can find this provider."""
+    """Create ``<hermes_home>/plugins/memory/lancedb_pro/`` with the discovery shim,
+    cli.py, and a copy of plugin.yaml so hermes-agent can find this provider."""
     hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
     plugin_dir = hermes_home / "plugins" / "memory" / PLUGIN_NAME
     init_path = plugin_dir / "__init__.py"
+    cli_path = plugin_dir / "cli.py"
     yaml_target = plugin_dir / "plugin.yaml"
     yaml_source = _packaged_plugin_yaml()
 
@@ -469,19 +548,20 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
         _stderr(f"plugin.yaml missing from installed package at {yaml_source}", quiet=False)
         return 1
 
-    existing_files = [p for p in (init_path, yaml_target) if p.exists()]
+    existing_files = [p for p in (init_path, cli_path, yaml_target) if p.exists()]
     force = bool(getattr(args, "force", False))
     if existing_files and not force:
         _stderr(
             f"Plugin already installed at {plugin_dir}\n"
             f"Pass --force to overwrite, or remove with:\n"
-            f"    hermes-memory uninstall-plugin",
+            f"    hermes-memory-lancedb-pro uninstall-plugin",
             quiet=False,
         )
         return 1
 
     plugin_dir.mkdir(parents=True, exist_ok=True)
     init_path.write_text(PLUGIN_SHIM_CONTENT, encoding="utf-8")
+    cli_path.write_text(PLUGIN_CLI_CONTENT, encoding="utf-8")
     shutil.copyfile(yaml_source, yaml_target)
 
     quiet = bool(getattr(args, "quiet", False))
@@ -490,6 +570,7 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
         sys.stdout.write(
             f"{action} {PLUGIN_NAME} plugin at {plugin_dir}\n"
             f"  - {init_path.name} (discovery shim)\n"
+            f"  - {cli_path.name} (plugin CLI shim)\n"
             f"  - {yaml_target.name} (manifest)\n"
             f"Next: configure with `hermes memory setup` or set the\n"
             f"MEMORY_EXTRACTION_* env vars manually. See README for details.\n"
@@ -510,7 +591,7 @@ def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
             sys.stdout.write(f"{PLUGIN_NAME} plugin not installed at {plugin_dir}\n")
         return 0
 
-    managed = {"__init__.py", "plugin.yaml"}
+    managed = {"__init__.py", "cli.py", "plugin.yaml"}
     removed: list[str] = []
     for name in managed:
         target = plugin_dir / name
@@ -544,97 +625,30 @@ def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    """Entry point for the ``hermes-memory`` multi-command CLI."""
+    """Entry point for the ``hermes-memory`` bootstrap CLI.
+
+    Handles plugin lifecycle only (install / uninstall).  Memory admin
+    commands (export, import, doctor) are available after installation via
+    ``hermes lancedb-pro <subcommand>``.
+    """
     parser = argparse.ArgumentParser(
-        prog="hermes-memory",
-        description="Hermes memory admin CLI — export, import, and diagnose the LanceDB store.",
-    )
-    parser.add_argument(
-        "--path",
-        default=None,
-        metavar="PATH",
-        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Suppress non-essential stderr output",
+        prog="hermes-memory-lancedb-pro",
+        description=(
+            "Hermes lancedb-pro bootstrap CLI — install and remove the lancedb_pro plugin.\n"
+            "After installation, use: hermes lancedb-pro export|import|doctor"
+        ),
     )
 
     subparsers = parser.add_subparsers(dest="subcommand", title="subcommands")
 
-    # ---- export ----
-    p_export = subparsers.add_parser(
-        "export",
-        help="Export memories to JSONL",
-        description="Stream memory rows to JSONL (one JSON object per line).",
-    )
-    p_export.add_argument(
-        "--out",
-        "-o",
-        default="-",
-        metavar="PATH",
-        help="Output file path (default: stdout)",
-    )
-    p_export.add_argument(
-        "--include-archived",
-        action="store_true",
-        help="Include archived rows (excluded by default)",
-    )
-    p_export.add_argument(
-        "--limit",
-        type=int,
-        default=100_000,
-        metavar="N",
-        help="Maximum rows to export (default: 100000)",
-    )
-    p_export.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
-    p_export.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-
-    # ---- import ----
-    p_import = subparsers.add_parser(
-        "import",
-        help="Import memories from JSONL",
-        description="Read a JSONL file produced by 'export' and write rows into the store.",
-    )
-    p_import.add_argument(
-        "--in",
-        dest="input",
-        default="-",
-        metavar="PATH",
-        help="Input file path (default: stdin)",
-    )
-    p_import.add_argument(
-        "--reembed",
-        action="store_true",
-        help="Re-encode text with the current embedder instead of using stored vectors",
-    )
-    p_import.add_argument(
-        "--allow-existing",
-        action="store_true",
-        help="Skip rows whose id already exists rather than aborting",
-    )
-    p_import.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
-    p_import.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-
-    # ---- doctor ----
-    p_doctor = subparsers.add_parser(
-        "doctor",
-        help="Print a diagnostic report",
-        description="Scan the store and report counts, anomalies, and recommendations.",
-    )
-    p_doctor.add_argument("--path", default=argparse.SUPPRESS, metavar="PATH", help=argparse.SUPPRESS)
-    p_doctor.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-
     # ---- install-plugin ----
     p_install = subparsers.add_parser(
         "install-plugin",
-        help="Install the Hermes discovery shim",
+        help="Install the Hermes plugin shim",
         description=(
-            "Create <hermes_home>/plugins/lancedb_pro/ with the discovery "
-            "__init__.py and a copy of plugin.yaml so hermes-agent can find "
-            "this provider."
+            "Create <hermes_home>/plugins/memory/lancedb_pro/ with the discovery "
+            "__init__.py, cli.py, and a copy of plugin.yaml so hermes-agent can "
+            "find this provider."
         ),
     )
     p_install.add_argument(
@@ -646,18 +660,19 @@ def main() -> int:
     p_install.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite an existing shim",
+        help="Overwrite an existing installation",
     )
-    p_install.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_install.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
+                           help=argparse.SUPPRESS)
 
     # ---- uninstall-plugin ----
     p_uninstall = subparsers.add_parser(
         "uninstall-plugin",
-        help="Remove the Hermes discovery shim",
+        help="Remove the Hermes plugin shim",
         description=(
-            "Remove <hermes_home>/plugins/lancedb_pro/. Only files this "
-            "command installed (__init__.py, plugin.yaml) are removed; the "
-            "dir is left in place if it contains anything else."
+            "Remove <hermes_home>/plugins/memory/lancedb_pro/. Only files this "
+            "command installed (__init__.py, cli.py, plugin.yaml) are removed; "
+            "the dir is left in place if it contains anything else."
         ),
     )
     p_uninstall.add_argument(
@@ -666,7 +681,8 @@ def main() -> int:
         metavar="PATH",
         help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes)",
     )
-    p_uninstall.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_uninstall.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
+                             help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -674,14 +690,7 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    # Subparser --path / --quiet use argparse.SUPPRESS so they only land in
-    # the namespace when the user explicitly provides them; absent that the
-    # top-level value is preserved. Nothing further to merge here.
-
     dispatch = {
-        "export": _cmd_export,
-        "import": _cmd_import,
-        "doctor": _cmd_doctor,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }

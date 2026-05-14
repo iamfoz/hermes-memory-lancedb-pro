@@ -7,12 +7,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.2] — 2026-05-20
+
+### Changed
+- Bootstrap CLI renamed from `hermes-memory` to `hermes-memory-lancedb-pro` to
+  make it clear the command is provider-specific, not a generic Hermes memory CLI.
+- `export`, `import`, and `doctor` subcommands moved out of `hermes-memory-lancedb-pro`
+  and into the Hermes plugin CLI slot as `hermes lancedb-pro export|import|doctor`,
+  following the plugin CLI spec (`register_cli(subparser)` in `cli.py`).
+
+### Added
+- `register_cli(subparser)` in `_cli.py` — hermes-agent calls this to wire
+  `hermes lancedb-pro` subcommands into the main CLI once the plugin is active.
+- `PLUGIN_CLI_CONTENT` shim (`cli.py`) written to the plugin directory by
+  `install-plugin` so hermes-agent can discover and load `register_cli`.
+
+### Fixed
+- `install-plugin` and `uninstall-plugin` now manage `cli.py` alongside
+  `__init__.py` and `plugin.yaml`.
+
+---
+
 ## [0.11.1] — 2026-05-20
 
 ### Fixed
-- `plugin.yaml` was missing `configurable: true` and the `env_vars` section,
-  causing the plugin to be invisible in `hermes memory setup`. Added both,
-  keeping the definitions in sync with `get_config_schema()`.
+- Plugin directory corrected from `plugins/lancedb_pro/` to
+  `plugins/memory/lancedb_pro/` per the Hermes memory plugin spec; the old path
+  caused `hermes memory setup` to not discover the provider.
 - `plugin.yaml` version field was stale at `0.9.4`; now tracks the package version.
 
 ---
@@ -192,6 +213,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hermes-memory-smoke` end-to-end smoke test CLI.
 - LangSearch cross-encoder reranker (`LANGSEARCH_API_KEY`).
 
+[0.11.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.11.2
+[0.11.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.9.3...v0.9.4
