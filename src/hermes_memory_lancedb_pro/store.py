@@ -1002,6 +1002,36 @@ class MemoryStore:
             rows = [r for r in rows if _match_session(r["metadata"], session_id)]
         return rows[offset : offset + limit]
 
+    def recent_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
+        """Return the *limit* most recently written non-archived memories for
+        *session_id*, ordered newest-first by timestamp.
+
+        Used by the recall path to anchor context: the most recently written
+        memory is always injected alongside relevance-ranked results so the
+        agent never loses sight of the latest instruction even when the current
+        query is semantically distant from earlier task framing."""
+        if not session_id:
+            return []
+        try:
+            rows = (
+                self._table.search()
+                .where(f"timestamp > 0")
+                .limit(MAX_SCAN_ROWS)
+                .to_list()
+            )
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            d = self._row_to_dict(r)
+            if d["metadata"].get("state") == ARCHIVED_STATE:
+                continue
+            if not _match_session(d["metadata"], session_id):
+                continue
+            out.append(d)
+        out.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return out[:limit]
+
     def search(
         self,
         query_text: str,
