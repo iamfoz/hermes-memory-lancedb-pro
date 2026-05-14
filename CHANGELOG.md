@@ -16,6 +16,13 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run `pip uninstall hermes-memory-lancedb-pro` and reinstall via hermes-pip.
 
 ### Fixed
+- `_raw_sync_turn` (fallback write path when no smart_extractor is configured)
+  no longer stores raw assistant responses. These are verbose, agent-side text
+  that created a feedback loop: an early greeting ("Hello! Ready to help…")
+  would be stored, survive the retrieval-time noise filter, get re-injected
+  after context compression, and cause the agent to re-greet as if the
+  conversation had just started. Only user-side content is now stored, and
+  only after passing the same `is_noise` check applied at retrieval time.
 - `plugin.yaml` now declares `kind: memory` so `PluginManager` routes the
   plugin to the memory manager instead of the generic standalone loader.
   Without this field the loader called `ctx.register()` on a context that
