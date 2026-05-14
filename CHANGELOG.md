@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.4] — 2026-05-20
+
+### Fixed
+- `hermes-memory` console script re-added as an alias for
+  `hermes-memory-lancedb-pro` so both names work after install; the old
+  binary is no longer orphaned when upgrading from 0.11.2.
+- `install-plugin` auto-migrates the old `plugins/lancedb_pro/` directory
+  to the correct `plugins/memory/lancedb_pro/` on first run, so users
+  upgrading from pre-0.11.1 don't need to manually move the directory.
+- `uninstall-plugin` also removes the old `plugins/lancedb_pro/` directory
+  when found, as part of the same migration cleanup.
+- Stale remote branches (`claude/restructure-repo-branches-BiSQH`,
+  `feat/spec-compliance`) that contained old commit messages with AI
+  session URLs were overwritten to point to clean main history.
+
+---
+
 ## [0.11.3] — 2026-05-20
 
 ### Fixed
@@ -230,6 +247,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hermes-memory-smoke` end-to-end smoke test CLI.
 - LangSearch cross-encoder reranker (`LANGSEARCH_API_KEY`).
 
+[0.11.4]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.0...v0.11.1

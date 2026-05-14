@@ -536,17 +536,47 @@ def _packaged_plugin_yaml() -> Path:
 
 def _cmd_install_plugin(args: argparse.Namespace) -> int:
     """Create ``<hermes_home>/plugins/memory/lancedb_pro/`` with the discovery shim,
-    cli.py, and a copy of plugin.yaml so hermes-agent can find this provider."""
+    cli.py, and a copy of plugin.yaml so hermes-agent can find this provider.
+
+    Also auto-migrates from the old pre-0.11.1 path
+    ``<hermes_home>/plugins/lancedb_pro/`` when found."""
     hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
     plugin_dir = hermes_home / "plugins" / "memory" / PLUGIN_NAME
     init_path = plugin_dir / "__init__.py"
     cli_path = plugin_dir / "cli.py"
     yaml_target = plugin_dir / "plugin.yaml"
     yaml_source = _packaged_plugin_yaml()
+    quiet = bool(getattr(args, "quiet", False))
 
     if not yaml_source.exists():
         _stderr(f"plugin.yaml missing from installed package at {yaml_source}", quiet=False)
         return 1
+
+    # --- Auto-migrate old path (plugins/lancedb_pro/ → plugins/memory/lancedb_pro/) ---
+    old_plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    if old_plugin_dir.exists() and not plugin_dir.exists():
+        if not quiet:
+            sys.stdout.write(
+                f"Migrating plugin from old path:\n"
+                f"  {old_plugin_dir} → {plugin_dir}\n"
+            )
+        try:
+            plugin_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(str(old_plugin_dir), str(plugin_dir))
+            shutil.rmtree(str(old_plugin_dir), ignore_errors=True)
+            if not quiet:
+                sys.stdout.write("  Migration complete. Updating files to latest version.\n")
+        except Exception as e:
+            _stderr(
+                f"Migration failed ({e}); installing fresh to {plugin_dir}.",
+                quiet=False,
+            )
+    elif old_plugin_dir.exists():
+        if not quiet:
+            sys.stdout.write(
+                f"Note: old plugin directory found at {old_plugin_dir}\n"
+                f"  Run `rm -rf {old_plugin_dir}` to clean it up.\n"
+            )
 
     existing_files = [p for p in (init_path, cli_path, yaml_target) if p.exists()]
     force = bool(getattr(args, "force", False))
@@ -564,7 +594,6 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
     cli_path.write_text(PLUGIN_CLI_CONTENT, encoding="utf-8")
     shutil.copyfile(yaml_source, yaml_target)
 
-    quiet = bool(getattr(args, "quiet", False))
     if not quiet:
         action = "Reinstalled" if existing_files else "Installed"
         sys.stdout.write(
@@ -572,19 +601,32 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
             f"  - {init_path.name} (discovery shim)\n"
             f"  - {cli_path.name} (plugin CLI shim)\n"
             f"  - {yaml_target.name} (manifest)\n"
-            f"Next: configure with `hermes memory setup` or set the\n"
-            f"MEMORY_EXTRACTION_* env vars manually. See README for details.\n"
+            f"Next: restart the Hermes gateway, then `hermes memory setup`\n"
+            f"to configure the LLM extraction key (optional).\n"
         )
     return 0
 
 
 def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
     """Remove ``<hermes_home>/plugins/memory/lancedb_pro/``. Only deletes files we
-    install (``__init__.py``, ``plugin.yaml``) and then the dir if empty —
-    refuses to delete a dir containing unknown files."""
+    install (``__init__.py``, ``cli.py``, ``plugin.yaml``) and then the dir if empty
+    — refuses to delete a dir containing unknown files.
+
+    Also removes the old pre-0.11.1 path ``<hermes_home>/plugins/lancedb_pro/``
+    when found."""
     hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
     plugin_dir = hermes_home / "plugins" / "memory" / PLUGIN_NAME
     quiet = bool(getattr(args, "quiet", False))
+
+    # Remove old path if it still exists (migration cleanup)
+    old_plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    if old_plugin_dir.exists():
+        try:
+            shutil.rmtree(str(old_plugin_dir))
+            if not quiet:
+                sys.stdout.write(f"Removed old plugin directory {old_plugin_dir}\n")
+        except Exception as e:
+            _stderr(f"Could not remove old plugin dir {old_plugin_dir}: {e}", quiet=False)
 
     if not plugin_dir.exists():
         if not quiet:
