@@ -457,10 +457,10 @@ def _packaged_plugin_yaml() -> Path:
 
 
 def _cmd_install_plugin(args: argparse.Namespace) -> int:
-    """Create ``<hermes_home>/plugins/lancedb_pro/`` with the discovery shim
+    """Create ``<hermes_home>/plugins/memory/lancedb_pro/`` with the discovery shim
     and a copy of plugin.yaml so hermes-agent can find this provider."""
     hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
-    plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    plugin_dir = hermes_home / "plugins" / "memory" / PLUGIN_NAME
     init_path = plugin_dir / "__init__.py"
     yaml_target = plugin_dir / "plugin.yaml"
     yaml_source = _packaged_plugin_yaml()
@@ -498,11 +498,11 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
 
 
 def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
-    """Remove ``<hermes_home>/plugins/lancedb_pro/``. Only deletes files we
+    """Remove ``<hermes_home>/plugins/memory/lancedb_pro/``. Only deletes files we
     install (``__init__.py``, ``plugin.yaml``) and then the dir if empty —
     refuses to delete a dir containing unknown files."""
     hermes_home = _resolve_hermes_home(getattr(args, "hermes_home", None))
-    plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    plugin_dir = hermes_home / "plugins" / "memory" / PLUGIN_NAME
     quiet = bool(getattr(args, "quiet", False))
 
     if not plugin_dir.exists():
