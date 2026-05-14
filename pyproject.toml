@@ -42,7 +42,6 @@ google = [
 [project.scripts]
 hermes-memory-smoke = "hermes_memory_lancedb_pro._cli:smoke_main"
 hermes-memory-lancedb-pro = "hermes_memory_lancedb_pro._cli:main"
-hermes-memory = "hermes_memory_lancedb_pro._cli:main"
 
 # Plugin entry point — hermes-agent versions that support entry-point
 # discovery (via importlib.metadata) can find the provider without a shim.
