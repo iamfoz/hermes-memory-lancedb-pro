@@ -678,3 +678,54 @@ class TestNormaliseContext:
         """Every key in _CONTEXT_ALIASES should be reachable."""
         for cjk_key, expected in _CONTEXT_ALIASES.items():
             assert _normalise_context(cjk_key) == expected
+
+
+# ---------------------------------------------------------------------------
+# TestEntitiesTypedField
+# ---------------------------------------------------------------------------
+
+class TestEntitiesTypedField:
+    def test_parse_entities_produces_typed_list(self):
+        raw = json.dumps({"entities": ["Alice", "Bob"]})
+        m = parse_smart_metadata(raw, {})
+        assert m.entities == ["Alice", "Bob"]
+
+    def test_parse_entities_not_in_extras(self):
+        raw = json.dumps({"entities": ["Alice"]})
+        m = parse_smart_metadata(raw, {})
+        assert "entities" not in m.extras
+
+    def test_parse_entities_empty_when_missing(self):
+        m = parse_smart_metadata(json.dumps({}), {})
+        assert m.entities == []
+
+    def test_parse_entities_filters_non_strings(self):
+        raw = json.dumps({"entities": ["Alice", 42, None, "Bob"]})
+        m = parse_smart_metadata(raw, {})
+        assert m.entities == ["Alice", "Bob"]
+
+    def test_stringify_emits_entities(self):
+        m = SmartMemoryMetadata(entities=["Alice", "Bob"])
+        d = json.loads(stringify_smart_metadata(m))
+        assert d["entities"] == ["Alice", "Bob"]
+
+    def test_stringify_omits_entities_when_empty(self):
+        m = SmartMemoryMetadata()
+        d = json.loads(stringify_smart_metadata(m))
+        assert "entities" not in d
+
+    def test_build_merges_entities_union(self):
+        base_entry = {"metadata": json.dumps({"entities": ["Alice", "Bob"]})}
+        merged = build_smart_metadata(base_entry, {"entities": ["Bob", "Charlie"]})
+        assert set(merged.entities) == {"Alice", "Bob", "Charlie"}
+
+    def test_build_preserves_base_entities_when_patch_has_none(self):
+        base_entry = {"metadata": json.dumps({"entities": ["Alice"]})}
+        merged = build_smart_metadata(base_entry, {"confidence": 0.9})
+        assert merged.entities == ["Alice"]
+
+    def test_roundtrip_entities_survive_stringify_parse(self):
+        m = SmartMemoryMetadata(entities=["Eve", "Mallory"])
+        serialized = stringify_smart_metadata(m)
+        restored = parse_smart_metadata(serialized, {})
+        assert restored.entities == ["Eve", "Mallory"]

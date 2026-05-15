@@ -7,6 +7,36 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.10] — 2026-05-20
+
+### Added
+- **`freshness_trend` in recall block** — `_format_recall` now appends a `[forming]` /
+  `[strengthening]` / `[weakening]` tag to each recalled memory when the evidence-weighted
+  trend is not "stable".  The agent sees at a glance which memories are contested or newly
+  forming and can weight them accordingly.
+- **`entities` typed field in `SmartMemoryMetadata`** — LLM-extracted entity names are now
+  a first-class field (`entities: list[str]`) rather than landing in the opaque `extras`
+  blob.  `parse_smart_metadata` validates and strips non-strings; `stringify_smart_metadata`
+  emits the field when non-empty; `build_smart_metadata` unions base + patch entities so
+  previously tagged names survive subsequent updates.
+- **Entity-overlap boost in retriever** — `MemoryRetriever.retrieve` now calls
+  `_apply_entity_boost` (step 2.5) immediately after vector-dominant fusion.  Any fused
+  result whose stored entity list contains a term that appears verbatim in the query
+  receives a multiplicative score boost (×1.2 per match, capped at ×1.6 for 3+ matches)
+  before the scoring pipeline applies decay weights.  Solves the case where an entity name
+  lives only in metadata rather than in the memory text.
+
+### Tests
+- `TestEntitiesTypedField` (9 tests): parse, extras isolation, filter non-strings, stringify
+  emit/omit, build union merge, base-preserve, roundtrip.
+- `TestFormatRecallFreshnessTrend` (5 tests): weakening/forming/strengthening present,
+  stable omitted, no-decay no tag.
+- `TestEntityOverlapBoost` (8 tests): single match boosts, no-match unchanged, missing
+  entities key unchanged, multi > single, 3-match cap, case-insensitive, `_entity_matches`
+  field set, empty list.
+
+---
+
 ## [0.11.9] — 2026-05-20
 
 ### Added / Changed — prompted by Hindsight (vectorize.io) best-practices review

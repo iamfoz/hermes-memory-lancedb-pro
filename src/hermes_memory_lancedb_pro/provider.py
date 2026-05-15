@@ -421,7 +421,9 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
             (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
             0.0,
         )
-        lines.append(f"- [{cat}] {text} (score={score:.2f})")
+        trend = (r.get("_decay") or {}).get("freshness_trend", "")
+        trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
+        lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
     return "\n".join(lines) if lines else ""
 
 
