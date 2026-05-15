@@ -448,3 +448,36 @@ class TestSessionAnchors:
         assert "task framing" in block.lower() or "stress-test" in block.lower(), (
             "task framing memory from turn 1 must be in recall even after 5 turns"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestFormatRecallFreshnessTrend
+# ---------------------------------------------------------------------------
+
+class TestFormatRecallFreshnessTrend:
+    def _make_result(self, text: str, trend: str | None = None) -> dict:
+        r: dict = {"text": text, "category": "facts", "_final_score": 0.75}
+        if trend is not None:
+            r["_decay"] = {"freshness_trend": trend}
+        return r
+
+    def test_weakening_trend_appears_in_output(self):
+        out = provider._format_recall([self._make_result("Alice prefers Python", "weakening")])
+        assert "[weakening]" in out
+
+    def test_forming_trend_appears_in_output(self):
+        out = provider._format_recall([self._make_result("Alice prefers Python", "forming")])
+        assert "[forming]" in out
+
+    def test_strengthening_trend_appears_in_output(self):
+        out = provider._format_recall([self._make_result("Alice prefers Python", "strengthening")])
+        assert "[strengthening]" in out
+
+    def test_stable_trend_omitted_from_output(self):
+        out = provider._format_recall([self._make_result("Alice prefers Python", "stable")])
+        assert "[stable]" not in out
+        assert "score=" in out
+
+    def test_no_decay_no_trend_tag(self):
+        out = provider._format_recall([self._make_result("Alice prefers Python")])
+        assert "[" not in out.split("(")[1]  # no tag after score bracket

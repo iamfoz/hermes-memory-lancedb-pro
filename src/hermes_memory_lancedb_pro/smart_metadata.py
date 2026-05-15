@@ -133,6 +133,7 @@ class SmartMemoryMetadata:
     cross_session: bool = False
     source: str = "manual"
     source_session: str = ""
+    entities: list[str] = field(default_factory=list)    # named entities extracted by LLM
     # Free-form passthrough for any extra fields the TS doesn't enumerate
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -396,8 +397,16 @@ def parse_smart_metadata(
         "bad_recall_count", "valid_from", "valid_until", "invalidated_at",
         "fact_key", "supersedes", "superseded_by", "relations",
         "support_info", "cross_session", "source", "source_session",
+        "entities",
     }
     extras: dict[str, Any] = {k: v for k, v in parsed.items() if k not in _typed_keys}
+
+    raw_entities = parsed.get("entities")
+    entities: list[str] = (
+        [str(e).strip() for e in raw_entities if isinstance(e, str) and str(e).strip()]
+        if isinstance(raw_entities, list)
+        else []
+    )
 
     return SmartMemoryMetadata(
         l0_abstract=l0,
@@ -424,6 +433,7 @@ def parse_smart_metadata(
             if isinstance(parsed.get("source_session"), str)
             else ""
         ),
+        entities=entities,
         extras=extras,
     )
 
@@ -517,6 +527,7 @@ def build_smart_metadata(
         "bad_recall_count", "valid_from", "valid_until", "invalidated_at",
         "fact_key", "supersedes", "superseded_by", "relations",
         "support_info", "cross_session", "source", "source_session",
+        "entities",
     }
     merged_extras = dict(base.extras)
     for k, v in patch.items():
@@ -526,6 +537,16 @@ def build_smart_metadata(
     # parse / stringify cycle preserves them.
     merged_extras["state"] = next_state
     merged_extras["memory_layer"] = next_layer
+
+    # Entities: union of base + patch so previously extracted entities persist
+    if "entities" in patch:
+        raw_patch_ents = [
+            str(e).strip() for e in (patch.get("entities") or [])
+            if isinstance(e, str) and str(e).strip()
+        ]
+        merged_entities = list(dict.fromkeys(base.entities + raw_patch_ents))
+    else:
+        merged_entities = base.entities
 
     return SmartMemoryMetadata(
         l0_abstract=l0_abstract,
@@ -548,6 +569,7 @@ def build_smart_metadata(
         cross_session=bool(patch.get("cross_session", base.cross_session)),
         source=next_source,
         source_session=source_session,
+        entities=merged_entities,
         extras=merged_extras,
     )
 
@@ -608,6 +630,9 @@ def stringify_smart_metadata(metadata: SmartMemoryMetadata) -> str:
             "total_observations": si.total_observations,
             "slices": slices_out,
         }
+
+    if metadata.entities:
+        d["entities"] = metadata.entities
 
     # Passthrough extras (apply array caps to sources/history if present)
     for k, v in metadata.extras.items():

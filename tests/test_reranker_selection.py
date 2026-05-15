@@ -421,3 +421,62 @@ class TestGoogleRerankBackend:
 
         call_url = r._google_session.post.call_args[0][0]
         assert "correct-project-123" in call_url
+
+
+# ---------------------------------------------------------------------------
+# TestEntityOverlapBoost
+# ---------------------------------------------------------------------------
+
+class TestEntityOverlapBoost:
+    """Unit tests for MemoryRetriever._apply_entity_boost."""
+
+    def _entry(self, eid: str, score: float, entities: list[str] | None = None) -> dict:
+        meta: dict = {}
+        if entities is not None:
+            meta["entities"] = entities
+        return {"id": eid, "_fusion_score": score, "metadata": meta}
+
+    def test_matching_entity_boosts_score(self):
+        entries = [self._entry("1", 0.5, ["Alice"])]
+        result = MemoryRetriever._apply_entity_boost("What does Alice prefer?", entries)
+        assert result[0]["_fusion_score"] > 0.5
+
+    def test_no_matching_entity_unchanged(self):
+        entries = [self._entry("1", 0.5, ["Bob"])]
+        result = MemoryRetriever._apply_entity_boost("What does Alice prefer?", entries)
+        assert result[0]["_fusion_score"] == 0.5
+
+    def test_no_entities_key_unchanged(self):
+        entries = [self._entry("2", 0.4)]
+        result = MemoryRetriever._apply_entity_boost("Alice query", entries)
+        assert result[0]["_fusion_score"] == 0.4
+
+    def test_multiple_matches_higher_boost_than_single(self):
+        single = [self._entry("a", 0.5, ["Alice"])]
+        multi = [self._entry("b", 0.5, ["Alice", "Bob"])]
+        q = "Alice and Bob discussed this"
+        s_score = MemoryRetriever._apply_entity_boost(q, single)[0]["_fusion_score"]
+        m_score = MemoryRetriever._apply_entity_boost(q, multi)[0]["_fusion_score"]
+        assert m_score > s_score
+
+    def test_boost_capped_at_three_matches(self):
+        three = [self._entry("x", 0.5, ["A", "B", "C"])]
+        four = [self._entry("y", 0.5, ["A", "B", "C", "D"])]
+        q = "A B C D query"
+        s3 = MemoryRetriever._apply_entity_boost(q, three)[0]["_fusion_score"]
+        s4 = MemoryRetriever._apply_entity_boost(q, four)[0]["_fusion_score"]
+        # 4-match should hit the same cap as 3-match
+        assert abs(s3 - s4) < 1e-9
+
+    def test_case_insensitive_matching(self):
+        entries = [self._entry("1", 0.5, ["alice"])]
+        result = MemoryRetriever._apply_entity_boost("What does Alice prefer?", entries)
+        assert result[0]["_fusion_score"] > 0.5
+
+    def test_entity_matches_field_set_on_boost(self):
+        entries = [self._entry("1", 0.5, ["Alice", "Bob"])]
+        result = MemoryRetriever._apply_entity_boost("Alice and Bob", entries)
+        assert result[0].get("_entity_matches") == 2
+
+    def test_empty_entries_returns_empty(self):
+        assert MemoryRetriever._apply_entity_boost("query", []) == []

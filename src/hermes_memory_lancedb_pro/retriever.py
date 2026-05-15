@@ -199,6 +199,10 @@ class MemoryRetriever:
         if not fused:
             return []
 
+        # 2.5 Entity-overlap boost: promote memories whose stored entity list
+        # contains terms that appear verbatim in the query
+        fused = self._apply_entity_boost(query, fused)
+
         # 3. Scoring pipeline (length norm -> hardMinScore -> decay -> sort)
         scored = self.scoring.apply_scoring(fused, now_ms)
 
@@ -297,6 +301,42 @@ class MemoryRetriever:
         return ""
 
     # ----- helpers -----
+
+    @staticmethod
+    def _apply_entity_boost(
+        query: str,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Multiply fusion scores for entries whose stored entity names appear in the query.
+
+        Entities extracted at write time are stored in metadata["entities"].  When the
+        user query mentions one of those names verbatim (case-insensitive), the memory is
+        already semantically relevant but may have landed lower in the vector ranking
+        because the entity name occurs only in the metadata, not in the text.  The boost
+        surfaces it before the scoring pipeline applies decay weights.
+
+        Boost table: 1 match → ×1.2, 2 matches → ×1.4, 3+ matches → ×1.6 (capped).
+        """
+        if not entries:
+            return entries
+        query_lower = query.lower()
+        for entry in entries:
+            meta = entry.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            stored_entities = meta.get("entities")
+            if not isinstance(stored_entities, list):
+                continue
+            matches = sum(
+                1 for e in stored_entities
+                if isinstance(e, str) and e.strip().lower() in query_lower
+            )
+            if matches:
+                factor = 1.0 + 0.2 * min(matches, 3)
+                src = float(entry.get("_fusion_score", entry.get("_rrf_score", 0.0)))
+                entry["_fusion_score"] = src * factor
+                entry["_entity_matches"] = matches
+        return entries
 
     def _filter_bm25_ghosts(
         self,
