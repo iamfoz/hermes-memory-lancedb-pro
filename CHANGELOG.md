@@ -7,6 +7,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.12] — 2026-05-20
+
+### Fixed
+- **`register_cli` now injects into the existing subparsers group** — the previous
+  implementation called `parser.add_subparsers()` on the parser hermes-agent passes,
+  creating a *second* nested subparsers group. Argparse only dispatches through the
+  first group, so `hermes memory doctor` resolved as an invalid choice instead of
+  routing to the plugin. Fixed: `register_cli` now iterates `parser._actions` to find
+  the pre-existing `_SubParsersAction` (the one that already holds setup/status/off/reset)
+  and calls `add_parser()` on it directly, so our commands appear at the same level.
+- **`lancedb-reset` instead of `reset`** — the plugin was registering a `reset` command
+  that collided with hermes-agent's built-in `hermes memory reset`. Renamed to
+  `lancedb-reset` to avoid the conflict.
+- **Each subparser sets its own `func` default** — commands now set
+  `p_xxx.set_defaults(func=_cmd_xxx)` so hermes-agent's standard `args.func(args)`
+  dispatch pattern routes directly without going through an intermediate
+  `_dispatch_plugin_cli` wrapper.
+- **`PLUGIN_CLI_CONTENT` shim comment** corrected from `hermes lancedb-pro` to
+  `hermes memory`.
+
+### Tests
+- `TestRegisterCli` extended with 3 new cases: commands extend an existing subparsers
+  group (the real hermes-agent scenario), every command has a callable `args.func`
+  default, and `lancedb-reset` is registered without overwriting the built-in `reset`.
+
+---
+
 ## [0.11.11] — 2026-05-20
 
 ### Fixed
