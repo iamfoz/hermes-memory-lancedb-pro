@@ -7,6 +7,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.6] — 2026-05-20
+
+### Fixed
+- Cold-start write/read race: `prefetch` and `before_prompt_build` now call
+  `_flush_pending_write()` before querying, joining the previous `sync_turn`
+  background thread (1 s timeout). On a brand-new install the embedding model
+  takes 10–30 s to load on first use; without the flush the recall for the
+  first several turns returned empty because the turn-N write hadn't finished
+  before the turn-N+1 read. Task framing stored in turn 1 is now visible from
+  turn 2 onwards.
+- Recency anchors in `_do_recall`: the 2 most-recently-written session memories
+  are appended to relevance results (deduplicated). Relevance-only retrieval
+  misses earlier task framing when the current query is semantically distant
+  (e.g. "check slot 7" scores low against "stress test my memory"), causing the
+  agent to lose its goal after context compression.
+- `_raw_sync_turn` no longer stores raw assistant responses. They are verbose
+  agent-side text that created a feedback loop: an early greeting stored in the
+  fallback path would survive the retrieval-time noise filter, get re-injected
+  after context compression, and cause the agent to re-greet. Only user-side
+  content is now stored, and only after passing the `is_noise` check.
+
+---
+
 ## [0.11.5] — 2026-05-20
 
 ### Removed
@@ -16,24 +39,6 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run `pip uninstall hermes-memory-lancedb-pro` and reinstall via hermes-pip.
 
 ### Fixed
-- Cold-start write/read race fixed. `prefetch` and `before_prompt_build` now
-  call `_flush_pending_write()` before querying, which briefly joins the
-  previous `sync_turn` background thread (1 s timeout). On a brand-new
-  install the embedding model takes 10–30 s to load on first use; without
-  the flush, the recall for the first several turns returned empty because
-  the turn-N write hadn't finished before the turn-N+1 read. Task framing
-  stored in turn 1 is now visible from turn 2 onwards.
-- Recency anchors added to `_do_recall`: the 2 most-recently-written session
-  memories are appended to relevance results (deduplicated). This ensures
-  task framing (e.g. "stress test my memory") stays in the injected context
-  even when the current query is semantically distant from it.
-- `_raw_sync_turn` (fallback write path when no smart_extractor is configured)
-  no longer stores raw assistant responses. These are verbose, agent-side text
-  that created a feedback loop: an early greeting ("Hello! Ready to help…")
-  would be stored, survive the retrieval-time noise filter, get re-injected
-  after context compression, and cause the agent to re-greet as if the
-  conversation had just started. Only user-side content is now stored, and
-  only after passing the same `is_noise` check applied at retrieval time.
 - `plugin.yaml` now declares `kind: memory` so `PluginManager` routes the
   plugin to the memory manager instead of the generic standalone loader.
   Without this field the loader called `ctx.register()` on a context that
