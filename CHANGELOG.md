@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.8] — 2026-05-20
+
+### Fixed
+- Task-framing memories from the start of a session are now always injected
+  into recall via **first+recent session anchors**.  Previously only the 2
+  most-recently-written memories were anchored; after 3 subsequent turns the
+  task framing (e.g. "stress test my memory") was no longer in the anchor
+  window.  Relevance search alone cannot recover it when the current query is
+  semantically distant, so the agent appeared to "forget" its goal at turn 4.
+  `_do_recall` now combines the 2 oldest *and* 2 newest session memories as
+  anchors (deduplicated against each other and the relevance results).
+- Added `MemoryStore.first_for_session()` — same shape as `recent_for_session`
+  but returns oldest-first, giving callers direct access to session-start
+  entries.
+- `MemoryStore._load_embedder()` is now guarded by a threading lock (double-
+  checked locking pattern) to prevent two concurrent threads (warmup + first
+  sync_turn write) from each loading the embedding model independently.
+- `_flush_pending_write` default timeout increased from 1 s to 2 s to give
+  the previous turn's write a wider window to complete before recall runs.
+
+---
+
 ## [0.11.7] — 2026-05-20
 
 ### Fixed
