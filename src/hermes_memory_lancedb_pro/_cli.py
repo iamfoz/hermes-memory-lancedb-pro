@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -662,26 +663,231 @@ def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Init / reset commands (Python equivalents of memory_init.sh / memory_reset.sh)
+# ---------------------------------------------------------------------------
+
+
+def _parse_memory_md(path: str) -> list[dict]:
+    """Parse MEMORY.md into seeding entries.  Best-effort heuristic classification."""
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    sections = re.split(r"^§\s*$", content, flags=re.MULTILINE)
+    for raw_section in sections:
+        section = raw_section.strip()
+        if not section:
+            continue
+        if section.startswith("*This is the persistent") or section.startswith("---"):
+            continue
+        if section.startswith("User:") and "UK English" in section:
+            continue
+        for para in (p.strip() for p in section.split("\n\n")):
+            if len(para) < 20:
+                continue
+            tl = para.lower()
+            if any(k in tl for k in ("prefer", "always", "never", "formatting")):
+                category = "preference"
+            elif any(k in tl for k in ("decision", "chosen", "selected")):
+                category = "decision"
+            elif any(k in tl for k in ("deadline", "due", "date")):
+                category = "fact"
+            elif any(k in tl for k in ("project", "active", "cron", "system")):
+                category = "other"
+            else:
+                category = "fact"
+            entries.append({
+                "text": para,
+                "category": category,
+                "scope": "global",
+                "importance": 0.7,
+            })
+    return entries
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Initialise the memory store and optionally seed from MEMORY.md.
+
+    Equivalent to ``scripts/memory_init.sh`` but runs in-process.
+    """
+    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    memory_md = getattr(args, "memory_md", None) or os.path.expanduser(
+        os.environ.get("MEMORY_MD", "~/.hermes/memory/MEMORY.md")
+    )
+    quiet = bool(getattr(args, "quiet", False))
+
+    if not quiet:
+        print("=== LanceDB Memory Initialisation ===")
+        print(f"DB Path:  {db_path}")
+        print(f"Memory:   {memory_md}")
+
+    store = MemoryStore(db_path=db_path)
+    try:
+        store._initialise()
+        store.stats()
+        if not quiet:
+            print("  ✓ Connection established")
+    except Exception as e:
+        if not quiet:
+            print(f"  ⚠ DB corrupted ({e}) — auto-recovering...")
+        shutil.rmtree(db_path, ignore_errors=True)
+        store = MemoryStore(db_path=db_path)
+        store._initialise()
+        if not quiet:
+            print("  ✓ Recovered (fresh DB created)")
+
+    existing = store.list_memories(limit=1)
+    if existing:
+        total = store.stats().get("total_memories", 0)
+        if not quiet:
+            print(f"  ⚠ Database already has {total} entries")
+            print("  Skipping seed. Run `hermes-memory-lancedb-pro reset` to start fresh.")
+        return 0
+
+    if not os.path.exists(memory_md):
+        if not quiet:
+            print(f"  ℹ No seed file at {memory_md}")
+        return 0
+
+    entries = _parse_memory_md(memory_md)
+    if not entries:
+        if not quiet:
+            print("  ⚠ No entries found in MEMORY.md")
+        return 0
+
+    if not quiet:
+        print(f"  Seeding {len(entries)} entries from MEMORY.md...")
+    ids = store.store_many(entries)
+    if not quiet:
+        print(f"    {len(ids)}/{len(entries)} entries stored")
+
+    if store.maybe_create_vector_index():
+        if not quiet:
+            print("  ✓ Vector index created")
+    elif not quiet:
+        print(f"  ℹ Vector index pending (need 256+ rows, have {len(ids)})")
+
+    stats = store.stats()
+    if not quiet:
+        print(f"\n  ✓ Seeded {stats['total_memories']} memories")
+        print(f"  Categories: {stats['categories']}")
+        print("\n=== Memory system ready ===")
+    return 0
+
+
+def _cmd_reset(args: argparse.Namespace) -> int:
+    """Wipe the memory database and reinitialise from MEMORY.md.
+
+    Equivalent to ``scripts/memory_reset.sh`` but runs in-process.
+    """
+    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    quiet = bool(getattr(args, "quiet", False))
+
+    if not quiet:
+        print("=== LanceDB Memory Reset ===")
+
+    if os.path.isdir(db_path):
+        if not quiet:
+            print(f"  Wiping: {db_path}")
+        shutil.rmtree(db_path)
+        if not quiet:
+            print("  ✓ Database cleared")
+    elif not quiet:
+        print("  (No existing database found)")
+
+    return _cmd_init(args)
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
 
 def main() -> int:
-    """Entry point for the ``hermes-memory`` bootstrap CLI.
-
-    Handles plugin lifecycle only (install / uninstall).  Memory admin
-    commands (export, import, doctor) are available after installation via
-    ``hermes lancedb-pro <subcommand>``.
-    """
+    """Entry point for the ``hermes-memory-lancedb-pro`` CLI."""
     parser = argparse.ArgumentParser(
         prog="hermes-memory-lancedb-pro",
-        description=(
-            "Hermes lancedb-pro bootstrap CLI — install and remove the lancedb_pro plugin.\n"
-            "After installation, use: hermes lancedb-pro export|import|doctor"
-        ),
+        description="Hermes LanceDB memory CLI — manage the lancedb_pro plugin and memory store.",
     )
 
     subparsers = parser.add_subparsers(dest="subcommand", title="subcommands")
+
+    # ---- init ----
+    p_init = subparsers.add_parser(
+        "init",
+        help="Initialise the memory store (seed from MEMORY.md if empty)",
+        description=(
+            "Open or create the memory database and optionally seed entries from "
+            "MEMORY.md when the store is empty."
+        ),
+    )
+    p_init.add_argument("--path", default=None, metavar="PATH",
+                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_init.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress non-essential output")
+
+    # ---- reset ----
+    p_reset = subparsers.add_parser(
+        "reset",
+        help="Wipe the memory database and reinitialise from MEMORY.md",
+        description=(
+            "Delete the existing LanceDB database directory and run init, "
+            "seeding fresh entries from MEMORY.md."
+        ),
+    )
+    p_reset.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
+
+    # ---- doctor ----
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="Print a diagnostic report for the memory store",
+        description="Scan the store and report counts, anomalies, and recommendations.",
+    )
+    p_doctor.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_doctor.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+
+    # ---- export ----
+    p_export = subparsers.add_parser(
+        "export",
+        help="Export memories to JSONL",
+        description="Stream memory rows to JSONL (one JSON object per line).",
+    )
+    p_export.add_argument("--out", "-o", default="-", metavar="PATH",
+                          help="Output file path (default: stdout)")
+    p_export.add_argument("--include-archived", action="store_true",
+                          help="Include archived rows (excluded by default)")
+    p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
+                          help="Maximum rows to export (default: 100000)")
+    p_export.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_export.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+
+    # ---- import ----
+    p_import = subparsers.add_parser(
+        "import",
+        help="Import memories from JSONL",
+        description="Read a JSONL file produced by 'export' and write rows into the store.",
+    )
+    p_import.add_argument("--in", dest="input", default="-", metavar="PATH",
+                          help="Input file path (default: stdin)")
+    p_import.add_argument("--reembed", action="store_true",
+                          help="Re-encode text with the current embedder instead of stored vectors")
+    p_import.add_argument("--allow-existing", action="store_true",
+                          help="Skip rows whose id already exists rather than aborting")
+    p_import.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_import.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
 
     # ---- install-plugin ----
     p_install = subparsers.add_parser(
@@ -733,6 +939,11 @@ def main() -> int:
         return 0
 
     dispatch = {
+        "init": _cmd_init,
+        "reset": _cmd_reset,
+        "doctor": _cmd_doctor,
+        "export": _cmd_export,
+        "import": _cmd_import,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }

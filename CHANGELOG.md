@@ -7,6 +7,45 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.11] — 2026-05-20
+
+### Fixed
+- **Plugin path corrected everywhere** — `memory_init.sh` and its embedded Python
+  fallback both used the stale pre-0.11.1 path `~/.hermes/plugins/lancedb_pro`.
+  Corrected to `~/.hermes/hermes-agent/plugins/memory/lancedb_pro` matching what
+  `install-plugin` actually creates. `register()` docstring in `provider.py` updated.
+- **`compute_decay_score` falls back to top-level `timestamp`** — entries written
+  without `metadata.created_at` (e.g. by external tooling) silently defaulted to
+  `now_ms` for recency, making them look brand-new regardless of age. Fixed: when
+  `metadata.created_at` is absent, the top-level LanceDB `timestamp` column is used
+  instead. `metadata.created_at` still takes priority when present.
+- **Temporal classifier recognises `current` (adjective)** — "Current stock price",
+  "my current address" were classified as static because the pattern only matched
+  `\bcurrently\b`. Broadened to `\bcurrent(?:ly)?\b`.
+- **Greeting detector handles "Hi there" / "Hello there"** — the GREETING_PATTERNS
+  regex required the string to end immediately after the greeting word. "Hi there"
+  fell through to `short_statement` (0.4) instead of `greeting` (0.1). Added
+  optional `(\s+there)?` group.
+
+### Added
+- **`init`, `reset`, `doctor`, `export`, `import` subcommands in the standalone CLI** —
+  `hermes-memory-lancedb-pro` now exposes all admin commands directly:
+  - `init` — open/create the memory store and optionally seed from MEMORY.md
+  - `reset` — wipe the DB directory and re-run init
+  - `doctor` — diagnostic report (previously only via `hermes lancedb-pro doctor`)
+  - `export` — JSONL export
+  - `import` — JSONL import
+  The shell scripts `memory_init.sh` / `memory_reset.sh` remain for environments
+  without the package installed, but the Python implementations are now canonical.
+
+### Tests
+- `TestCreatedAtFallback` (2 tests): ancient top-level timestamp produces low recency;
+  `metadata.created_at` takes priority over top-level timestamp.
+- `TestCurrentPattern` (3 tests): "current" adjective, "currently", compound phrase.
+- `TestGreetingHiThere` (3 tests): "Hi there", "Hello there!", "Hi" alone.
+
+---
+
 ## [0.11.10] — 2026-05-20
 
 ### Added

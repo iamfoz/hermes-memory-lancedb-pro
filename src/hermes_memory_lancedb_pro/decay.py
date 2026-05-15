@@ -203,7 +203,13 @@ def compute_decay_score(
     )
     confidence = float(metadata.get("confidence", 0.8) or 0.8)
     access_count = int(metadata.get("access_count", 0) or 0)
-    created_at = int(metadata.get("created_at", now_ms) or now_ms)
+    # created_at: prefer metadata field (explicit write time), then fall back
+    # to the top-level LanceDB schema timestamp column so entries written
+    # without a metadata.created_at still age correctly.
+    _created_at_raw = metadata.get("created_at")
+    if _created_at_raw is None and not is_metadata_only:
+        _created_at_raw = entry.get("timestamp")
+    created_at = int(_created_at_raw if _created_at_raw is not None else now_ms)
     last_accessed_at = int(metadata.get("last_accessed_at", created_at) or created_at)
     temporal_type = metadata.get("temporal_type", "static")
 
