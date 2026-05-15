@@ -42,7 +42,7 @@ PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
 Exposes register_cli() so hermes-agent can wire the lancedb_pro commands
-(doctor, export, import, reset) into `hermes lancedb_pro`.
+(init, doctor, export, import, reset) into `hermes lancedb_pro`.
 
 Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
@@ -461,6 +461,7 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
     if cmd is None:
         return 0
     return {
+        "init": _cmd_init,
         "export": _cmd_export,
         "import": _cmd_import,
         "doctor": _cmd_doctor,
@@ -475,13 +476,30 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     and calls this with a **fresh** ArgumentParser for the provider's own
     namespace.  Commands appear as:
 
-        hermes lancedb_pro doctor|export|import|reset
+        hermes lancedb_pro init|doctor|export|import|reset
 
     Follows the hermes memory plugin CLI spec exactly:
     ``add_subparsers`` on the fresh parser + ``set_defaults(func=dispatcher)``
     at the top level for ``args.func(args)`` dispatch.
     """
     subs = subparser.add_subparsers(dest="lancedb_pro_command")
+
+    p_init = subs.add_parser(
+        "init",
+        help="Initialise the memory store (seed from MEMORY.md if empty)",
+        description=(
+            "Open or create the memory database and optionally seed entries from "
+            "MEMORY.md when the store is empty."
+        ),
+    )
+    p_init.add_argument("--path", default=None, metavar="PATH",
+                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_init.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompt")
+    p_init.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress non-essential output")
 
     p_doctor = subs.add_parser(
         "doctor",
@@ -537,6 +555,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                          help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-y", "--yes", action="store_true",
+                         help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
 
@@ -744,6 +764,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
     )
     quiet = bool(getattr(args, "quiet", False))
 
+    if not getattr(args, "yes", False):
+        print(f"This will initialise the memory store at: {db_path}")
+        answer = input('Type "yes" to proceed: ').strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return 1
+
     if not quiet:
         print("=== LanceDB Memory Initialisation ===")
         print(f"DB Path:  {db_path}")
@@ -811,6 +838,13 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
     quiet = bool(getattr(args, "quiet", False))
 
+    if not getattr(args, "yes", False):
+        print(f"This will WIPE ALL MEMORIES at: {db_path}")
+        answer = input('Type "yes" to proceed: ').strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return 1
+
     if not quiet:
         print("=== LanceDB Memory Reset ===")
 
@@ -853,6 +887,8 @@ def main() -> int:
                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_init.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompt")
     p_init.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress non-essential output")
 
@@ -869,6 +905,8 @@ def main() -> int:
                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                          help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-y", "--yes", action="store_true",
+                         help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
 
