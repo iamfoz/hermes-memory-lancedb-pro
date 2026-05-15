@@ -389,8 +389,8 @@ class TestRegisterCli:
         parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
         register_cli(parser)
 
-        # All four commands parse correctly in the provider's own namespace
-        for cmd in ("doctor", "export", "import", "reset"):
+        # All five commands parse correctly in the provider's own namespace
+        for cmd in ("init", "doctor", "export", "import", "reset"):
             args = parser.parse_args([cmd])
             assert getattr(args, "lancedb_pro_command", None) == cmd, (
                 f"'{cmd}' should be a valid lancedb_pro_command"

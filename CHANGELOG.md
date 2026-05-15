@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.14] — 2026-05-20
+
+### Added
+- **`init` command in `register_cli`** — `hermes lancedb_pro init` was missing from
+  the plugin CLI namespace despite being available in the standalone CLI. Added
+  `p_init` subparser block and `"init": _cmd_init` to `_dispatch_plugin_cli`.
+- **Confirmation gate for `init` and `reset`** — both commands now prompt
+  `Type "yes" to proceed:` before making any changes to the database. Pass `-y` /
+  `--yes` to skip the prompt for scripted or automated use. The `--yes` flag is
+  added to the parsers in both `register_cli` (plugin CLI) and `main()` (standalone
+  CLI).
+
+### Tests
+- `test_register_cli_uses_own_subparsers_group` extended to include `"init"` in
+  the commands-parse check.
+
+---
+
 ## [0.11.13] — 2026-05-20
 
 ### Fixed
