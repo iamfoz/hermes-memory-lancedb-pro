@@ -41,8 +41,8 @@ __all__ = ["register"]
 PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
-Exposes register_cli() so hermes-agent can wire the lancedb-pro commands
-(doctor, export, import, lancedb-reset) into `hermes memory`.
+Exposes register_cli() so hermes-agent can wire the lancedb_pro commands
+(doctor, export, import, reset) into `hermes lancedb_pro`.
 
 Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
@@ -451,50 +451,51 @@ def _cmd_doctor(
 
 
 # ---------------------------------------------------------------------------
-# Plugin CLI — register_cli() injects commands into hermes memory
+# Plugin CLI — register_cli() wires hermes lancedb_pro <subcommand>
 # ---------------------------------------------------------------------------
 
 
-def register_cli(parser: argparse.ArgumentParser) -> None:
-    """Register lancedb-pro commands into the ``hermes memory`` CLI.
+def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
+    """Dispatch hermes lancedb_pro <subcommand> to the correct handler."""
+    cmd = getattr(args, "lancedb_pro_command", None)
+    if cmd is None:
+        return 0
+    return {
+        "export": _cmd_export,
+        "import": _cmd_import,
+        "doctor": _cmd_doctor,
+        "reset": _cmd_reset,
+    }.get(cmd, lambda _: 0)(args)
 
-    hermes-agent calls this with the ArgumentParser for ``hermes memory``.
-    We find the existing ``_SubParsersAction`` (which already holds setup /
-    status / off / reset) and add our commands directly to it, so they
-    appear as ``hermes memory doctor|export|import|lancedb-reset``.
 
-    Each subparser sets its own ``func`` default so hermes-agent's standard
-    ``args.func(args)`` dispatch pattern routes directly to the right handler.
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    """Register lancedb-pro subcommands with the hermes-agent CLI.
 
-    ``lancedb-reset`` is used instead of ``reset`` to avoid collision with
-    hermes-agent's built-in ``hermes memory reset`` command.
+    hermes-agent discovers ``cli.py`` via ``discover_plugin_cli_commands()``
+    and calls this with a **fresh** ArgumentParser for the provider's own
+    namespace.  Commands appear as:
+
+        hermes lancedb_pro doctor|export|import|reset
+
+    Follows the hermes memory plugin CLI spec exactly:
+    ``add_subparsers`` on the fresh parser + ``set_defaults(func=dispatcher)``
+    at the top level for ``args.func(args)`` dispatch.
     """
-    # Locate the existing subparsers action — hermes-agent already registered
-    # setup / status / off / reset on it.  Adding a *new* subparsers group
-    # (via parser.add_subparsers()) would create a nested group that argparse
-    # ignores during dispatch, which is why commands appeared invalid.
-    subs: argparse._SubParsersAction | None = None
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            subs = action
-            break
-    if subs is None:
-        subs = parser.add_subparsers(dest="memory_command")
+    subs = subparser.add_subparsers(dest="lancedb_pro_command")
 
     p_doctor = subs.add_parser(
         "doctor",
-        help="Print a diagnostic report for the LanceDB memory store",
+        help="Print a diagnostic report for the memory store",
         description="Scan the store and report counts, anomalies, and recommendations.",
     )
     p_doctor.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_doctor.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
-    p_doctor.set_defaults(func=_cmd_doctor)
 
     p_export = subs.add_parser(
         "export",
-        help="Export LanceDB memories to JSONL",
+        help="Export memories to JSONL",
         description="Stream memory rows to JSONL (one JSON object per line).",
     )
     p_export.add_argument("--out", "-o", default="-", metavar="PATH",
@@ -507,11 +508,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
-    p_export.set_defaults(func=_cmd_export)
 
     p_import = subs.add_parser(
         "import",
-        help="Import LanceDB memories from JSONL",
+        help="Import memories from JSONL",
         description="Read a JSONL file produced by 'export' and write rows into the store.",
     )
     p_import.add_argument("--in", dest="input", default="-", metavar="PATH",
@@ -524,25 +524,23 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_import.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
-    p_import.set_defaults(func=_cmd_import)
 
-    # Named lancedb-reset (not reset) to avoid collision with the built-in
-    # hermes memory reset command.
-    p_lreset = subs.add_parser(
-        "lancedb-reset",
+    p_reset = subs.add_parser(
+        "reset",
         help="Wipe and reinitialise the LanceDB memory database",
         description=(
             "Delete the LanceDB database directory and re-run init, "
             "seeding fresh entries from MEMORY.md."
         ),
     )
-    p_lreset.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
-    p_lreset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
-                          help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
-    p_lreset.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential output")
-    p_lreset.set_defaults(func=_cmd_reset)
+    p_reset.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
+
+    subparser.set_defaults(func=_dispatch_plugin_cli)
 
 
 # ---------------------------------------------------------------------------

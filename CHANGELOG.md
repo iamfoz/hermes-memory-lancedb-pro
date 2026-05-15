@@ -7,6 +7,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.13] — 2026-05-20
+
+### Fixed
+- **`register_cli` rewritten to match hermes memory plugin spec exactly** — the
+  0.11.12 implementation incorrectly tried to inject commands into the *existing*
+  `hermes memory` subparsers group by scanning `parser._actions`. The spec says
+  hermes-agent passes a **fresh** ArgumentParser for the provider's own namespace
+  (`hermes lancedb_pro`) and `register_cli` should call `add_subparsers()` on it
+  directly. Commands now appear at `hermes lancedb_pro doctor|export|import|reset`.
+  The top-level `subparser.set_defaults(func=_dispatch_plugin_cli)` pattern from
+  the spec is restored.
+- **`reset` renamed back from `lancedb-reset`** — "lancedb-reset" was needed to
+  avoid collision with `hermes memory reset`. In the provider's own namespace
+  (`hermes lancedb_pro`), there is no such collision, so the simpler name is correct.
+- **`PLUGIN_CLI_CONTENT` shim** comment corrected to `hermes lancedb_pro`.
+
+### Tests
+- `TestRegisterCli` refreshed: removed the two tests that verified the incorrect
+  injection behaviour; replaced with `test_register_cli_uses_own_subparsers_group`
+  (commands parse under `lancedb_pro_command` dest), `test_register_cli_top_level_func_for_dispatch`
+  (spec pattern: func on parent parser), and `test_register_cli_reset_is_reset_not_lancedb_reset`.
+
+---
+
 ## [0.11.12] — 2026-05-20
 
 ### Fixed
