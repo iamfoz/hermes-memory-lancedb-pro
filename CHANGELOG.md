@@ -7,6 +7,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.7] — 2026-05-20
+
+### Fixed
+- `on_memory_write` now implements `edit` and `delete` actions and supports
+  `replace_all=True` bulk mutation.  Previously both actions were stubs that
+  logged a warning and returned, leaving the LanceDB store out of sync with
+  hermes-agent's built-in memory after any `/memory edit` or `/memory delete`
+  command.
+- `edit`: BM25-searches for memories whose text contains the `target` string,
+  then supersedes each match with `content` (the new text).  Without
+  `replace_all=True` only the single best match is updated; with it every
+  matching entry is superseded.
+- `delete`: same BM25 lookup, then soft-archives each match (marks
+  `state=archived`) so the rows are hidden from future recalls but preserved
+  in the audit trail.
+- `replace_all` key is no longer forwarded into the stored metadata on `add`
+  writes (it was a no-op scalar that polluted the metadata blob).
+
+---
+
 ## [0.11.6] — 2026-05-20
 
 ### Fixed
