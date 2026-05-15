@@ -1329,10 +1329,10 @@ def register(ctx: Any) -> None:
     """Plugin entry point per the Hermes memory-provider plugin spec.
 
     Called by hermes-agent's plugin discovery when it loads
-    ``~/.hermes/plugins/lancedb_pro/``. Registers a configured
+    ``~/.hermes/hermes-agent/plugins/memory/lancedb_pro/``. Registers a configured
     LanceDBProMemoryProvider with the host context.
 
-    A `~/.hermes/plugins/lancedb_pro/__init__.py` shim needs only:
+    A `~/.hermes/hermes-agent/plugins/memory/lancedb_pro/__init__.py` shim needs only:
 
         from hermes_memory_lancedb_pro.provider import register
 

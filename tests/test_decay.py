@@ -4,6 +4,8 @@ These run pure-Python — no LanceDB or sentence-transformers required."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hermes_memory_lancedb_pro.decay import (
@@ -297,3 +299,49 @@ class TestTemporalQueryIntent:
             if result is not None:
                 ts_min, ts_max = result
                 assert ts_min <= ts_max, f"range inverted for {query!r}"
+
+
+# ---------------------------------------------------------------------------
+# TestCreatedAtFallback — top-level timestamp fallback
+# ---------------------------------------------------------------------------
+
+class TestCreatedAtFallback:
+    """compute_decay_score must use entry["timestamp"] when metadata.created_at is absent."""
+
+    def test_ancient_timestamp_produces_low_recency(self):
+        ten_years_ms = 10 * 365 * 24 * 3600 * 1000
+        old_ts = int(time.time() * 1000) - ten_years_ms
+        entry = {
+            "text": "old memory",
+            "importance": 0.7,
+            "timestamp": old_ts,       # top-level column, no metadata.created_at
+            "metadata": {
+                "tier": "working",
+                "confidence": 0.8,
+                "access_count": 0,
+                # no created_at here
+            },
+        }
+        result = compute_decay_score(entry)
+        assert result["recency"] < 0.05, (
+            f"10-year-old memory should have near-zero recency; got {result['recency']}"
+        )
+
+    def test_metadata_created_at_takes_priority_over_timestamp(self):
+        ten_years_ms = 10 * 365 * 24 * 3600 * 1000
+        now_ms = int(time.time() * 1000)
+        entry = {
+            "text": "recent memory with old top-level timestamp",
+            "importance": 0.7,
+            "timestamp": now_ms - ten_years_ms,   # old
+            "metadata": {
+                "tier": "working",
+                "confidence": 0.8,
+                "access_count": 0,
+                "created_at": now_ms - 1000,       # recent — should win
+            },
+        }
+        result = compute_decay_score(entry)
+        assert result["recency"] > 0.99, (
+            "metadata.created_at should take priority over top-level timestamp"
+        )

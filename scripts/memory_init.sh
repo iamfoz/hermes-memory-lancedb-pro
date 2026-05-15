@@ -26,7 +26,7 @@ fi
 
 MEMORY_MD="${MEMORY_MD:-$HOME/.hermes/memory/MEMORY.md}"
 MEMORY_DB_DIR="${MEMORY_DB_DIR:-$HOME/.hermes/memory-lancedb}"
-PLUGIN_DIR="${PLUGIN_DIR:-$HOME/.hermes/plugins/lancedb_pro}"
+PLUGIN_DIR="${PLUGIN_DIR:-$HOME/.hermes/hermes-agent/plugins/memory/lancedb_pro}"
 
 export MEMORY_MD MEMORY_DB_DIR PLUGIN_DIR
 
@@ -44,7 +44,7 @@ import shutil
 import sys
 
 # Try the installed package first; fall back to importing from PLUGIN_DIR.
-plugin_dir = os.environ.get("PLUGIN_DIR", os.path.expanduser("~/.hermes/plugins/lancedb_pro"))
+plugin_dir = os.environ.get("PLUGIN_DIR", os.path.expanduser("~/.hermes/hermes-agent/plugins/memory/lancedb_pro"))
 candidates = [
     os.path.join(plugin_dir, "src"),  # editable / source layout
     plugin_dir,                       # flattened install

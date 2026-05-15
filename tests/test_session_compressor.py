@@ -623,3 +623,24 @@ class TestEstimateConversationValue:
         texts = ["ok", "thanks", "got it"]
         value = estimate_conversation_value(texts)
         assert value == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# TestGreetingHiThere
+# ---------------------------------------------------------------------------
+
+class TestGreetingHiThere:
+    def test_hi_there_scores_as_greeting(self):
+        result = score_text("Hi there", 0)
+        assert result.score == 0.1, f"'Hi there' should score 0.1 (greeting), got {result.score}"
+        assert result.reason == "greeting"
+
+    def test_hello_there_scores_as_greeting(self):
+        result = score_text("Hello there!", 0)
+        assert result.score == 0.1
+        assert result.reason == "greeting"
+
+    def test_hi_alone_still_greeting(self):
+        result = score_text("Hi", 0)
+        assert result.score == 0.1
+        assert result.reason == "greeting"
