@@ -715,6 +715,7 @@ def _build_provider_class():
             called — the host detects our override and skips prefetch
             to avoid double-injection. On older hermes-agent, this is
             the only injection point."""
+            self._flush_pending_write()
             return self._do_recall(query, session_id or self._session_id)
 
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
@@ -731,6 +732,7 @@ def _build_provider_class():
             users who haven't picked up the hermes-agent change. The
             plugin keeps both methods so the SAME wheel works against
             both old and new hermes-agent."""
+            self._flush_pending_write()
             query = str(turn_state.get("query") or "")
             session_id = str(turn_state.get("session_id") or "") or self._session_id
             return self._do_recall(query, session_id)
@@ -813,6 +815,19 @@ def _build_provider_class():
                 with self._thread_lock:
                     self._sync_thread = new_thread
                 new_thread.start()
+
+        def _flush_pending_write(self, timeout: float = 1.0) -> None:
+            """Wait briefly for the previous sync_turn write thread to finish.
+
+            Called at the top of prefetch / before_prompt_build so that
+            the previous turn's memories are visible to the upcoming recall.
+            Without this, a slow embedding (e.g. first-ever model load on a
+            brand-new install) causes the read to race the write and return
+            empty results for the first several turns."""
+            with self._thread_lock:
+                thread = self._sync_thread
+            if thread and thread.is_alive():
+                thread.join(timeout=timeout)
 
         def _raw_sync_turn(
             self,
