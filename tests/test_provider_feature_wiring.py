@@ -383,3 +383,68 @@ class TestOnMemoryWriteEditDelete:
         assert len(rows) == 1
         meta = rows[0].get("metadata", {})
         assert "replace_all" not in meta, "replace_all must not be stored in row metadata"
+
+
+# ---------------------------------------------------------------------------
+# first_for_session / session anchor coverage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestSessionAnchors:
+    """first_for_session returns oldest memories; _do_recall includes them."""
+
+    def test_first_for_session_returns_oldest(self, real_store):
+        sess = "anchor-sess"
+        real_store.store(
+            text="Task framing from turn one",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        time.sleep(0.01)
+        real_store.store(
+            text="Detail from turn two",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        time.sleep(0.01)
+        real_store.store(
+            text="Detail from turn three",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        first = real_store.first_for_session(sess, limit=1)
+        assert len(first) == 1
+        assert "turn one" in first[0]["text"]
+
+    def test_first_for_session_empty_when_no_session(self, real_store):
+        assert real_store.first_for_session("") == []
+
+    def test_recall_includes_task_framing_after_many_turns(
+        self, provider_cls, real_store
+    ):
+        """After several turns, recall must still surface the session-start
+        memory (task framing) via first_for_session anchors."""
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        p.initialize("anchor-sess-2")
+        sess = "anchor-sess-2"
+
+        # Simulate 5 turns of conversation stored directly to bypass threading
+        texts = [
+            "Stress-test my memory — this is the task framing",
+            "Turn two payload ABC",
+            "Turn three payload DEF",
+            "Turn four payload GHI",
+            "Turn five payload JKL",
+        ]
+        for t in texts:
+            real_store.store(
+                text=t, category="other", scope="agent", importance=0.5,
+                metadata_extra={"source_session": sess},
+            )
+            time.sleep(0.02)
+
+        # Query is semantically unrelated to task framing
+        block = p._do_recall("check slot 7", sess)
+        assert "task framing" in block.lower() or "stress-test" in block.lower(), (
+            "task framing memory from turn 1 must be in recall even after 5 turns"
+        )

@@ -647,19 +647,28 @@ def _build_provider_class():
                 logger.warning("lancedb_pro recall failed: %s", e)
                 results = []
 
-            # Recency anchors — always append the 2 most recently written
-            # memories for this session so task framing never silently drops
-            # out of the injected context window.
+            # Session anchors — always append the 2 oldest (task framing) and
+            # 2 most-recently-written session memories so context continuity
+            # holds regardless of how many turns have passed.  Without the
+            # "first" anchors, task framing from turn 1 falls out of the
+            # recency window after turn 3 and is only recoverable by relevance
+            # search, which fails when the current query is semantically
+            # distant (e.g. "check slot 7" vs "stress test my memory").
             if session_id:
                 try:
                     existing_ids = {r.get("id") for r in results}
-                    anchors = [
-                        m for m in self._store.recent_for_session(session_id, limit=2)
-                        if m.get("id") not in existing_ids
-                    ]
-                    results = results + anchors
+                    first_anchors = self._store.first_for_session(session_id, limit=2)
+                    recent_anchors = self._store.recent_for_session(session_id, limit=2)
+                    seen: set[str | None] = set(existing_ids)
+                    extra_anchors = []
+                    for m in first_anchors + recent_anchors:
+                        mid = m.get("id")
+                        if mid not in seen:
+                            extra_anchors.append(m)
+                            seen.add(mid)
+                    results = results + extra_anchors
                 except Exception as e:
-                    logger.debug("lancedb_pro recency anchor lookup failed: %s", e)
+                    logger.debug("lancedb_pro session anchor lookup failed: %s", e)
 
             if results and session_id:
                 with self._pending_lock:
@@ -817,7 +826,7 @@ def _build_provider_class():
                     self._sync_thread = new_thread
                 new_thread.start()
 
-        def _flush_pending_write(self, timeout: float = 1.0) -> None:
+        def _flush_pending_write(self, timeout: float = 2.0) -> None:
             """Wait briefly for the previous sync_turn write thread to finish.
 
             Called at the top of prefetch / before_prompt_build so that
