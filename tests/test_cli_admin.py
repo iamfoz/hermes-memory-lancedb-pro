@@ -376,3 +376,64 @@ class TestRegisterCli:
         with pytest.raises(SystemExit) as exc_info:
             parser.parse_args(["export", "--help"])
         assert exc_info.value.code == 0
+
+    def test_register_cli_adds_to_existing_subparsers_group(self, capsys):
+        """register_cli must extend an existing subparsers group, not add a nested one.
+
+        This is the real hermes-agent scenario: the parser already has a subparsers
+        group containing 'setup', 'status', 'off', 'reset'.  Our commands must appear
+        alongside them, not hidden in a nested group that argparse ignores at dispatch.
+        """
+        import argparse
+
+        # Simulate hermes-agent's memory parser with its built-in commands
+        parser = argparse.ArgumentParser(prog="hermes memory")
+        subs = parser.add_subparsers(dest="memory_command")
+        subs.add_parser("setup")
+        subs.add_parser("status")
+        subs.add_parser("off")
+        subs.add_parser("reset")
+
+        register_cli(parser)
+
+        # All original commands still parseable
+        for cmd in ("setup", "status", "off", "reset"):
+            args = parser.parse_args([cmd])
+            assert args.memory_command == cmd
+
+        # Our commands now parse successfully via the same group
+        for cmd in ("doctor", "export", "import", "lancedb-reset"):
+            args = parser.parse_args([cmd])
+            assert args.memory_command == cmd, f"'{cmd}' should be a valid memory_command"
+
+    def test_register_cli_commands_have_func_default(self):
+        """Each command registered by register_cli must set args.func for dispatch."""
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes memory")
+        subs = parser.add_subparsers(dest="memory_command")
+        subs.add_parser("setup")
+
+        register_cli(parser)
+
+        for cmd in ("doctor", "export", "import", "lancedb-reset"):
+            args = parser.parse_args([cmd])
+            assert callable(getattr(args, "func", None)), (
+                f"'{cmd}' subparser must set args.func for hermes-agent dispatch"
+            )
+
+    def test_lancedb_reset_not_reset(self):
+        """Our DB-reset command must be 'lancedb-reset', not 'reset', to avoid collision."""
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes memory")
+        subs = parser.add_subparsers(dest="memory_command")
+        subs.add_parser("reset")  # hermes-agent built-in
+
+        register_cli(parser)
+
+        choices = subs.choices if hasattr(subs, "choices") else {}
+        assert "lancedb-reset" in choices, "plugin must register 'lancedb-reset'"
+        assert choices.get("reset") is not choices.get("lancedb-reset"), (
+            "plugin must not overwrite hermes-agent's built-in 'reset'"
+        )

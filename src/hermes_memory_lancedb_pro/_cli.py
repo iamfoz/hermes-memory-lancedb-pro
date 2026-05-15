@@ -41,10 +41,10 @@ __all__ = ["register"]
 PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
-Exposes register_cli() so hermes-agent can wire the lancedb-pro
-subcommands (export, import, doctor) into `hermes lancedb-pro`.
+Exposes register_cli() so hermes-agent can wire the lancedb-pro commands
+(doctor, export, import, lancedb-reset) into `hermes memory`.
 
-Regenerate with: hermes-memory install-plugin
+Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
 from hermes_memory_lancedb_pro._cli import register_cli
 
@@ -451,28 +451,50 @@ def _cmd_doctor(
 
 
 # ---------------------------------------------------------------------------
-# Plugin CLI — register_cli() wires hermes lancedb-pro <subcommand>
+# Plugin CLI — register_cli() injects commands into hermes memory
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
-    cmd = getattr(args, "lancedb_pro_command", None)
-    if cmd is None:
-        return 0
-    return {"export": _cmd_export, "import": _cmd_import, "doctor": _cmd_doctor}[cmd](args)
+def register_cli(parser: argparse.ArgumentParser) -> None:
+    """Register lancedb-pro commands into the ``hermes memory`` CLI.
 
+    hermes-agent calls this with the ArgumentParser for ``hermes memory``.
+    We find the existing ``_SubParsersAction`` (which already holds setup /
+    status / off / reset) and add our commands directly to it, so they
+    appear as ``hermes memory doctor|export|import|lancedb-reset``.
 
-def register_cli(subparser: argparse.ArgumentParser) -> None:
-    """Register hermes lancedb-pro subcommands with the hermes CLI.
+    Each subparser sets its own ``func`` default so hermes-agent's standard
+    ``args.func(args)`` dispatch pattern routes directly to the right handler.
 
-    hermes-agent calls this with the ArgumentParser for the provider's
-    top-level slot so commands appear as `hermes lancedb-pro <subcommand>`.
+    ``lancedb-reset`` is used instead of ``reset`` to avoid collision with
+    hermes-agent's built-in ``hermes memory reset`` command.
     """
-    subs = subparser.add_subparsers(dest="lancedb_pro_command")
+    # Locate the existing subparsers action — hermes-agent already registered
+    # setup / status / off / reset on it.  Adding a *new* subparsers group
+    # (via parser.add_subparsers()) would create a nested group that argparse
+    # ignores during dispatch, which is why commands appeared invalid.
+    subs: argparse._SubParsersAction | None = None
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subs = action
+            break
+    if subs is None:
+        subs = parser.add_subparsers(dest="memory_command")
+
+    p_doctor = subs.add_parser(
+        "doctor",
+        help="Print a diagnostic report for the LanceDB memory store",
+        description="Scan the store and report counts, anomalies, and recommendations.",
+    )
+    p_doctor.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_doctor.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+    p_doctor.set_defaults(func=_cmd_doctor)
 
     p_export = subs.add_parser(
         "export",
-        help="Export memories to JSONL",
+        help="Export LanceDB memories to JSONL",
         description="Stream memory rows to JSONL (one JSON object per line).",
     )
     p_export.add_argument("--out", "-o", default="-", metavar="PATH",
@@ -484,11 +506,12 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_export.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
+                          help="Suppress non-essential output")
+    p_export.set_defaults(func=_cmd_export)
 
     p_import = subs.add_parser(
         "import",
-        help="Import memories from JSONL",
+        help="Import LanceDB memories from JSONL",
         description="Read a JSONL file produced by 'export' and write rows into the store.",
     )
     p_import.add_argument("--in", dest="input", default="-", metavar="PATH",
@@ -500,19 +523,26 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_import.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_import.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
+                          help="Suppress non-essential output")
+    p_import.set_defaults(func=_cmd_import)
 
-    p_doctor = subs.add_parser(
-        "doctor",
-        help="Print a diagnostic report",
-        description="Scan the store and report counts, anomalies, and recommendations.",
+    # Named lancedb-reset (not reset) to avoid collision with the built-in
+    # hermes memory reset command.
+    p_lreset = subs.add_parser(
+        "lancedb-reset",
+        help="Wipe and reinitialise the LanceDB memory database",
+        description=(
+            "Delete the LanceDB database directory and re-run init, "
+            "seeding fresh entries from MEMORY.md."
+        ),
     )
-    p_doctor.add_argument("--path", default=None, metavar="PATH",
+    p_lreset.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
-    p_doctor.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
-
-    subparser.set_defaults(func=_dispatch_plugin_cli)
+    p_lreset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                          help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_lreset.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+    p_lreset.set_defaults(func=_cmd_reset)
 
 
 # ---------------------------------------------------------------------------
