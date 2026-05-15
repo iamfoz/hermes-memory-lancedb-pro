@@ -37,6 +37,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from ._sql import ARCHIVED_STATE as _ARCHIVED_STATE
 from .decay import is_noise as _is_noise
 from .memory_compactor import (
     CompactionConfig,
@@ -965,20 +966,94 @@ def _build_provider_class():
         ) -> None:
             """Mirror writes from the built-in memory tool into our store
             so hermes-agent's `/memory` commands and our recall stay in
-            sync. Idempotent on duplicate writes — we just add a row.
+            sync.
 
-            ``edit`` and ``delete`` actions are noted in the debug log but
-            not yet wired to store mutations — the exact `target`/`content`
-            semantics for those actions are not yet finalised in the spec."""
+            ``add``: stores ``content`` with provenance from ``target``
+            (namespace: "user" → preference/user scope, else other/agent).
+
+            ``edit``: BM25-searches for memories matching ``target`` (the
+            old text), then supersedes each match with ``content`` (the new
+            text).  Pass ``metadata={"replace_all": True}`` to update every
+            matching entry; without it only the single best match is updated.
+
+            ``delete``: BM25-searches for memories matching ``target`` (or
+            ``content`` when target is a namespace keyword) and soft-archives
+            each match.  ``replace_all`` applies here too."""
             if action not in ("add", "edit", "delete"):
                 return
+
             if action in ("edit", "delete"):
-                logger.debug(
-                    "lancedb_pro on_memory_write: action %r not yet handled "
-                    "(target=%r); built-in and LanceDB stores may diverge",
-                    action, target,
+                replace_all = bool((metadata or {}).get("replace_all", False))
+                # target carries the old text for edit/delete; content may
+                # carry it too when target is a namespace keyword.
+                query = (
+                    target
+                    if target and target not in ("user", "agent")
+                    else content
                 )
+                if not query or not query.strip():
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: empty query — skip", action
+                    )
+                    return
+                try:
+                    candidates = self._store.search(
+                        query.strip(), mode="bm25", limit=20
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "lancedb_pro on_memory_write %r search failed: %s", action, e
+                    )
+                    return
+                query_lower = query.strip().lower()
+                exact = [
+                    c for c in candidates
+                    if query_lower in c.get("text", "").lower()
+                ]
+                matches = exact if exact else (candidates[:1] if candidates else [])
+                if not matches:
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: no match for %r — skip",
+                        action, query,
+                    )
+                    return
+                if len(matches) > 1 and not replace_all:
+                    matches = matches[:1]
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: %d candidates, using top "
+                        "(pass replace_all=True to update all)",
+                        action, len(exact) or len(candidates),
+                    )
+                if action == "edit":
+                    new_text = content.strip()
+                    if not new_text:
+                        return
+                    for m in matches:
+                        try:
+                            self._store.update(m["id"], text=new_text)
+                        except Exception as e:
+                            logger.warning(
+                                "lancedb_pro on_memory_write edit id=%s: %s",
+                                m.get("id"), e,
+                            )
+                else:  # delete
+                    now_ms = int(time.time() * 1000)
+                    for m in matches:
+                        try:
+                            self._store.update(
+                                m["id"],
+                                metadata_extra={
+                                    "state": _ARCHIVED_STATE,
+                                    "invalidated_at": now_ms,
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "lancedb_pro on_memory_write delete id=%s: %s",
+                                m.get("id"), e,
+                            )
                 return
+
             if not content.strip():
                 return
             sess = (metadata or {}).get("session_id") or ""
@@ -988,7 +1063,7 @@ def _build_provider_class():
             if metadata:
                 # Pass through any provenance the agent supplied
                 extra.update(
-                    {k: v for k, v in metadata.items() if k != "session_id"}
+                    {k: v for k, v in metadata.items() if k not in ("session_id", "replace_all")}
                 )
             try:
                 self._store.store(
