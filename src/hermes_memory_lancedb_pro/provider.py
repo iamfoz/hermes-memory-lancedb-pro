@@ -169,6 +169,59 @@ def _extract_message_texts(messages: Any) -> list[str]:
     return texts
 
 
+_MS_PER_DAY = 86_400_000
+_MS_PER_HOUR = 3_600_000
+_MS_PER_WEEK = 7 * _MS_PER_DAY
+
+# Ordered longest-match-first so "last month" beats "last" and "this morning"
+# beats "this".  Each tuple is (pattern, delta_ms_start, delta_ms_end) where
+# values are *subtracted* from now_ms: start > end means "from X days ago
+# until Y days ago" — the caller still filters `timestamp >= ts_min`.
+_TEMPORAL_PATTERNS: list[tuple[re.Pattern[str], int, int]] = [
+    # "this morning" / "this afternoon" → today so far
+    (re.compile(r"\bthis (morning|afternoon|evening)\b", re.I), 1 * _MS_PER_DAY, 0),
+    # "yesterday"
+    (re.compile(r"\byesterday\b", re.I), 2 * _MS_PER_DAY, 1 * _MS_PER_DAY),
+    # "last week" / "past week"
+    (re.compile(r"\b(last|past) week\b", re.I), 14 * _MS_PER_DAY, 7 * _MS_PER_DAY),
+    # "this week"
+    (re.compile(r"\bthis week\b", re.I), 7 * _MS_PER_DAY, 0),
+    # "last month" / "past month"
+    (re.compile(r"\b(last|past) month\b", re.I), 60 * _MS_PER_DAY, 30 * _MS_PER_DAY),
+    # "this month"
+    (re.compile(r"\bthis month\b", re.I), 30 * _MS_PER_DAY, 0),
+    # "last year"
+    (re.compile(r"\blast year\b", re.I), 730 * _MS_PER_DAY, 365 * _MS_PER_DAY),
+    # "recently" / "lately" — loose 7-day window
+    (re.compile(r"\b(recently|lately)\b", re.I), 7 * _MS_PER_DAY, 0),
+    # "today"
+    (re.compile(r"\btoday\b", re.I), 1 * _MS_PER_DAY, 0),
+    # Named months: "in January", "last March", "back in April"
+    (re.compile(
+        r"\b(?:in|last|back in|during)\s+(January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)\b", re.I,
+    ), 365 * _MS_PER_DAY, 0),   # search entire past year; month name boosts BM25 anyway
+]
+
+
+def _parse_temporal_intent(query: str, now_ms: int) -> tuple[int, int] | None:
+    """Return (ts_min_ms, ts_max_ms) if the query contains a clear temporal
+    reference, else None.
+
+    ts_min_ms is the start of the relevant window (older boundary).
+    ts_max_ms is the end of the relevant window (newer boundary, ≤ now_ms).
+    The caller should post-filter results to memories whose timestamp is
+    between ts_min_ms and ts_max_ms."""
+    for pattern, delta_start, delta_end in _TEMPORAL_PATTERNS:
+        if pattern.search(query):
+            ts_min = now_ms - delta_start
+            ts_max = now_ms - delta_end
+            if ts_max < ts_min:
+                ts_max = now_ms  # safety: never invert the range
+            return (ts_min, ts_max)
+    return None
+
+
 def _load_memory_provider_base():
     """Import hermes-agent's MemoryProvider ABC. Returns None if hermes-agent
     isn't on the import path — which is fine for tests / standalone use."""
@@ -632,9 +685,16 @@ def _build_provider_class():
             current query is semantically distant (e.g. "check slot 7"
             doesn't match "stress test my memory"). To keep context
             continuity, the two most-recently-written session memories are
-            injected as anchors, deduplicated against the relevance results."""
+            injected as anchors, deduplicated against the relevance results.
+
+            When the query contains a clear temporal reference ("last week",
+            "yesterday", "in January" …) the relevance results are
+            post-filtered to memories whose timestamp falls inside the
+            corresponding window.  Session anchors bypass this filter so
+            task-framing memories are always present."""
             if not query or not query.strip():
                 return ""
+            now_ms = int(time.time() * 1000)
             try:
                 results = self._retriever.retrieve(
                     query,
@@ -646,6 +706,26 @@ def _build_provider_class():
             except Exception as e:
                 logger.warning("lancedb_pro recall failed: %s", e)
                 results = []
+
+            # Temporal post-filter — if the query has a clear time reference,
+            # drop relevance results that fall outside the window.
+            temporal_range = _parse_temporal_intent(query, now_ms)
+            if temporal_range is not None and results:
+                ts_min, ts_max = temporal_range
+                filtered = [
+                    r for r in results
+                    if ts_min <= int(r.get("timestamp") or 0) <= ts_max
+                ]
+                # Keep unfiltered results if nothing survives the window
+                # (avoids returning an empty context block on edge cases).
+                if filtered:
+                    results = filtered
+                else:
+                    logger.debug(
+                        "lancedb_pro temporal filter (%d–%d ms) matched 0 of %d "
+                        "results — keeping unfiltered",
+                        ts_min, ts_max, len(results),
+                    )
 
             # Session anchors — always append the 2 oldest (task framing) and
             # 2 most-recently-written session memories so context continuity
@@ -774,6 +854,18 @@ def _build_provider_class():
             _extractor = self._smart_extractor
             _store = self._store
 
+            # Build a context string describing the source so the extraction
+            # LLM knows what kind of data it's looking at.  Hindsight research
+            # found this to be the single highest-impact extraction-quality
+            # lever — "vague missions produce vague results."
+            _extraction_context = (
+                f"Hermes agent conversation turn, "
+                f"session={effective_session_id or 'unknown'}, "
+                f"scope=agent. Extract durable facts, preferences, entities, "
+                f"events, and problem/solution pairs. Ignore greetings, "
+                f"acknowledgements, and transient scaffolding."
+            )
+
             def _do() -> None:
                 if _extractor is not None:
                     try:
@@ -782,6 +874,7 @@ def _build_provider_class():
                             assistant_content=assistant_content,
                             session_key=effective_session_id,
                             scope="agent",
+                            context=_extraction_context,
                         )
                     except Exception as e:
                         # The extractor's own pipeline catches per-candidate

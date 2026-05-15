@@ -7,6 +7,53 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.9] — 2026-05-20
+
+### Added / Changed — prompted by Hindsight (vectorize.io) best-practices review
+
+**Extraction context field** (`extraction_prompts.py`, `smart_extractor.py`):
+`build_extraction_prompt` now accepts a `context` parameter — a short
+description of the content source (e.g. "Hermes agent turn, session=s-123,
+scope=agent"). Injected as `## Content Context` into the extraction prompt.
+Hindsight research identifies this as the single highest-impact extraction
+quality lever. `sync_turn` constructs and passes this context automatically.
+
+**Structured conversation JSON** (`smart_extractor._format_conversation`):
+Turn content is now passed to the extraction LLM as a JSON conversation array
+with explicit `role` and `timestamp` fields rather than a flat string.
+Preserves entity relationships, causal context, and temporal markers that the
+flat format loses (e.g. "moved away from Redux *last quarter*" stays bound to
+the migration fact rather than fragmenting).
+
+**Named entity extraction** (`extraction_prompts.py`, `smart_extractor.py`):
+The extraction prompt now requests an `entities` list (proper nouns: people,
+projects, tools, organisations) alongside each memory. Parsed and stored in
+`metadata.entities` for future graph-traversal retrieval. A narrative-unit
+rule is also added: "keep causally interdependent facts as a single memory
+rather than splitting them".
+
+**Evidence-weighted confidence + freshness trend** (`decay.py`):
+`compute_decay_score` now reads `metadata.support_info.global_strength`
+(ratio of confirmations to total observations) and blends it into the
+effective confidence used for the intrinsic score component. Requires ≥ 3
+observations to avoid penalising newly-created memories. Formula:
+`confidence × (0.4 + 0.6 × global_strength)` — a fully contradicted memory
+(strength=0) is scored at 40% of its write-time confidence; a fully confirmed
+one (strength=1) is unchanged. The score dict now also includes
+`freshness_trend` ("forming" / "strengthening" / "stable" / "weakening").
+Fixed a latent bug: `0.0 or 0.5` was silently coercing a zero global_strength
+to 0.5, defeating the penalty.
+
+**Temporal query intent post-filter** (`provider.py`):
+`_do_recall` now detects temporal language in the query ("yesterday",
+"last week", "this morning", "recently", named months, …) via
+`_parse_temporal_intent` and post-filters relevance results to memories whose
+`timestamp` falls in the corresponding window. Session anchors (task-framing)
+bypass the filter so they are always present. When the filter would produce an
+empty result set it falls back to the unfiltered list.
+
+---
+
 ## [0.11.8] — 2026-05-20
 
 ### Fixed

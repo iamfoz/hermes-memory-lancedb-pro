@@ -51,21 +51,32 @@ def _format_existing_memories(existing_memories: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_extraction_prompt(conversation_text: str, user: str = "user") -> str:
+def build_extraction_prompt(
+    conversation_text: str,
+    user: str = "user",
+    context: str = "",
+) -> str:
     """Return the extraction prompt with 6-category decision table and few-shot examples.
 
     Args:
-        conversation_text: The recent conversation to analyse.
+        conversation_text: The recent conversation to analyse (plain text or
+            JSON conversation array).
         user: The user identifier to interpolate into the prompt.
+        context: Short description of the content source and nature.
+            High-impact on extraction quality — always set it.
+            Example: "Agent conversation turn, session s-123, scope=agent"
 
     Returns:
         The fully-rendered extraction prompt string.
     """
+    context_section = (
+        f"\n## Content Context\n{context.strip()}\n" if context and context.strip() else ""
+    )
     return f"""Analyze the following session context and extract memories worth long-term preservation.
 
 User: {user}
 
-Target Output Language: auto (detect from recent messages)
+Target Output Language: auto (detect from recent messages){context_section}
 
 ## Recent Conversation
 {conversation_text}
@@ -162,6 +173,11 @@ Each memory contains three levels:
 
 # Output Format
 
+**Narrative unit rule**: If two or more facts are causally or contextually
+interdependent (e.g. "moved away from Redux *because* of bundle size"), keep
+them in a single memory rather than splitting them. Splitting loses the
+rationale and the temporal marker.
+
 Return JSON:
 {{
   "memories": [
@@ -169,7 +185,8 @@ Return JSON:
       "category": "profile|preferences|entities|events|cases|patterns",
       "abstract": "One-line index",
       "overview": "Structured Markdown summary",
-      "content": "Full narrative"
+      "content": "Full narrative",
+      "entities": ["Entity1", "Entity2"]
     }}
   ]
 }}
@@ -179,7 +196,9 @@ Notes:
 - Only extract truly valuable personalized information
 - If nothing worth recording, return {{"memories": []}}
 - Maximum 5 memories per extraction
-- Preferences should be aggregated by topic"""
+- Preferences should be aggregated by topic
+- "entities": list of proper nouns (people, projects, tools, organisations)
+  mentioned in this memory — used for graph traversal. Omit if none."""
 
 
 def build_dedup_prompt(

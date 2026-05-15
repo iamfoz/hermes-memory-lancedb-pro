@@ -207,6 +207,34 @@ def compute_decay_score(
     last_accessed_at = int(metadata.get("last_accessed_at", created_at) or created_at)
     temporal_type = metadata.get("temporal_type", "static")
 
+    # Evidence-weighted confidence: blend write-time confidence with the
+    # accumulated confirmation/contradiction evidence in support_info.
+    # global_strength = confirmations / total_observations ∈ [0, 1].
+    # Requires ≥ 3 observations to avoid penalising freshly-created memories
+    # that haven't yet been confirmed or contradicted.
+    # Formula: confidence * (0.4 + 0.6 * global_strength)
+    #   global_strength=1.0 → factor=1.0 (no change)
+    #   global_strength=0.5 → factor=0.70 (contested, mild penalty)
+    #   global_strength=0.0 → factor=0.40 (all contradicted, strong penalty)
+    support_raw = metadata.get("support_info")
+    freshness_trend = "forming"
+    if support_raw:
+        try:
+            si = support_raw if isinstance(support_raw, dict) else {}
+            total_obs = int(si.get("total_observations", 0) or 0)
+            _gs_raw = si.get("global_strength")
+            global_strength = float(_gs_raw) if _gs_raw is not None else 0.5
+            if total_obs >= 3:
+                confidence = confidence * (0.4 + 0.6 * global_strength)
+                if global_strength >= 0.75:
+                    freshness_trend = "strengthening"
+                elif global_strength <= 0.35:
+                    freshness_trend = "weakening"
+                else:
+                    freshness_trend = "stable"
+        except (TypeError, ValueError):
+            pass
+
     # Recency
     last_active = last_accessed_at if access_count > 0 else created_at
     days_since = max(0.0, (now_ms - last_active) / MS_PER_DAY)
@@ -258,6 +286,7 @@ def compute_decay_score(
         "frequency": round(freq, 4),
         "intrinsic": round(intrinsic, 4),
         "composite": round(composite, 4),
+        "freshness_trend": freshness_trend,
     }
 
 
