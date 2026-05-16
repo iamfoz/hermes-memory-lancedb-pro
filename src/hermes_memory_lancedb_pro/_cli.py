@@ -1007,7 +1007,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     control_block = _tl.build_control_block(state)
     state_path = str(_tl._state_path(task_id, root))
     store = _open_store(args)
-    meta = json.dumps({"task_id": task_id, "state_path": state_path, "priority": "must_include"})
+    meta = {"task_id": task_id, "state_path": state_path, "priority": "must_include"}
     mem_id = store.store(
         text=control_block,
         category="active_task",

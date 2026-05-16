@@ -1,7 +1,8 @@
 ## Durable Task Protocol
 
-For any task requiring more than 3 sequential steps, tool calls, or iterations,
-use the durable task ledger before starting work.
+Invoke `/durable-task` when starting any multi-step task to load the full
+procedure guide. For any task requiring more than 3 sequential steps, tool
+calls, or iterations, you MUST use the durable task ledger before starting work.
 
 ### Starting a long-running task
 
