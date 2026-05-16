@@ -7,6 +7,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.17] — 2026-05-20
+
+### Fixed
+- **Post-compaction task recovery** — added `_refresh_active_task_memories` which
+  runs after guardrails on every `_do_recall` call.  For any `active_task` memory
+  that carries a `state_path` in its metadata (written by `task pin`), the control
+  block text is re-read from `state.json` on disk rather than serving the snapshot
+  from when `pin` was run.  This means:
+  - The injected iteration counter and `next_action` are always current.
+  - After context compaction the model still receives the correct task state in
+    `before_prompt_build`, because the task ledger lives on disk — not in the
+    context window.
+- **Recall injection debug log** — every recall now logs at DEBUG level the count
+  and category list of items being injected (e.g. `active_task, fact, preference`).
+  Enable with `MEMORY_LOG_LEVEL=DEBUG` or equivalent to observe what the model
+  sees on each turn.
+
+### Added
+- `import json` at module level in `provider.py` (was used only via `_parse_metadata`
+  previously; now required directly by `_refresh_active_task_memories`).
+
+---
+
 ## [0.11.16] — 2026-05-20
 
 ### Fixed

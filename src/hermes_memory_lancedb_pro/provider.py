@@ -30,6 +30,7 @@ That's all hermes-agent's plugin discovery needs. The provider:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -47,6 +48,7 @@ from .memory_compactor import (
 )
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
 from .store import MemoryStore
+from .task_ledger import build_control_block as _build_task_control_block
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +497,55 @@ def _apply_recall_guardrails(
     return pinned + rest
 
 
+def _refresh_active_task_memories(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """For pinned active_task memories that carry a state_path, reload the control
+    block text from disk on every recall.
+
+    Without this, the pinned text is the snapshot from when ``task pin`` was run.
+    After ``advance_iteration`` increments the counter, the recall block shows a
+    stale iteration number.  More importantly, this makes the active task block
+    survive context compaction: even after compaction wipes the conversation history,
+    ``before_prompt_build`` still injects the *current* control block from
+    ``state.json`` so the model always knows what iteration it is on and what to
+    do next.
+    """
+    refreshed = []
+    for r in results:
+        if r.get("category") != "active_task":
+            refreshed.append(r)
+            continue
+        try:
+            meta_raw = r.get("metadata") or "{}"
+            meta: dict[str, Any] = (
+                json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+            )
+            state_path = meta.get("state_path")
+            if not state_path:
+                refreshed.append(r)
+                continue
+            expanded = os.path.expanduser(str(state_path))
+            if not os.path.exists(expanded):
+                logger.debug(
+                    "lancedb_pro active_task state_path missing: %s", expanded
+                )
+                refreshed.append(r)
+                continue
+            with open(expanded, encoding="utf-8") as fh:
+                state = json.load(fh)
+            refreshed.append({**r, "text": _build_task_control_block(state)})
+            logger.debug(
+                "lancedb_pro refreshed active_task memory from %s (iter %s)",
+                expanded,
+                state.get("current_iteration"),
+            )
+        except Exception as exc:
+            logger.debug("lancedb_pro active_task refresh failed: %s", exc)
+            refreshed.append(r)
+    return refreshed
+
+
 def _maybe_auto_purge(store: MemoryStore) -> None:
     """Run purge_archived() if the cooldown has elapsed since the last run.
 
@@ -843,6 +894,20 @@ def _build_provider_class():
                 _RECALL_NEVER_CATEGORIES,
                 _RECALL_CHAR_BUDGET,
                 _RECALL_ACTIVE_TASK_PIN,
+            )
+
+            # Reload active_task control blocks from state.json so the injected
+            # text always reflects the current iteration — not a stale snapshot.
+            # This is the primary defence against post-compaction greeting-replay:
+            # even after the conversation history is wiped, the model still sees
+            # the current task objective and next_action in the system prompt.
+            results = _refresh_active_task_memories(results)
+
+            logger.debug(
+                "lancedb_pro recall: injecting %d items [%s] for session %s",
+                len(results),
+                ", ".join(r.get("category", "?") for r in results),
+                session_id or "global",
             )
 
             if results and session_id:
