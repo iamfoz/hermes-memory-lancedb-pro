@@ -1021,17 +1021,56 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_task_advance(args: argparse.Namespace) -> int:
+    """Record one completed iteration and advance the task counter.
+
+    Increments ``current_iteration``, appends a result to ``results.jsonl``,
+    and updates ``next_action`` in ``state.json``.  Because the memory plugin
+    reloads ``state.json`` on every recall, the model will see the updated
+    iteration count and next_action on the very next turn — no re-pin needed.
+    """
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    result = getattr(args, "result", "pass") or "pass"
+    next_action = getattr(args, "next_action", None) or None
+    summary = getattr(args, "summary", None) or None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.advance_iteration(
+            task_id,
+            result=result,
+            next_action=next_action,
+            summary=summary,
+            root=root,
+        )
+        if not quiet:
+            current = state["current_iteration"]
+            target = state.get("target_iterations")
+            iter_str = f"{current}/{target}" if target is not None else str(current)
+            print(f"Task {task_id!r}: iteration advanced to {iter_str}")
+            print(f"  Next action: {state['next_action']}")
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
 def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     """Dispatch task sub-subcommands."""
     sub = getattr(args, "task_command", None)
     if sub is None:
-        print("Usage: ... task <create|list|show|resume|complete|pin>")
+        print("Usage: ... task <create|list|show|resume|advance|complete|pin>")
         return 0
     return {
         "create": _cmd_task_create,
         "list": _cmd_task_list,
         "show": _cmd_task_show,
         "resume": _cmd_task_resume,
+        "advance": _cmd_task_advance,
         "complete": _cmd_task_complete,
         "pin": _cmd_task_pin,
     }.get(sub, lambda _: 0)(args)
@@ -1063,6 +1102,20 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_resume = tsubs.add_parser("resume", help="Print the task control block for re-orienting")
     p_resume.add_argument("task_id", metavar="TASK_ID")
     p_resume.add_argument("--task-root", default=None, metavar="PATH")
+
+    p_advance = tsubs.add_parser(
+        "advance",
+        help="Record a completed iteration and increment the counter",
+    )
+    p_advance.add_argument("task_id", metavar="TASK_ID")
+    p_advance.add_argument("--result", default="pass", choices=["pass", "fail"],
+                           help="Iteration result (default: pass)")
+    p_advance.add_argument("--next-action", dest="next_action", default=None, metavar="TEXT",
+                           help="Override the auto-generated next_action string")
+    p_advance.add_argument("--summary", default=None, metavar="TEXT",
+                           help="Short summary of what happened in this iteration")
+    p_advance.add_argument("--task-root", default=None, metavar="PATH")
+    p_advance.add_argument("-q", "--quiet", action="store_true")
 
     p_complete = tsubs.add_parser("complete", help="Mark a task as complete")
     p_complete.add_argument("task_id", metavar="TASK_ID")
