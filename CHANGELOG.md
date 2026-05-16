@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.18] — 2026-05-20
+
+### Added
+- **`task advance` CLI subcommand** — records a completed iteration, increments
+  `current_iteration`, appends to `results.jsonl`, and updates `next_action` in
+  `state.json`.  Because the memory plugin reloads `state.json` on every recall,
+  the model sees the updated state on the very next turn with no re-pin required.
+  Flags: `--result pass|fail`, `--next-action <text>`, `--summary <text>`.
+- **`skills/durable-task/SKILL.md`** — installable Hermes skill that teaches the
+  agent the durable task protocol: create ledger → pin → resume before each step
+  → advance after each step → complete.  Also covers post-compaction recovery
+  (`task list` → `task resume` → continue from `next_action`).
+
+---
+
 ## [0.11.17] — 2026-05-20
 
 ### Fixed
