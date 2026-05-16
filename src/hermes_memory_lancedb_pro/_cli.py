@@ -857,6 +857,7 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     elif not quiet:
         print("  (No existing database found)")
 
+    args.yes = True  # user already confirmed; don't prompt again in _cmd_init
     return _cmd_init(args)
 
 
