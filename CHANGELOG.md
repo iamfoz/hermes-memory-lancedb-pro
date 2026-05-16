@@ -7,6 +7,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.20] — 2026-05-21
+
+### Changed
+- **Durable task protocol now integral to the plugin** — the compact task
+  protocol (create → pin → resume → advance → complete + context-reset recovery
+  invariants) is injected into every prompt via `before_prompt_build`,
+  unconditionally, without requiring the `/durable-task` skill to be invoked.
+  This change comes directly from observational data: without the protocol text
+  present, sessions collapse to a "Hello" loop within ~12 steps; with it always
+  visible, sessions sustain 90+ steps / 171 messages reliably.
+- Replaced the reactive single-line task nudge (v0.11.19) with the full
+  `_TASK_PROTOCOL_TEXT` block — always prepended ahead of the reflection and
+  recall sections, even on turns with no recall results.
+- New env var `MEMORY_TASK_PROTOCOL` (default `on`) controls the injection;
+  set to `off` to suppress (e.g. automated pipelines that manage the ledger
+  externally). `MEMORY_TASK_NUDGE` is retired.
+
+---
+
 ## [0.11.19] — 2026-05-20
 
 ### Fixed
