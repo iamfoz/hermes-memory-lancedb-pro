@@ -804,6 +804,11 @@ def _build_provider_class():
             # recency window after turn 3 and is only recoverable by relevance
             # search, which fails when the current query is semantically
             # distant (e.g. "check slot 7" vs "stress test my memory").
+            #
+            # Anchors are filtered by noise and minimum length so trivial
+            # exchanges ("Hello", "OK", single-word acks) are never re-injected
+            # as session context — the classic cause of the greeting-replay bug
+            # where the model echoes turn-1 "Hello" on every subsequent turn.
             if session_id:
                 try:
                     existing_ids = {r.get("id") for r in results}
@@ -813,9 +818,20 @@ def _build_provider_class():
                     extra_anchors = []
                     for m in first_anchors + recent_anchors:
                         mid = m.get("id")
-                        if mid not in seen:
-                            extra_anchors.append(m)
+                        if mid in seen:
+                            continue
+                        # Skip noise: too short or flagged by the decay noise filter.
+                        text = (m.get("text") or "").strip()
+                        if len(text) < 20 or _is_noise(text):
+                            logger.debug(
+                                "lancedb_pro: skipping noise/short anchor %s (%d chars)",
+                                mid,
+                                len(text),
+                            )
                             seen.add(mid)
+                            continue
+                        extra_anchors.append(m)
+                        seen.add(mid)
                     results = results + extra_anchors
                 except Exception as e:
                     logger.debug("lancedb_pro session anchor lookup failed: %s", e)

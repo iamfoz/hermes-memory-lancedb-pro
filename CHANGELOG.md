@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.16] — 2026-05-20
+
+### Fixed
+- **Greeting-replay bug** — session anchors (`first_for_session` + `recent_for_session`)
+  were injected into every turn without any noise filter.  If the first stored memory
+  in a session was a greeting ("Hello", "Hi there", "👋 How can I help?"), it was
+  anchored into the system-prompt recall block on the very next turn, causing the
+  model to echo it.  The anchor loop now applies two guards before appending a
+  candidate:
+  1. **Minimum length** — texts shorter than 20 chars are skipped (catches bare
+     "Hello", "OK", "Sure").
+  2. **`is_noise()` filter** — texts matching `BOILERPLATE_PATTERNS` (which already
+     covers `^(hi|hello|hey|good morning|greetings|…)`) are skipped.
+  Both guards were already applied to the main relevance results via the retriever's
+  noise pre-filter; the anchor fast-path had no equivalent check.
+
+---
+
 ## [0.11.15] — 2026-05-20
 
 ### Added
