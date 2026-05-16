@@ -139,6 +139,26 @@ _EXTRACTION_RATE_LIMIT: int = int(
     os.environ.get("MEMORY_EXTRACTION_RATE_LIMIT", "0")
 )
 
+# ---------------------------------------------------------------------------
+# Recall guardrails
+# ---------------------------------------------------------------------------
+# Categories that are NEVER injected into the recall block regardless of score.
+# Comma-separated; e.g. MEMORY_NEVER_CATEGORIES=greeting,ephemeral_chat,old_task_state
+_RECALL_NEVER_CATEGORIES: frozenset[str] = frozenset(
+    c.strip()
+    for c in os.environ.get("MEMORY_NEVER_CATEGORIES", "greeting,ephemeral_chat").split(",")
+    if c.strip()
+)
+# Approximate character budget for the full recall block injected each turn.
+# chars / 4 ≈ tokens, so the default 4800 ≈ 1200 tokens.  Set 0 to disable.
+_RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800"))
+# When True, memories with category="active_task" are pinned to the front of
+# the recall block and bypass the never-categories filter and char budget.
+# This ensures long-running task state is always in context.
+_RECALL_ACTIVE_TASK_PIN: bool = os.environ.get(
+    "MEMORY_ACTIVE_TASK_PIN", "on"
+).strip().lower() not in ("off", "0", "false", "no")
+
 
 def _extract_message_texts(messages: Any) -> list[str]:
     """Coerce hermes-agent's session-end ``messages`` arg to a flat list of
@@ -425,6 +445,54 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
         trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
         lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
     return "\n".join(lines) if lines else ""
+
+
+def _apply_recall_guardrails(
+    results: list[dict[str, Any]],
+    never_categories: frozenset[str],
+    char_budget: int,
+    pin_active_tasks: bool,
+) -> list[dict[str, Any]]:
+    """Filter and reorder recall results per guardrail configuration.
+
+    Order of operations:
+    1. Split out ``active_task`` pinned memories (immune to all filters).
+    2. Drop memories in ``never_categories`` from the remainder.
+    3. Enforce the char budget (approximate token budget) on the remainder.
+    4. Return pinned first, then budgeted rest.
+
+    Pinned memories always appear at the top of the recall block so an
+    active task control block is never crowded out by unrelated memories.
+    """
+    if pin_active_tasks:
+        pinned = [r for r in results if r.get("category") == "active_task"]
+        rest = [r for r in results if r.get("category") != "active_task"]
+    else:
+        pinned, rest = [], list(results)
+
+    if never_categories:
+        rest = [
+            r for r in rest
+            if (r.get("category") or "other") not in never_categories
+        ]
+
+    if char_budget > 0 and rest:
+        budget = char_budget
+        budgeted: list[dict[str, Any]] = []
+        for r in rest:
+            cost = len(r.get("text") or "") + 60  # ~60 chars overhead per formatted line
+            if budget < cost and budgeted:
+                logger.debug(
+                    "lancedb_pro recall budget exhausted after %d items; %d dropped",
+                    len(budgeted),
+                    len(rest) - len(budgeted),
+                )
+                break
+            budget -= cost
+            budgeted.append(r)
+        rest = budgeted
+
+    return pinned + rest
 
 
 def _maybe_auto_purge(store: MemoryStore) -> None:
@@ -751,6 +819,15 @@ def _build_provider_class():
                     results = results + extra_anchors
                 except Exception as e:
                     logger.debug("lancedb_pro session anchor lookup failed: %s", e)
+
+            # Recall guardrails — pin active-task memories first, drop
+            # never-categories, enforce char/token budget.
+            results = _apply_recall_guardrails(
+                results,
+                _RECALL_NEVER_CATEGORIES,
+                _RECALL_CHAR_BUDGET,
+                _RECALL_ACTIVE_TASK_PIN,
+            )
 
             if results and session_id:
                 with self._pending_lock:

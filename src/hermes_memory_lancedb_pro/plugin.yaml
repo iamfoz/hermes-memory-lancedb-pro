@@ -1,5 +1,5 @@
 name: lancedb_pro
-version: 0.11.14
+version: 0.11.15
 kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 hooks:
