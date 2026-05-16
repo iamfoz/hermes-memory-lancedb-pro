@@ -160,6 +160,13 @@ _RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800
 _RECALL_ACTIVE_TASK_PIN: bool = os.environ.get(
     "MEMORY_ACTIVE_TASK_PIN", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
+# When True, a one-line nudge is appended to the recall block whenever there
+# are recall results but no active_task memory is present. Reminds the model
+# to start a task ledger for multi-step work. Set MEMORY_TASK_NUDGE=off to
+# silence it (e.g. for automated pipelines that manage the ledger externally).
+_RECALL_TASK_NUDGE: bool = os.environ.get(
+    "MEMORY_TASK_NUDGE", "on"
+).strip().lower() not in ("off", "0", "false", "no")
 
 
 def _extract_message_texts(messages: Any) -> list[str]:
@@ -909,6 +916,24 @@ def _build_provider_class():
                 ", ".join(r.get("category", "?") for r in results),
                 session_id or "global",
             )
+
+            # Nudge the model to start a task ledger for multi-step work when
+            # there are recall results but no active_task pin is present.
+            has_active_task = any(r.get("category") == "active_task" for r in results)
+            if results and _RECALL_TASK_NUDGE and not has_active_task:
+                results = list(results) + [
+                    {
+                        "text": (
+                            "[lancedb_pro: no active task ledger — "
+                            "for multi-step tasks run: "
+                            "hermes-memory-lancedb-pro task create --id <id> --objective \"<text>\" "
+                            "&& hermes-memory-lancedb-pro task pin <id> "
+                            "| or invoke /durable-task]"
+                        ),
+                        "category": "_nudge",
+                        "id": None,
+                    }
+                ]
 
             if results and session_id:
                 with self._pending_lock:

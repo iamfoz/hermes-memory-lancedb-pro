@@ -7,6 +7,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.19] — 2026-05-20
+
+### Fixed
+- **`task pin` crash** — `metadata_extra` was serialised as a JSON string before
+  being passed to `store.store()`, which calls `meta.update(extra)` internally
+  and requires a `dict`.  Now passes a plain `dict` directly, eliminating the
+  `ValueError: dictionary update sequence element #0 has length 1` crash
+  reported during stress testing.
+
+### Added
+- **Task nudge** — when recall returns results but no `active_task` memory is
+  present, a one-line reminder is appended to the recall block pointing the
+  model to `hermes-memory-lancedb-pro task create` + `task pin` and `/durable-task`.
+  Controlled by `MEMORY_TASK_NUDGE` env var (default `on`); set to `off` to
+  silence it in automated pipelines that manage the ledger externally.
+- **`/durable-task` invocation** added to `skills/durable-task/AGENTS.md` with
+  mandatory language (`MUST`) for multi-step tasks.
+
+---
+
 ## [0.11.18] — 2026-05-20
 
 ### Added
