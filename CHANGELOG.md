@@ -7,6 +7,46 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.15] — 2026-05-20
+
+### Added
+- **`task_ledger` module** — durable task-state management outside the LLM context
+  window. Task state lives in `~/.hermes/workspace/tasks/<task_id>/` with
+  `state.json` (objective, status, iteration counter, next_action, blockers,
+  invariants), `results.jsonl`, `events.jsonl`, and `log.md`. Key functions:
+  `create_task`, `load_state`, `save_state`, `advance_iteration`, `complete_task`,
+  `append_jsonl`, `build_control_block`, `looks_like_reset`, `list_tasks`.
+- **`looks_like_reset(response, active_task)`** — detects model greeting/reset
+  responses so the runner can reject them, log a `reset_detected` event, and
+  retry from `state.json` rather than silently losing iteration progress.
+- **`build_control_block(state)`** — formats the `ACTIVE TASK CONTROL BLOCK`
+  string (task ID, status, objective, current/target iteration, next_action,
+  blockers, invariants) for prepending to every iteration prompt. Context
+  compaction cannot lose the task objective when the control block is always
+  re-injected from `state.json` each turn.
+- **`hermes-memory-lancedb-pro task <subcommand>`** — standalone CLI task group:
+  `create`, `list`, `show`, `resume` (prints control block + pass/fail summary),
+  `complete`, `pin` (stores control block as an `active_task` memory).
+- **`hermes lancedb_pro task <subcommand>`** — same commands in the plugin CLI
+  namespace via `register_cli`.
+- **Recall guardrails in `before_prompt_build` / `prefetch`**:
+  - `MEMORY_NEVER_CATEGORIES` (default: `greeting,ephemeral_chat`) — categories
+    never injected regardless of score, preventing old greetings from surfacing.
+  - `MEMORY_RECALL_CHAR_BUDGET` (default: `4800` ≈ 1200 tokens) — caps the total
+    size of the injected recall block so memory cannot crowd out the active task
+    state or cause early compaction.
+  - `MEMORY_ACTIVE_TASK_PIN` (default: `on`) — memories with
+    `category="active_task"` are always prepended to the recall block, bypass
+    never-categories filtering and the char budget. Use `task pin` to store the
+    current control block as a pinned active-task memory.
+
+### Tests
+- 53 new tests in `tests/test_task_ledger.py` covering all public functions of
+  `task_ledger` including atomic write, iteration sequencing, reset detection,
+  and boundary cases.
+
+---
+
 ## [0.11.14] — 2026-05-20
 
 ### Added
