@@ -160,13 +160,34 @@ _RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800
 _RECALL_ACTIVE_TASK_PIN: bool = os.environ.get(
     "MEMORY_ACTIVE_TASK_PIN", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
-# When True, a one-line nudge is appended to the recall block whenever there
-# are recall results but no active_task memory is present. Reminds the model
-# to start a task ledger for multi-step work. Set MEMORY_TASK_NUDGE=off to
-# silence it (e.g. for automated pipelines that manage the ledger externally).
-_RECALL_TASK_NUDGE: bool = os.environ.get(
-    "MEMORY_TASK_NUDGE", "on"
+# When True, the compact durable-task protocol is prepended to every recall
+# block so the model always knows how to manage multi-step work — without
+# requiring an explicit skill invocation.  Set MEMORY_TASK_PROTOCOL=off to
+# silence (e.g. in automated pipelines that manage the ledger externally).
+_RECALL_TASK_PROTOCOL: bool = os.environ.get(
+    "MEMORY_TASK_PROTOCOL", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
+
+# Compact durable-task protocol injected every turn when _RECALL_TASK_PROTOCOL
+# is True.  This text is what makes the model reliably use the task ledger for
+# multi-step work — it must be visible at the start of every prompt, not loaded
+# on demand via a skill.
+_TASK_PROTOCOL_TEXT = """\
+[Durable Task Protocol — hermes-memory-lancedb-pro]
+For any task requiring >3 steps, iterations, or tool calls you MUST use the task ledger:
+
+  START     hermes-memory-lancedb-pro task create --id <id> --objective "<goal>" --iterations <N>
+            hermes-memory-lancedb-pro task pin <id>
+  EACH TURN hermes-memory-lancedb-pro task resume <id>       # read state before starting work
+            hermes-memory-lancedb-pro task advance <id> \\
+              --result pass|fail --next-action "<text>" --summary "<one sentence>"
+  FINISH    hermes-memory-lancedb-pro task complete <id> --summary "<what was done>"
+
+Context reset / about to greet the user:
+  1. hermes-memory-lancedb-pro task list  →  if a task is running, DO NOT greet — resume it.
+  2. hermes-memory-lancedb-pro task resume <id>  →  continue from next_action.
+  Invariants: one iteration per response; record result before starting next; state.json is truth.\
+"""
 
 
 def _extract_message_texts(messages: Any) -> list[str]:
@@ -917,24 +938,6 @@ def _build_provider_class():
                 session_id or "global",
             )
 
-            # Nudge the model to start a task ledger for multi-step work when
-            # there are recall results but no active_task pin is present.
-            has_active_task = any(r.get("category") == "active_task" for r in results)
-            if results and _RECALL_TASK_NUDGE and not has_active_task:
-                results = list(results) + [
-                    {
-                        "text": (
-                            "[lancedb_pro: no active task ledger — "
-                            "for multi-step tasks run: "
-                            "hermes-memory-lancedb-pro task create --id <id> --objective \"<text>\" "
-                            "&& hermes-memory-lancedb-pro task pin <id> "
-                            "| or invoke /durable-task]"
-                        ),
-                        "category": "_nudge",
-                        "id": None,
-                    }
-                ]
-
             if results and session_id:
                 with self._pending_lock:
                     self._pending_used_ids[session_id] = [
@@ -943,9 +946,9 @@ def _build_provider_class():
 
             recall_block = _format_recall(results)
             reflection_block = self._reflection_block(session_id)
-            if reflection_block and recall_block:
-                return f"{reflection_block}\n{recall_block}"
-            return reflection_block or recall_block
+            protocol_block = _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+            parts = [p for p in [protocol_block, reflection_block, recall_block] if p]
+            return "\n\n".join(parts)
 
         def _reflection_block(self, session_id: str) -> str:
             """Return the formatted reflection-recall block for this
