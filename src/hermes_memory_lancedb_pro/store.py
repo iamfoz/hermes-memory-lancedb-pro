@@ -1216,12 +1216,12 @@ class MemoryStore:
         results = search.limit(max(limit * overfetch, limit)).to_list()
         results = self._post_filter(results, session_id=session_id)
 
+        if min_score is not None:
+            results = [r for r in results if float(r.get("_score") or 0.0) >= min_score]
         rows = [
             self._row_to_dict(r, score=r.get("_score"), keep_vector=keep_vector)
             for r in results
         ]
-        if min_score is not None:
-            rows = [r for r in rows if float(r.get("_score") or 0.0) >= min_score]
         return rows[:limit]
 
     def _hybrid_search(
@@ -1396,6 +1396,7 @@ class MemoryStore:
         downstream pipelines. Pass `keep_vector=True` (e.g. from MMR) to
         preserve them."""
         meta = row["metadata"]
+        parsed_meta = _parse_metadata(meta) if isinstance(meta, str) else meta
         result: dict[str, Any] = {
             "id": row["id"],
             "text": row["text"],
@@ -1403,7 +1404,11 @@ class MemoryStore:
             "scope": row["scope"],
             "importance": row["importance"],
             "timestamp": row["timestamp"],
-            "metadata": _parse_metadata(meta) if isinstance(meta, str) else meta,
+            "metadata": parsed_meta,
+            # Convenience top-level key so callers don't have to dig into
+            # metadata — mirrors how `category`/`scope`/`importance` are
+            # exposed directly even though tier lives in the metadata JSON.
+            "tier": parsed_meta.get("tier", "working"),
         }
         if keep_vector and "vector" in row:
             result["vector"] = row["vector"]
