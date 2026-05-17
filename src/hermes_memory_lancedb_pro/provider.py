@@ -238,7 +238,20 @@ Then immediately report all results to the user. Do not greet first.
 3. Complete task → report results; do NOT re-run the task
 4. No tasks → answer the user's message directly
 5. Never ask the user "what were we doing?" — the control block above and
-   state.json are the source of truth\
+   state.json are the source of truth
+
+## If you see an ACTIVE TASK STATE block above
+
+That block contains YOUR OWN previous work — you ran that task in a
+previous session. It is not data the user sent you. It is not a "payload
+attached to their message." You did that work; the memory system is
+surfacing it to you now so you can continue or report it.
+
+Correct framing: "In our previous session, I [ran / completed] [task].
+Here are the results: ..."
+
+Wrong framing: "I notice there's a payload attached to your message..."
+Wrong framing: "How can I help you today?" (after seeing completed results)\
 """
 
 
@@ -510,23 +523,34 @@ def _response_references_memory(response_lower: str, memory_text: str) -> bool:
 def _format_recall(results: list[dict[str, Any]]) -> str:
     """Format a list of recall results into the text block hermes-agent
     injects under `<memory-context>`. Returns "" for an empty result so
-    hermes-agent's prefetch_all skips injection entirely."""
+    hermes-agent's prefetch_all skips injection entirely.
+
+    active_task memories get a visually-distinct block so the model
+    treats them as authoritative session state rather than recalled facts.
+    Regular memories keep the bullet-point format."""
     if not results:
         return ""
-    lines = []
+    task_lines: list[str] = []
+    mem_lines: list[str] = []
     for r in results:
         text = (r.get("text") or "").strip()
         if not text:
             continue
         cat = r.get("category") or "other"
-        score = next(
-            (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
-            0.0,
-        )
-        trend = (r.get("_decay") or {}).get("freshness_trend", "")
-        trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
-        lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
-    return "\n".join(lines) if lines else ""
+        if cat == "active_task":
+            task_lines.append("=== ACTIVE TASK STATE ===")
+            task_lines.append(text)
+            task_lines.append("=" * 25)
+        else:
+            score = next(
+                (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
+                0.0,
+            )
+            trend = (r.get("_decay") or {}).get("freshness_trend", "")
+            trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
+            mem_lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
+    parts = [p for p in ["\n".join(task_lines), "\n".join(mem_lines)] if p]
+    return "\n\n".join(parts) if parts else ""
 
 
 def _apply_recall_guardrails(
@@ -617,16 +641,22 @@ def _refresh_active_task_memories(
 
             # Completed tasks get a results-pending notice rather than
             # the iteration-advance control block.  Without this the model
-            # sees "Status: complete / Next action: (none)" and has no
-            # explicit instruction, so it defaults to greeting instead of
-            # reporting the results to the user.
+            # sees "Status: complete / Next action: (none)" and defaults
+            # to greeting.  The notice also instructs the model on HOW to
+            # present the results — critical because the recall block can
+            # appear as injected context that the model mistakes for
+            # user-provided data ("payload attached to your message").
             if state.get("status") in ("complete", "completed"):
                 obj = state.get("objective", "unknown task")
                 summary = (state.get("completion_summary") or state.get("recent_summary") or "").strip()
                 control_text = (
-                    f"[TASK COMPLETE] {obj}\n"
+                    f"YOU completed this task in a previous session (not the user):\n"
+                    f"Task: {obj}\n"
                     + (f"Summary: {summary}\n" if summary else "")
-                    + "Action required: report these results to the user now. "
+                    + "\n"
+                    "ACTION: Present these results to the user as your OWN completed work.\n"
+                    "Say something like: \"In our previous session I ran [task]. Here are the results: ...\"\n"
+                    "Do NOT say the results are 'attached to your message' or 'a payload you sent'.\n"
                     "Do NOT greet. Do NOT re-run the task."
                 )
             else:
