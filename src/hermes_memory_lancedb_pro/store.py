@@ -633,7 +633,11 @@ class MemoryStore:
                 now_ms=now_ms,
             )
 
-        # Metadata-only update path
+        # Metadata-only update path.
+        # NOTE: get_by_id follows the supersede chain, so existing["id"] may
+        # differ from mem_id (the old archived row). Always use existing["id"]
+        # as the target so the update lands on the live row.
+        effective_id = existing["id"]
         update_values: dict[str, Any] = {}
 
         if tier is not None:
@@ -655,11 +659,10 @@ class MemoryStore:
             update_values["category"] = category
 
         self._table.update(
-            where=f"id = '{_escape_sql(mem_id)}'",
+            where=f"id = '{_escape_sql(effective_id)}'",
             values=update_values,
         )
-        # Metadata-only update keeps the same id
-        return mem_id
+        return effective_id
 
     def _supersede(
         self,
@@ -993,6 +996,7 @@ class MemoryStore:
             limit + offset + max(limit, 16) * 2 if post_filter else limit
         )
 
+        self._checkout_latest()
         query = self._table.search()
         where_clause = _and_clauses(*clauses)
         if where_clause:
@@ -1018,7 +1022,7 @@ class MemoryStore:
         try:
             rows = (
                 self._table.search()
-                .where(f"timestamp > 0")
+                .where("timestamp > 0")
                 .limit(MAX_SCAN_ROWS)
                 .to_list()
             )
@@ -1047,7 +1051,7 @@ class MemoryStore:
         try:
             rows = (
                 self._table.search()
-                .where(f"timestamp > 0")
+                .where("timestamp > 0")
                 .limit(MAX_SCAN_ROWS)
                 .to_list()
             )
@@ -1155,6 +1159,7 @@ class MemoryStore:
         session_id: str | None = None,
         min_score: float | None = None,
     ) -> list[dict[str, Any]]:
+        self._checkout_latest()
         vector = self.encode(query_text)
         search = self._table.search(vector, vector_column_name="vector")
         where = self._filters_clause(category, scope)
@@ -1188,6 +1193,7 @@ class MemoryStore:
         session_id: str | None = None,
         min_score: float | None = None,
     ) -> list[dict[str, Any]]:
+        self._checkout_latest()
         # Scope FTS to the `text` column only — LanceDB's FTS otherwise indexes
         # all string columns, polluting results with id/category/metadata.
         search = self._table.search(
@@ -1331,6 +1337,24 @@ class MemoryStore:
                 purged, grace_period_days,
             )
         return purged
+
+    def _checkout_latest(self) -> None:
+        """Advance the table handle to the latest dataset version.
+
+        When another process (e.g. the CLI import command) has written to the
+        same LanceDB path, the in-process table handle may be pinned to an
+        older version and miss the new rows entirely.  Calling this before any
+        read brings the handle up to date.  Falls back to re-opening the table
+        for older LanceDB versions that lack `checkout_latest()`."""
+        try:
+            self._table.checkout_latest()
+        except AttributeError:
+            # Older lancedb without checkout_latest — re-open for a fresh handle.
+            import contextlib
+            with contextlib.suppress(Exception):
+                self._table = self._db.open_table("memories")
+        except Exception:
+            pass
 
     def _scan_all(self, limit: int = MAX_SCAN_ROWS) -> Iterable[dict[str, Any]]:
         """Iterate every row in the table up to `limit`. Yields raw rows."""
