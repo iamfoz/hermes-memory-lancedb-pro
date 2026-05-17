@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.22] — 2026-05-21
+
+### Fixed
+- **`_TASK_PROTOCOL_TEXT` was too compact to be effective** — the 14-line
+  summary injected in v0.11.20 was not sufficient to prevent Hello-loop
+  failures (sessions still collapsed within 6 messages without the skill).
+  Replaced with the full `SKILL.md` content: explicit trigger conditions,
+  step-by-step commands with exact syntax, recovery-after-reset instructions,
+  and the invariants list.  Empirically, the full text is what drives reliable
+  multi-step behaviour; the compact version did not.
+
+---
+
 ## [0.11.21] — 2026-05-21
 
 ### Fixed
