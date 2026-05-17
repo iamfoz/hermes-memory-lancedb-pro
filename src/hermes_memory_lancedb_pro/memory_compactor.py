@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 class CompactionConfig:
     """Knobs for `run_compaction`. All fields have working defaults."""
     min_age_days: int = 7
+    # min_age_hours takes precedence when set (0 = compact immediately).
+    # Provided for callers that need sub-day granularity.
+    min_age_hours: int | None = None
     similarity_threshold: float = 0.88
     min_cluster_size: int = 2
     max_memories_to_scan: int = 200
@@ -251,7 +254,10 @@ def run_compaction(
     `scopes=None` scans all scopes. Set `config.dry_run=True` to report a
     plan without writing changes (useful for tuning the threshold)."""
     cfg = config or CompactionConfig()
-    cutoff_ms = int(time.time() * 1000) - cfg.min_age_days * 86_400_000
+    if cfg.min_age_hours is not None:
+        cutoff_ms = int(time.time() * 1000) - cfg.min_age_hours * 3_600_000
+    else:
+        cutoff_ms = int(time.time() * 1000) - cfg.min_age_days * 86_400_000
 
     entries = _fetch_for_compaction(
         store, cutoff_ms, scopes, cfg.max_memories_to_scan

@@ -7,6 +7,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.21] — 2026-05-21
+
+### Fixed
+- **`update()` writes to the wrong row after supersede** (phase 15) — when
+  `get_by_id()` follows the supersede chain from an old (archived) ID to the
+  current live row, the subsequent `table.update(where="id = old_id")` was
+  still targeting the archived row instead of the live one.  Changed to use
+  `existing["id"]` (the chain-resolved ID) in the WHERE clause and return
+  value so `update(old_id, category="fact")` correctly updates the current
+  version.
+- **Stale table view after CLI writes** (phases 7, 17, 18, 25) — after a
+  subprocess CLI command (`import`, `reset`, etc.) writes to the LanceDB path,
+  the in-process `LanceTable` handle could remain pinned to an older dataset
+  version, returning 0 results for newly imported rows.  Added
+  `_checkout_latest()` which calls `table.checkout_latest()` (LanceDB ≥ 0.20)
+  or falls back to re-opening the table.  Called automatically at the start of
+  `_vector_search`, `_bm25_search`, and `list_memories`.
+- **`CompactionConfig` rejects `min_age_hours`** (phase 20) — stress tests pass
+  `min_age_hours=0` to force immediate compaction, but the dataclass only had
+  `min_age_days`.  Added `min_age_hours: int | None = None`; when set it takes
+  precedence over `min_age_days` (0 = compact everything regardless of age).
+
+---
+
 ## [0.11.20] — 2026-05-21
 
 ### Changed
