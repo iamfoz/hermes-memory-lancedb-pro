@@ -526,7 +526,7 @@ class MemoryStore:
         category: str,
         scope: str,
         importance: float,
-        metadata: str,
+        metadata: str | dict[str, Any],
         timestamp: int | None = None,
     ) -> str:
         """Low-level write: caller supplies the encoded vector AND the
@@ -546,6 +546,10 @@ class MemoryStore:
         if not vector:
             raise ValueError("MemoryStore.store_raw: `vector` must be non-empty")
         text = _check_injection_guard(text, where="store_raw")
+        # Accept a pre-built dict as well as a JSON string so callers don't
+        # have to json.dumps() themselves (and to match store()'s metadata_extra API).
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
 
         mem_id = str(uuid.uuid4())
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
@@ -759,7 +763,10 @@ class MemoryStore:
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
-        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
+        # get_by_id follows the supersede chain; use the resolved live ID so
+        # we delete the actual live row rather than an already-archived predecessor.
+        effective_id = existing["id"]
+        self._table.delete(f"id = '{_escape_sql(effective_id)}'")
         return True
 
     def increment_access_count(
@@ -896,6 +903,7 @@ class MemoryStore:
         chain until it reaches the current live version, guarding against
         cycles with a depth limit of 32.
         """
+        self._checkout_latest()
         seen: set[str] = set()
         current_id = mem_id
         while True:
@@ -920,6 +928,7 @@ class MemoryStore:
     def has_id(self, mem_id: str) -> bool:
         """True if the ID exists and is not archived. Used for BM25 ghost
         protection — see also `check_ids` for batch lookups."""
+        self._checkout_latest()
         results = (
             self._table.search()
             .where(f"id = '{_escape_sql(mem_id)}'")
@@ -938,6 +947,7 @@ class MemoryStore:
         default page size, falsely flagging the rest as ghosts."""
         if not mem_ids:
             return []
+        self._checkout_latest()
         # de-dup but keep original input intact so callers aren't surprised
         unique_ids = list(dict.fromkeys(mem_ids))
         in_clause = ",".join(f"'{_escape_sql(mid)}'" for mid in unique_ids)
