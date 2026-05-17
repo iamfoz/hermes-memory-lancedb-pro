@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.23] — 2026-05-21
+
+### Fixed
+- **Task protocol never reached the model** (root cause of v0.11.20–0.11.22
+  ineffectiveness) — `_do_recall` bailed out with `return ""` whenever the
+  query was empty.  `before_prompt_build` is called to assemble the
+  *query-independent system prompt*, so it always passes an empty query;
+  the early return discarded the protocol text before it was ever prepended.
+  This is why injecting the full `SKILL.md` content in v0.11.22 had zero
+  observable effect — it was dropped every turn.  The empty-query branch now
+  returns `_TASK_PROTOCOL_TEXT`, so the protocol is injected into the system
+  prompt regardless of whether there is anything to recall.
+
+---
+
 ## [0.11.22] — 2026-05-21
 
 ### Fixed

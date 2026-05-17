@@ -942,7 +942,14 @@ def _build_provider_class():
             corresponding window.  Session anchors bypass this filter so
             task-framing memories are always present."""
             if not query or not query.strip():
-                return ""
+                # No query to recall against — this happens when
+                # before_prompt_build is called to assemble the
+                # query-independent system prompt. The task protocol is
+                # static guidance that does NOT depend on the query, so it
+                # must still be injected here; returning "" would drop it
+                # from the system prompt entirely (the v0.11.20–0.11.22 bug
+                # where the protocol text never reached the model).
+                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
             now_ms = int(time.time() * 1000)
             try:
                 results = self._retriever.retrieve(
