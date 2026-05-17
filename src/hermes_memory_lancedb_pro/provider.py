@@ -169,124 +169,76 @@ _RECALL_TASK_PROTOCOL: bool = os.environ.get(
 ).strip().lower() not in ("off", "0", "false", "no")
 
 # Full durable-task protocol injected every turn when _RECALL_TASK_PROTOCOL
-# is True.  This is the exact content of skills/durable-task/SKILL.md — the
-# compact summary was not sufficient to prevent Hello-loop failures; the full
-# text (triggers, step-by-step commands, recovery, invariants, example) is
-# required for reliable behaviour.
+# is True.  Front-loaded with the unconditional no-greeting rule so the
+# model cannot misread the scope as "only during a running task".
 _TASK_PROTOCOL_TEXT = """\
-# Durable Task Protocol
+# Memory Task Protocol
 
-Use this protocol for any task that takes more than 3 sequential steps or tool calls.
-It ensures progress survives context compaction, session restarts, and model resets
-by keeping state in a file on disk rather than in the conversation.
+## NEVER GREET — unconditional, no exceptions
 
-## When to use this protocol
+Do not say "Hello", "Hi", "Hey", or any greeting word in ANY response:
+- Even if the user greeted you
+- Even at the start of what appears to be a new session
+- Even after context compaction wiped the conversation history
+- Even when there are no active tasks
 
-Trigger this protocol whenever:
+Instead: respond immediately to the substance of the user's message.
+If context is genuinely unclear, say one line such as "Checking task state..."
+and then run `hermes-memory-lancedb-pro task list`.
 
-- The user asks to run a test suite, benchmark, stress test, or any iterative work
-- The user asks you to "keep going", "run N iterations", or "repeat until done"
-- You expect to make more than 3 tool calls to complete the task
-- You are resuming a task after receiving a greeting or context reset
+## First thing every turn — check task state
 
-## Protocol
+Run this BEFORE any other action or text:
 
-### Step 1 — Create the task ledger
+    hermes-memory-lancedb-pro task list
 
-Before touching anything else, create a task ledger:
+Decision tree:
+- Status = running  → `task resume <id>`, then continue from next_action
+- Status = complete → report the task results to the user now; do not re-run
+- No tasks listed   → respond directly to the user's message; no greeting
 
-```bash
-hermes-memory-lancedb-pro task create \\
-  --id <task-id> \\
-  --objective "<clear one-line objective>" \\
-  --iterations <N>
-```
+## Creating a task ledger (for multi-step work)
 
-Choose a task ID that is unique and descriptive, e.g. `stress-test-2026-05-20`.
-If --iterations is unknown, omit it.
+Use this for any task that takes more than 3 tool calls, or that could be
+interrupted by context compaction: test suites, benchmarks, iterative loops,
+anything where "keep going" is the instruction.
 
-### Step 2 — Pin it to memory
+    hermes-memory-lancedb-pro task create \\
+      --id <task-id> \\
+      --objective "<clear one-line objective>" \\
+      --iterations <N>
 
-```bash
-hermes-memory-lancedb-pro task pin <task-id>
-```
+    hermes-memory-lancedb-pro task pin <task-id>
 
-This stores the task state in the memory database. The memory plugin reloads
-state.json on every turn, so the model always sees the current iteration and
-next action — even after context compaction wipes the conversation history.
+Pinning stores state to disk. The memory plugin reloads state.json on every
+turn — even after compaction — so the model always knows the current iteration
+and next action without re-reading conversation history.
 
-You only need to pin once. The pin does not need to be refreshed as the task
-advances; the plugin reads state.json live.
+## Each iteration
 
-### Step 3 — Before each iteration
+    hermes-memory-lancedb-pro task resume <task-id>      # read current state
+    # do the bounded work
+    hermes-memory-lancedb-pro task advance <task-id> \\
+      --result pass|fail \\
+      --next-action "Run iteration <N+1>." \\
+      --summary "<one sentence: what happened>"
 
-Read the current state before doing any work:
+One step = one advance. Do not attempt multiple iterations per response.
 
-```bash
-hermes-memory-lancedb-pro task resume <task-id>
-```
+## Completing a task
 
-Confirm the task ID, objective, current_iteration, and next_action are correct.
+    hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
 
-### Step 4 — Do the work
+Then immediately report all results to the user. Do not greet first.
 
-Execute one bounded step. Do not attempt multiple iterations in a single response.
-One step = one advance.
+## Recovery after context loss or reset
 
-### Step 5 — After each iteration
-
-Record the result and advance the counter:
-
-```bash
-hermes-memory-lancedb-pro task advance <task-id> \\
-  --result pass \\
-  --next-action "Run iteration <N+1>." \\
-  --summary "<one sentence: what happened>"
-```
-
-Use --result fail if the step errored. Always set --next-action explicitly
-so the next turn knows exactly what to do without re-reading the whole history.
-
-### Step 6 — Check stopping condition
-
-After advance, check whether the task is complete:
-
-```bash
-hermes-memory-lancedb-pro task show <task-id>
-```
-
-If current_iteration >= target_iterations, or the objective is met:
-
-```bash
-hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
-```
-
-Then report results to the user.
-
-## Recovery after a reset or greeting
-
-If you find yourself about to greet the user, or if context is unclear:
-
-1. Check for a running task first:
-   hermes-memory-lancedb-pro task list
-
-2. If a running task exists, resume it:
-   hermes-memory-lancedb-pro task resume <task-id>
-
-3. Continue from next_action. Do not re-introduce yourself. Do not ask
-   the user what you were doing. The state file is the source of truth.
-
-## Invariants
-
-These rules apply for the entire lifetime of a running task:
-
-- Do not greet the user.
-- Do not restart the conversation.
-- Do not ask the user what you were doing — read state.json.
-- Before each iteration: confirm state with task resume.
-- After each iteration: update state with task advance.
-- If task list shows a running task: continue it, do not start a new one.
-- If blockers appear: record them with task advance --result fail and report.\
+1. Run `hermes-memory-lancedb-pro task list`
+2. Running task → `task resume <id>` and continue from next_action
+3. Complete task → report results; do NOT re-run the task
+4. No tasks → answer the user's message directly
+5. Never ask the user "what were we doing?" — the control block above and
+   state.json are the source of truth\
 """
 
 
@@ -662,10 +614,29 @@ def _refresh_active_task_memories(
                 continue
             with open(expanded, encoding="utf-8") as fh:
                 state = json.load(fh)
-            refreshed.append({**r, "text": _build_task_control_block(state)})
+
+            # Completed tasks get a results-pending notice rather than
+            # the iteration-advance control block.  Without this the model
+            # sees "Status: complete / Next action: (none)" and has no
+            # explicit instruction, so it defaults to greeting instead of
+            # reporting the results to the user.
+            if state.get("status") in ("complete", "completed"):
+                obj = state.get("objective", "unknown task")
+                summary = (state.get("completion_summary") or state.get("recent_summary") or "").strip()
+                control_text = (
+                    f"[TASK COMPLETE] {obj}\n"
+                    + (f"Summary: {summary}\n" if summary else "")
+                    + "Action required: report these results to the user now. "
+                    "Do NOT greet. Do NOT re-run the task."
+                )
+            else:
+                control_text = _build_task_control_block(state)
+
+            refreshed.append({**r, "text": control_text})
             logger.debug(
-                "lancedb_pro refreshed active_task memory from %s (iter %s)",
+                "lancedb_pro refreshed active_task memory from %s (status=%s iter=%s)",
                 expanded,
+                state.get("status"),
                 state.get("current_iteration"),
             )
         except Exception as exc:
@@ -942,14 +913,33 @@ def _build_provider_class():
             corresponding window.  Session anchors bypass this filter so
             task-framing memories are always present."""
             if not query or not query.strip():
-                # No query to recall against — this happens when
-                # before_prompt_build is called to assemble the
-                # query-independent system prompt. The task protocol is
-                # static guidance that does NOT depend on the query, so it
-                # must still be injected here; returning "" would drop it
-                # from the system prompt entirely (the v0.11.20–0.11.22 bug
-                # where the protocol text never reached the model).
-                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+                # No query — before_prompt_build assembling the
+                # query-independent system prompt.  Return the protocol text
+                # PLUS any pinned active-task state from disk, so the model
+                # knows its task state even after context compaction wipes
+                # the conversation history.  Without the task-state injection
+                # here, the model sees "check task list" instructions but no
+                # state, has no context for what work was in progress, and
+                # defaults to a greeting — the loop that afflicted v0.11.22.
+                parts: list[str] = []
+                if _RECALL_TASK_PROTOCOL:
+                    parts.append(_TASK_PROTOCOL_TEXT)
+                try:
+                    task_mems = self._store.list_memories(
+                        limit=5,
+                        category="active_task",
+                        include_archived=False,
+                    )
+                    task_mems = _refresh_active_task_memories(task_mems)
+                    if task_mems:
+                        task_block = _format_recall(task_mems)
+                        if task_block:
+                            parts.append(task_block)
+                except Exception as _exc:
+                    logger.debug(
+                        "lancedb_pro no-query active task inject failed: %s", _exc
+                    )
+                return "\n\n".join(p for p in parts if p)
             now_ms = int(time.time() * 1000)
             try:
                 results = self._retriever.retrieve(
