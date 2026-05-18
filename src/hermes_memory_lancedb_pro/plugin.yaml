@@ -1,5 +1,5 @@
 name: lancedb_pro
-version: 0.11.35
+version: 0.11.36
 kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 # Standard hooks work on hermes-agent `main`. before_prompt_build, on_recall_used

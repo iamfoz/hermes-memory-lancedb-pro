@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hermes_memory_lancedb_pro.task_ledger import (
+    _resolve_task_root,
     advance_iteration,
     append_jsonl,
     atomic_write_json,
@@ -395,3 +396,23 @@ class TestListTasks:
         tasks = list_tasks(task_root)
         assert len(tasks) == 1
         assert tasks[0]["task_id"] == "valid"
+
+
+class TestResolveTaskRoot:
+    """The default task root must be profile-isolated: HERMES_TASK_ROOT wins,
+    then HERMES_HOME, then the legacy ~/.hermes fallback."""
+
+    def test_explicit_task_root_env_wins(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TASK_ROOT", "/tmp/explicit-root")
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        assert _resolve_task_root() == Path("/tmp/explicit-root")
+
+    def test_hermes_home_isolates_per_profile(self, monkeypatch):
+        monkeypatch.delenv("HERMES_TASK_ROOT", raising=False)
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        assert _resolve_task_root() == Path("/tmp/profile-home/workspace/tasks")
+
+    def test_legacy_default_when_no_env(self, monkeypatch):
+        monkeypatch.delenv("HERMES_TASK_ROOT", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        assert _resolve_task_root() == Path.home() / ".hermes" / "workspace" / "tasks"
