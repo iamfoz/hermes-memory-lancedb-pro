@@ -547,10 +547,10 @@ class TestSystemPromptBlockAndCompaction:
     """The system-prompt hook and the pre-compaction anchor that together
     stop the model greeting after context compaction.
 
-    `system_prompt_block` is hermes-agent's authoritative per-turn
-    system-prompt hook; `on_pre_compress` fires right before compaction
-    discards old messages. `before_prompt_build` is NOT called by upstream
-    hermes-agent, so the task protocol must travel through these hooks."""
+    `system_prompt_block` is hermes-agent's authoritative system-prompt
+    hook (rebuilt at session start and after each compaction);
+    `on_pre_compress` fires right before compaction discards old
+    messages. The task protocol travels through these hooks."""
 
     def _provider(self, provider_cls, store, session="sess-1"):
         p = provider_cls(store=store, auto_smart_extraction=False)
@@ -724,10 +724,7 @@ class TestSystemPromptBlockAndCompaction:
 @pytest.mark.integration
 class TestRecallHookSeparation:
     """The durable-task protocol lives only in `system_prompt_block`; the
-    query-dependent recall hooks (`prefetch`, `before_prompt_build`) never
-    duplicate it. `before_prompt_build` is the non-standard
-    `feat/memory-provider-hooks` path — it must coexist with `prefetch`
-    without double-injecting."""
+    query-dependent recall path (`prefetch`) never duplicates it."""
 
     def _provider(self, provider_cls, store, session="sess-1"):
         p = provider_cls(store=store, auto_smart_extraction=False)
@@ -739,22 +736,18 @@ class TestRecallHookSeparation:
         assert p.prefetch("") == ""
         assert p.prefetch("   ") == ""
 
-    def test_before_prompt_build_empty_query_returns_empty(
-        self, provider_cls, real_store
-    ):
-        p = self._provider(provider_cls, real_store)
-        assert p.before_prompt_build({"query": ""}) == ""
-        assert p.before_prompt_build({}) == ""
+    def test_provider_does_not_override_before_prompt_build(self, provider_cls):
+        # Overriding before_prompt_build makes the host's prefetch_all() skip
+        # this provider — and the host never calls before_prompt_build — so
+        # the provider must NOT define it.
+        assert "before_prompt_build" not in vars(provider_cls)
 
-    def test_recall_hooks_do_not_duplicate_protocol(self, provider_cls, real_store):
+    def test_recall_path_does_not_duplicate_protocol(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
         # The protocol belongs to system_prompt_block...
         assert "Memory Task Protocol" in p.system_prompt_block()
-        # ...and must NOT also appear in the query-dependent recall hooks.
+        # ...and must NOT also appear in the query-dependent recall block.
         assert "Memory Task Protocol" not in p.prefetch("a real user query")
-        assert "Memory Task Protocol" not in p.before_prompt_build(
-            {"query": "a real user query"}
-        )
 
 
 @pytest.mark.integration

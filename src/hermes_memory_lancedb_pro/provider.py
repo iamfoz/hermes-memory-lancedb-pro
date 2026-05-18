@@ -954,8 +954,8 @@ def _build_provider_class():
             # sync_turn callers cannot each launch their own write thread.
             self._dispatch_lock = threading.Lock()
             # Lock protecting _pending_used_ids — dict is mutated from the
-            # calling thread (prefetch/before_prompt_build) and from the
-            # sync_turn daemon thread simultaneously.
+            # calling thread (prefetch) and from the sync_turn daemon
+            # thread simultaneously.
             self._pending_lock = threading.Lock()
             # Cache last-prefetched ids per session so we can mark them
             # "used" on the next sync_turn (i.e. only when we actually
@@ -1112,9 +1112,10 @@ def _build_provider_class():
         # ---- Read path ----------------------------------------------------
 
         def _do_recall(self, query: str, session_id: str) -> str:
-            """Shared implementation for both `prefetch` and
-            `before_prompt_build`. Runs a session-scoped recall, caches
-            the returned ids in `_pending_used_ids[session_id]` so we
+            """Shared recall implementation. With a query it serves
+            `prefetch`; with an empty query it serves `system_prompt_block`
+            (protocol + active-task state). Runs a session-scoped recall,
+            caches the returned ids in `_pending_used_ids[session_id]` so we
             can credit them later, prepends the reflection block, and
             returns the combined text.
 
@@ -1318,20 +1319,19 @@ def _build_provider_class():
             return "\n".join(lines)
 
         def prefetch(self, query: str, session_id: str | None = None) -> str:
-            """Query-dependent recall — the standard (`main`-branch) path.
+            """Query-dependent recall — the host's real recall path.
+
+            `MemoryManager.prefetch_all()` calls this every turn (from
+            `conversation_loop.py`) and the host injects the result into the
+            current turn's user message. This is the ONLY recall hook the
+            host actually drives, so the provider must not override
+            `before_prompt_build` (doing so makes `prefetch_all()` skip us).
 
             Returns the formatted recall block (relevant memories +
-            reflection) for the user message position. On a host running
-            the `feat/memory-provider-hooks` branch — which adds
-            `before_prompt_build` — the host detects our `before_prompt_build`
-            override and SKIPS this method to avoid double-injecting recall.
-            On a `main`-branch host (no `before_prompt_build`) this is the
-            recall injection point.
-
-            The durable-task protocol and active-task state are NOT returned
-            here — those belong to `system_prompt_block()`, which every host
-            calls. An empty query therefore yields an empty string rather
-            than falling through to the protocol branch of `_do_recall`."""
+            reflection). The durable-task protocol and active-task state are
+            NOT returned here — those belong to `system_prompt_block()`. An
+            empty query yields an empty string rather than falling through to
+            the protocol branch of `_do_recall`."""
             if not query or not query.strip():
                 return ""
             self._flush_pending_write()
@@ -1341,31 +1341,34 @@ def _build_provider_class():
             """Query-independent text injected into the SYSTEM PROMPT.
 
             This is hermes-agent's authoritative memory hook: `MemoryManager.
-            build_system_prompt()` calls it once per turn and concatenates the
-            result into the system prompt itself.
+            build_system_prompt()` calls it and the result is concatenated
+            into the system prompt. The host caches the assembled system
+            prompt and rebuilds it at session start and after each context
+            compaction — i.e. exactly when the greeting-loop defence needs
+            refreshing.
 
             It is the correct home for the durable-task protocol and the
             active-task control block because:
 
-              * the system prompt is re-assembled every turn but is NOT
-                discarded by context compaction — so a "you are mid-task,
-                do not greet" directive placed here survives compaction
-                automatically, which `prefetch` context (user-message
+              * the system prompt is NOT discarded by context compaction —
+                so a "you are mid-task, do not greet" directive placed here
+                survives compaction, which `prefetch` context (user-message
                 position) does not;
               * the model treats system-prompt text as ground truth rather
-                than as recalled data it might mistake for a user payload;
-              * the protocol text is stable, so keeping it here (instead of
-                in the turn-varying `prefetch` block) is a prompt-cache hit.
+                than as recalled data it might mistake for a user payload.
 
-            The system prompt is prompt-cache breakpoint 1 and must stay
-            stable between turns, so the active-task block injected here uses
-            the immutable-fields-only rendering (`_refresh_active_task_memories
-            (stable=True)`): it does not change on every `task advance`. The
-            model fetches live iteration state with `task resume`; the full
-            live block also reaches the compression summary via
-            `on_pre_compress`."""
-            self._flush_pending_write()
+            The system prompt is prompt-cache breakpoint 1, so the active-task
+            block uses the immutable-fields-only rendering
+            (`_refresh_active_task_memories(stable=True)`): it does not change
+            on every `task advance`. The model fetches live iteration state
+            with `task resume`.
+
+            This method must NEVER raise: the host wraps the whole external
+            memory block in a bare `except` and silently drops ALL of it on
+            any error — which would remove the entire greeting defence. Every
+            path here is therefore guarded."""
             try:
+                self._flush_pending_write()
                 return self._do_recall("", self._session_id)
             except Exception as exc:
                 logger.debug("lancedb_pro system_prompt_block failed: %s", exc)
@@ -1418,29 +1421,15 @@ def _build_provider_class():
                 logger.debug("lancedb_pro on_pre_compress export failed: %s", exc)
                 return ""
 
-        def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
-            """Query-dependent recall — the `feat/memory-provider-hooks` path.
-
-            This is a non-standard hook: it exists on hermes-agent's
-            `feat/memory-provider-hooks` branch, not on `main`. When the host
-            supports it, it is called once per turn after the user message is
-            known and the result is appended to the system prompt; the host
-            then SKIPS this provider's `prefetch` to avoid double-injecting
-            recall. On a `main`-branch host the hook simply never fires — an
-            unused method is harmless, so the same wheel runs unmodified on
-            both branches (recall travels via `prefetch` instead).
-
-            Like `prefetch`, this returns only the query-dependent recall
-            block. The durable-task protocol and active-task state come from
-            `system_prompt_block()`, which both host branches always call —
-            so an empty query yields an empty string here rather than
-            duplicating the protocol the system prompt already carries."""
-            query = str(turn_state.get("query") or "")
-            if not query.strip():
-                return ""
-            self._flush_pending_write()
-            session_id = str(turn_state.get("session_id") or "") or self._session_id
-            return self._do_recall(query, session_id)
+        # NOTE: `before_prompt_build` is deliberately NOT implemented.
+        # On hermes-agent's `feat/memory-provider-hooks` branch the host's
+        # `MemoryManager.prefetch_all()` SKIPS any provider that overrides
+        # `before_prompt_build` (expecting `build_dynamic_system_prompt()` to
+        # call it instead) — but `build_dynamic_system_prompt()` is never
+        # invoked anywhere in the host. So defining `before_prompt_build`
+        # would silently disable our `prefetch()` and gain nothing. `prefetch`
+        # is the one recall path the host actually drives (`prefetch_all()` is
+        # called every turn from `conversation_loop.py`).
 
         # ---- Write path ---------------------------------------------------
 
@@ -1551,7 +1540,7 @@ def _build_provider_class():
         def _flush_pending_write(self, timeout: float = 2.0) -> None:
             """Wait briefly for the previous sync_turn write thread to finish.
 
-            Called at the top of prefetch / before_prompt_build so that
+            Called at the top of prefetch / system_prompt_block so that
             the previous turn's memories are visible to the upcoming recall.
             Without this, a slow embedding (e.g. first-ever model load on a
             brand-new install) causes the read to race the write and return

@@ -124,39 +124,30 @@ def real_store():
 
 @pytest.mark.integration
 class TestNewHookOverrides:
-    """The plugin overrides three hooks introduced in hermes-agent's
-    MemoryProvider (PR ###). These tests verify the override behaviour
-    against a real LanceDB store without needing hermes-agent itself
-    to be the version that calls them — we instantiate the provider
-    and call the methods directly."""
+    """The plugin's recall + observation hooks, verified against a real
+    LanceDB store without needing hermes-agent itself to be the version
+    that calls them — we instantiate the provider and call directly."""
 
     def setup_method(self):
         if provider._self_check() != "real":
             pytest.skip("hermes-agent not on PYTHONPATH")
 
-    def test_class_overrides_three_new_methods(self):
-        """The plugin's class must override all three new hooks,
-        otherwise hermes-agent's prefetch-skip detection won't fire."""
-        # Lazy import: agent.memory_provider only exists when hermes-agent
-        # is on PYTHONPATH (the class-level skip handles that case).
+    def test_does_not_override_before_prompt_build(self):
+        """The plugin must NOT override before_prompt_build: the host's
+        prefetch_all() skips any provider that does, and the host never
+        calls before_prompt_build — overriding it would silently disable
+        our prefetch recall."""
         import agent.memory_provider as agent_mp  # noqa: PLC0415
 
         cls = provider.LanceDBProMemoryProvider
-        # before_prompt_build override is what triggers the prefetch
-        # skip on the host side, so this is the most important assertion
-        assert cls.before_prompt_build is not agent_mp.MemoryProvider.before_prompt_build
+        assert "before_prompt_build" not in vars(cls)
+        # The observation hooks are still overridden.
         assert cls.on_recall_used is not agent_mp.MemoryProvider.on_recall_used
         assert cls.on_tool_call_observed is not agent_mp.MemoryProvider.on_tool_call_observed
 
-    def test_before_prompt_build_returns_same_text_as_prefetch(self, real_store):
-        """The two injection paths produce the same content; only the
-        location differs (system prompt vs user message). Hermes-agent
-        decides which one fires.
-
-        Note: scores can differ between back-to-back calls because the
-        first call's recall lifecycle bumps access_count, which changes
-        downstream decay scoring on the second call. We compare on text
-        content (memory body), not the score-formatted suffix."""
+    def test_prefetch_returns_recalled_memory(self, real_store):
+        """prefetch is the host's real recall path; it returns the
+        recalled memory formatted for the user-message position."""
         real_store.store(
             text="user prefers UK English in writing",
             metadata_extra={"source_session": "sess-A"},
@@ -164,28 +155,19 @@ class TestNewHookOverrides:
         p = provider.LanceDBProMemoryProvider(store=real_store)
 
         prefetch_block = p.prefetch("UK English", session_id="sess-A")
-        bpb_block = p.before_prompt_build({
-            "query": "UK English",
-            "session_id": "sess-A",
-        })
-        # Both blocks must be non-empty and contain the recalled memory
         assert prefetch_block.strip()
-        assert bpb_block.strip()
         assert "UK English" in prefetch_block
-        assert "UK English" in bpb_block
-        # Both must use the same formatting (line prefixes, brackets)
         assert prefetch_block.startswith("- [")
-        assert bpb_block.startswith("- [")
 
-    def test_before_prompt_build_caches_pending_ids(self, real_store):
-        """Same caching behaviour as prefetch — populates
-        _pending_used_ids[session_id] for later credit."""
+    def test_prefetch_caches_pending_ids(self, real_store):
+        """prefetch populates _pending_used_ids[session_id] for later
+        credit by on_recall_used / sync_turn."""
         real_store.store(
             text="cacheable preference content",
             metadata_extra={"source_session": "sess-B"},
         )
         p = provider.LanceDBProMemoryProvider(store=real_store)
-        out = p.before_prompt_build({"query": "cacheable", "session_id": "sess-B"})
+        out = p.prefetch("cacheable", session_id="sess-B")
         assert out  # not empty
         assert "sess-B" in p._pending_used_ids
         assert len(p._pending_used_ids["sess-B"]) >= 1
@@ -255,7 +237,7 @@ class TestNoDoubleCreditOnNewHost:
             metadata_extra={"source_session": "sess-D"},
         )
         p = provider.LanceDBProMemoryProvider(store=real_store)
-        # Pretend the host called before_prompt_build then on_recall_used
+        # Pretend the host called prefetch then on_recall_used
         p._pending_used_ids["sess-D"] = [mid]
         p.on_recall_used("I'll remember your Vim shortcuts preference.",
                          session_id="sess-D")
