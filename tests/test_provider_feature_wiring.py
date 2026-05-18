@@ -695,14 +695,21 @@ class TestAutoAnchor:
             not (m.get("metadata") or {}).get("auto_anchor") for m in anchors
         )
 
-    def test_archives_stale_anchor_from_other_session(self, real_store):
-        provider._auto_anchor_session_if_needed("Old work", "sess-OLD", real_store)
-        provider._auto_anchor_session_if_needed("New work", "sess-NEW", real_store)
+    def test_anchor_survives_session_id_rotation(self, real_store):
+        # Context compression rotates session_id mid-conversation. The anchor
+        # and its original objective must persist, not churn into the latest
+        # turn's text under a new session id.
+        provider._auto_anchor_session_if_needed(
+            "Original objective", "sess-1", real_store
+        )
+        provider._auto_anchor_session_if_needed(
+            "later turn after a compaction", "sess-2", real_store
+        )
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
         )
         assert len(live) == 1
-        assert "New work" in live[0]["text"]
+        assert "Original objective" in live[0]["text"]
 
     def test_archive_auto_anchors_clears_all_live_anchors(self, real_store):
         provider._auto_anchor_session_if_needed("work A", "sess-A", real_store)
