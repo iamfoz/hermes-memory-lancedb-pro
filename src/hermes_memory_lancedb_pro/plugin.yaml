@@ -1,11 +1,12 @@
 name: lancedb_pro
-version: 0.11.23
+version: 0.11.31
 kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 hooks:
+  - system_prompt_block
   - prefetch
-  - before_prompt_build
   - sync_turn
+  - on_pre_compress
   - on_memory_write
   - on_recall_used
   - on_tool_call_observed
