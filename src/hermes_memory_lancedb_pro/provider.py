@@ -1714,116 +1714,39 @@ def _build_provider_class():
             content: str,
             metadata: dict[str, Any] | None = None,
         ) -> None:
-            """Mirror writes from the built-in memory tool into our store
-            so hermes-agent's `/memory` commands and our recall stay in
-            sync.
+            """Mirror built-in memory tool writes into our store so the
+            built-in memory and our recall stay in sync.
 
-            ``add``: stores ``content`` with provenance from ``target``
-            (namespace: "user" → preference/user scope, else other/agent).
+            Contract (see hermes-agent `agent/tool_executor.py`): the host
+            calls this ONLY for ``add`` and ``replace`` actions — ``remove``
+            is intentionally not forwarded. Both arrive with just the NEW
+            ``content``; the host does not pass the replaced entry's old
+            text, so a ``replace`` cannot be turned into a targeted
+            supersede. Both are therefore mirrored the same way — the new
+            content is stored as a fact and the store's own dedup /
+            auto-compaction collapses near-duplicates over time.
 
-            ``edit``: BM25-searches for memories matching ``target`` (the
-            old text), then supersedes each match with ``content`` (the new
-            text).  Pass ``metadata={"replace_all": True}`` to update every
-            matching entry; without it only the single best match is updated.
-
-            ``delete``: BM25-searches for memories matching ``target`` (or
-            ``content`` when target is a namespace keyword) and soft-archives
-            each match.  ``replace_all`` applies here too."""
-            if action not in ("add", "edit", "delete"):
+            ``target`` is the built-in namespace: ``user`` (profile facts —
+            stored as a preference) or ``memory`` (environment facts)."""
+            if action not in ("add", "replace"):
                 return
-
-            if action in ("edit", "delete"):
-                replace_all = bool((metadata or {}).get("replace_all", False))
-                # target carries the old text for edit/delete; content may
-                # carry it too when target is a namespace keyword.
-                query = (
-                    target
-                    if target and target not in ("user", "agent")
-                    else content
-                )
-                if not query or not query.strip():
-                    logger.debug(
-                        "lancedb_pro on_memory_write %r: empty query — skip", action
-                    )
-                    return
-                try:
-                    candidates = self._store.search(
-                        query.strip(), mode="bm25", limit=20
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "lancedb_pro on_memory_write %r search failed: %s", action, e
-                    )
-                    return
-                query_lower = query.strip().lower()
-                exact = [
-                    c for c in candidates
-                    if query_lower in c.get("text", "").lower()
-                ]
-                matches = exact if exact else (candidates[:1] if candidates else [])
-                if not matches:
-                    logger.debug(
-                        "lancedb_pro on_memory_write %r: no match for %r — skip",
-                        action, query,
-                    )
-                    return
-                if len(matches) > 1 and not replace_all:
-                    matches = matches[:1]
-                    logger.debug(
-                        "lancedb_pro on_memory_write %r: %d candidates, using top "
-                        "(pass replace_all=True to update all)",
-                        action, len(exact) or len(candidates),
-                    )
-                if action == "edit":
-                    new_text = content.strip()
-                    if not new_text:
-                        return
-                    for m in matches:
-                        try:
-                            self._store.update(m["id"], text=new_text)
-                        except Exception as e:
-                            logger.warning(
-                                "lancedb_pro on_memory_write edit id=%s: %s",
-                                m.get("id"), e,
-                            )
-                else:  # delete
-                    now_ms = int(time.time() * 1000)
-                    for m in matches:
-                        try:
-                            self._store.update(
-                                m["id"],
-                                metadata_extra={
-                                    "state": _ARCHIVED_STATE,
-                                    "invalidated_at": now_ms,
-                                },
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "lancedb_pro on_memory_write delete id=%s: %s",
-                                m.get("id"), e,
-                            )
+            text = (content or "").strip()
+            if not text:
                 return
-
-            if not content.strip():
-                return
-            sess = (metadata or {}).get("session_id") or ""
-            extra = {"source": f"hermes_{target}"}
-            if sess:
-                extra["source_session"] = sess
-            if metadata:
-                # Pass through any provenance the agent supplied
-                extra.update(
-                    {k: v for k, v in metadata.items() if k not in ("session_id", "replace_all")}
-                )
+            is_user = target == "user"
             try:
                 self._store.store(
-                    text=content.strip(),
-                    category="preference" if target == "user" else "other",
-                    scope="user" if target == "user" else "agent",
+                    text=text,
+                    category="preference" if is_user else "other",
+                    scope="user" if is_user else "agent",
                     importance=0.6,
                     # Built-in memory writes are user-curated and should
                     # surface across sessions.
-                    metadata_extra={**extra, "cross_session": True},
+                    metadata_extra={
+                        "source": f"hermes_{target}",
+                        "memory_write_action": action,
+                        "cross_session": True,
+                    },
                 )
             except Exception as e:
                 logger.warning("lancedb_pro on_memory_write failed: %s", e)
