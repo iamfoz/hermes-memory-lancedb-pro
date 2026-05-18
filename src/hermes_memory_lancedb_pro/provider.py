@@ -1229,13 +1229,22 @@ def _build_provider_class():
             return "\n".join(lines)
 
         def prefetch(self, query: str, session_id: str | None = None) -> str:
-            """User-message memory injection (legacy hermes-agent path).
+            """Query-dependent recall — the standard (`main`-branch) path.
 
-            Returns the formatted recall block. On hermes-agent versions
-            that support `before_prompt_build`, this method is NOT
-            called — the host detects our override and skips prefetch
-            to avoid double-injection. On older hermes-agent, this is
-            the only injection point."""
+            Returns the formatted recall block (relevant memories +
+            reflection) for the user message position. On a host running
+            the `feat/memory-provider-hooks` branch — which adds
+            `before_prompt_build` — the host detects our `before_prompt_build`
+            override and SKIPS this method to avoid double-injecting recall.
+            On a `main`-branch host (no `before_prompt_build`) this is the
+            recall injection point.
+
+            The durable-task protocol and active-task state are NOT returned
+            here — those belong to `system_prompt_block()`, which every host
+            calls. An empty query therefore yields an empty string rather
+            than falling through to the protocol branch of `_do_recall`."""
+            if not query or not query.strip():
+                return ""
             self._flush_pending_write()
             return self._do_recall(query, session_id or self._session_id)
 
@@ -1307,16 +1316,26 @@ def _build_provider_class():
                 return ""
 
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
-            """Forward-compat shim — NOT called by current hermes-agent.
+            """Query-dependent recall — the `feat/memory-provider-hooks` path.
 
-            Upstream `agent/memory_manager.py` exposes `system_prompt_block`,
-            `prefetch`, `queue_prefetch`, `sync_turn` and `on_pre_compress`,
-            but no `before_prompt_build`. This method is kept only so the
-            same wheel keeps working if a future hermes-agent reintroduces a
-            turn-state system-prompt hook; on today's hosts it is dormant.
-            The live system-prompt path is `system_prompt_block()`."""
-            self._flush_pending_write()
+            This is a non-standard hook: it exists on hermes-agent's
+            `feat/memory-provider-hooks` branch, not on `main`. When the host
+            supports it, it is called once per turn after the user message is
+            known and the result is appended to the system prompt; the host
+            then SKIPS this provider's `prefetch` to avoid double-injecting
+            recall. On a `main`-branch host the hook simply never fires — an
+            unused method is harmless, so the same wheel runs unmodified on
+            both branches (recall travels via `prefetch` instead).
+
+            Like `prefetch`, this returns only the query-dependent recall
+            block. The durable-task protocol and active-task state come from
+            `system_prompt_block()`, which both host branches always call —
+            so an empty query yields an empty string here rather than
+            duplicating the protocol the system prompt already carries."""
             query = str(turn_state.get("query") or "")
+            if not query.strip():
+                return ""
+            self._flush_pending_write()
             session_id = str(turn_state.get("session_id") or "") or self._session_id
             return self._do_recall(query, session_id)
 

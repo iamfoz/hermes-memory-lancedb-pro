@@ -588,6 +588,42 @@ class TestSystemPromptBlockAndCompaction:
 
 
 @pytest.mark.integration
+class TestRecallHookSeparation:
+    """The durable-task protocol lives only in `system_prompt_block`; the
+    query-dependent recall hooks (`prefetch`, `before_prompt_build`) never
+    duplicate it. `before_prompt_build` is the non-standard
+    `feat/memory-provider-hooks` path — it must coexist with `prefetch`
+    without double-injecting."""
+
+    def _provider(self, provider_cls, store, session="sess-1"):
+        p = provider_cls(store=store, auto_smart_extraction=False)
+        p.initialize(session)
+        return p
+
+    def test_prefetch_empty_query_returns_empty(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        assert p.prefetch("") == ""
+        assert p.prefetch("   ") == ""
+
+    def test_before_prompt_build_empty_query_returns_empty(
+        self, provider_cls, real_store
+    ):
+        p = self._provider(provider_cls, real_store)
+        assert p.before_prompt_build({"query": ""}) == ""
+        assert p.before_prompt_build({}) == ""
+
+    def test_recall_hooks_do_not_duplicate_protocol(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        # The protocol belongs to system_prompt_block...
+        assert "Memory Task Protocol" in p.system_prompt_block()
+        # ...and must NOT also appear in the query-dependent recall hooks.
+        assert "Memory Task Protocol" not in p.prefetch("a real user query")
+        assert "Memory Task Protocol" not in p.before_prompt_build(
+            {"query": "a real user query"}
+        )
+
+
+@pytest.mark.integration
 class TestAutoAnchor:
     """_auto_anchor_session_if_needed: idempotent, pin-aware, self-cleaning."""
 

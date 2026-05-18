@@ -1,10 +1,14 @@
 name: lancedb_pro
-version: 0.11.31
+version: 0.11.32
 kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
+# Standard hooks work on hermes-agent `main`. before_prompt_build, on_recall_used
+# and on_tool_call_observed are non-standard — they exist on the
+# `feat/memory-provider-hooks` branch and are inert (never called) on `main`.
 hooks:
   - system_prompt_block
   - prefetch
+  - before_prompt_build
   - sync_turn
   - on_pre_compress
   - on_memory_write
