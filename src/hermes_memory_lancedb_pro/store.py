@@ -118,6 +118,27 @@ INJECTION_GUARD_MODE: str = os.environ.get(
 ).lower().strip()
 
 
+def _raise_if_fd_exhaustion(exc: Exception) -> None:
+    """Re-raise *exc* as a clear OSError when it signals file-descriptor
+    exhaustion (EMFILE / errno 24 / "too many open files").
+
+    LanceDB + PyTorch each open many file handles; on macOS the default
+    ulimit -n is only 256, which can be exhausted under sustained load
+    (~2 000+ store operations with concurrent reads).
+
+    Callers: wrap LanceDB I/O in try/except and call this before re-raising
+    so users get an actionable message instead of a cryptic LanceError."""
+    msg = str(exc).lower()
+    if "too many open files" in msg or "os error 24" in msg or "emfile" in msg:
+        raise OSError(
+            "MemoryStore: OS file-descriptor limit exhausted — memory operations "
+            "will fail until the limit is raised.  Fix: run  `ulimit -n 4096`  "
+            "in your shell before starting hermes-agent, or add it to "
+            "~/.zshrc / ~/.bashrc.  "
+            f"Original error: {exc}"
+        ) from exc
+
+
 def _check_injection_guard(text: str, *, where: str) -> str:
     """Apply the prompt-injection guard. Returns the (possibly sanitised)
     text, or raises ValueError when mode == 'reject'.
@@ -452,18 +473,22 @@ class MemoryStore:
         )
 
         vector = self.encode(text)
-        self._table.add([
-            MemorySchema(
-                id=mem_id,
-                text=text,
-                vector=vector,
-                category=category,
-                scope=scope,
-                importance=importance,
-                timestamp=now_ms,
-                metadata=json.dumps(metadata),
-            )
-        ])
+        try:
+            self._table.add([
+                MemorySchema(
+                    id=mem_id,
+                    text=text,
+                    vector=vector,
+                    category=category,
+                    scope=scope,
+                    importance=importance,
+                    timestamp=now_ms,
+                    metadata=json.dumps(metadata),
+                )
+            ])
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         return mem_id
 
     def store_many(
@@ -515,7 +540,11 @@ class MemoryStore:
             )
             ids.append(mem_id)
 
-        self._table.add(prepared)
+        try:
+            self._table.add(prepared)
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         return ids
 
     def store_raw(
@@ -555,18 +584,22 @@ class MemoryStore:
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
         importance = max(0.0, min(1.0, float(importance)))
 
-        self._table.add([
-            MemorySchema(
-                id=mem_id,
-                text=text,
-                vector=list(vector),
-                category=category,
-                scope=scope,
-                importance=importance,
-                timestamp=ts,
-                metadata=metadata,
-            )
-        ])
+        try:
+            self._table.add([
+                MemorySchema(
+                    id=mem_id,
+                    text=text,
+                    vector=list(vector),
+                    category=category,
+                    scope=scope,
+                    importance=importance,
+                    timestamp=ts,
+                    metadata=metadata,
+                )
+            ])
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         return mem_id
 
     def search_by_vector(
@@ -1178,7 +1211,11 @@ class MemoryStore:
         # Over-fetch more aggressively when post-filtering by session, since
         # session-matching rows may be sparse in the top-N from LanceDB.
         overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
-        results = search.limit(max(limit * overfetch, limit)).to_list()
+        try:
+            results = search.limit(max(limit * overfetch, limit)).to_list()
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         results = self._post_filter(results, session_id=session_id)
 
         rows = [
@@ -1213,7 +1250,11 @@ class MemoryStore:
         if where:
             search = search.where(where)
         overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
-        results = search.limit(max(limit * overfetch, limit)).to_list()
+        try:
+            results = search.limit(max(limit * overfetch, limit)).to_list()
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         results = self._post_filter(results, session_id=session_id)
 
         if min_score is not None:
