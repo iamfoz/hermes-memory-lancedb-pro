@@ -533,7 +533,11 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="Run the stress suite to completion",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         block = p.system_prompt_block()
         assert "=== ACTIVE TASK STATE ===" in block
@@ -546,7 +550,11 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="auto anchor breadcrumb text",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         real_store.store(
             text="FORMAL PIN control block",
@@ -616,12 +624,35 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="auto anchor breadcrumb for the session",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
         recall = p.prefetch("anything the user might ask")
         assert "=== ACTIVE TASK STATE ===" not in recall
         assert "auto anchor breadcrumb" not in recall
+
+    def test_system_prompt_block_isolates_conversations(
+        self, provider_cls, real_store
+    ):
+        """A gateway serves many conversations from one shared store. One
+        conversation's auto-anchor must never surface in another's system
+        prompt."""
+        pa = self._provider(provider_cls, real_store, session="conv-A")
+        pa.on_pre_compress([
+            {"role": "user", "content": "Build the conv-A feature"},
+        ])
+        # A second conversation, separate provider instance, same store.
+        pb = provider_cls(store=real_store, auto_smart_extraction=False)
+        pb.initialize("conv-B")
+        block_b = pb.system_prompt_block()
+        assert "Build the conv-A feature" not in block_b
+        assert "=== ACTIVE TASK STATE ===" not in block_b
+        # conv-A still sees its own anchor.
+        assert "Build the conv-A feature" in pa.system_prompt_block()
 
 
 @pytest.mark.integration
@@ -662,20 +693,23 @@ class TestRecallHookSeparation:
 
 @pytest.mark.integration
 class TestAutoAnchor:
-    """_auto_anchor_session_if_needed: idempotent, pin-aware, self-cleaning."""
+    """_auto_anchor_session_if_needed: idempotent, pin-aware, conversation-
+    scoped. The anchor is keyed by conversation id so it survives the
+    session-id rotation that context compression performs, yet stays
+    isolated from other conversations sharing the same store."""
 
     def test_creates_anchor_when_none_exists(self, real_store):
         provider._auto_anchor_session_if_needed(
-            "Fix the failing tests", "sess-A", real_store
+            "Fix the failing tests", "sess-A", "conv-A", real_store
         )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1
         assert "Fix the failing tests" in anchors[0]["text"]
 
-    def test_idempotent_no_duplicate_for_same_session(self, real_store):
+    def test_idempotent_no_duplicate_for_same_conversation(self, real_store):
         for _ in range(3):
             provider._auto_anchor_session_if_needed(
-                "Fix the failing tests", "sess-A", real_store
+                "Fix the failing tests", "sess-A", "conv-A", real_store
             )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1
@@ -687,7 +721,7 @@ class TestAutoAnchor:
             metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
         )
         provider._auto_anchor_session_if_needed(
-            "some objective", "sess-A", real_store
+            "some objective", "sess-A", "conv-A", real_store
         )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1  # only the formal pin; no auto-anchor added
@@ -696,14 +730,14 @@ class TestAutoAnchor:
         )
 
     def test_anchor_survives_session_id_rotation(self, real_store):
-        # Context compression rotates session_id mid-conversation. The anchor
-        # and its original objective must persist, not churn into the latest
-        # turn's text under a new session id.
+        # Context compression rotates session_id mid-conversation but keeps
+        # the conversation id. The anchor and its original objective must
+        # persist, not churn into the latest turn's text.
         provider._auto_anchor_session_if_needed(
-            "Original objective", "sess-1", real_store
+            "Original objective", "sess-1", "conv-1", real_store
         )
         provider._auto_anchor_session_if_needed(
-            "later turn after a compaction", "sess-2", real_store
+            "later turn after a compaction", "sess-2", "conv-1", real_store
         )
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
@@ -711,27 +745,52 @@ class TestAutoAnchor:
         assert len(live) == 1
         assert "Original objective" in live[0]["text"]
 
-    def test_archive_auto_anchors_clears_all_live_anchors(self, real_store):
-        provider._auto_anchor_session_if_needed("work A", "sess-A", real_store)
-        n = provider._archive_auto_anchors(real_store)
+    def test_anchors_isolated_across_conversations(self, real_store):
+        # Two conversations sharing one store each get their OWN anchor.
+        provider._auto_anchor_session_if_needed(
+            "conv A work", "sA", "conv-A", real_store
+        )
+        provider._auto_anchor_session_if_needed(
+            "conv B work", "sB", "conv-B", real_store
+        )
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert len(live) == 2
+        by_conv = {
+            (m["metadata"] or {}).get("conversation_id"): m["text"]
+            for m in live
+        }
+        assert "conv A work" in by_conv["conv-A"]
+        assert "conv B work" in by_conv["conv-B"]
+
+    def test_archive_auto_anchors_scoped_to_one_conversation(self, real_store):
+        provider._auto_anchor_session_if_needed("A", "sA", "conv-A", real_store)
+        provider._auto_anchor_session_if_needed("B", "sB", "conv-B", real_store)
+        n = provider._archive_auto_anchors(real_store, "conv-A")
         assert n == 1
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
         )
-        assert live == []
+        assert len(live) == 1
+        assert (live[0]["metadata"] or {}).get("conversation_id") == "conv-B"
 
     def test_archive_auto_anchors_leaves_formal_pins(self, real_store):
         real_store.store(
             text="auto anchor breadcrumb",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-A"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-A",
+                "conversation_id": "conv-A",
+            },
         )
         real_store.store(
             text="FORMAL PIN block",
             category="active_task", scope="global", importance=1.0,
             metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
         )
-        n = provider._archive_auto_anchors(real_store)
+        n = provider._archive_auto_anchors(real_store, "conv-A")
         assert n == 1
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
