@@ -374,75 +374,70 @@ class TestSessionSwitch:
 
 
 # ---------------------------------------------------------------------------
-# on_memory_write — edit / delete / replace_all
+# on_memory_write — mirror built-in memory tool add / replace writes
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-class TestOnMemoryWriteEditDelete:
-    """on_memory_write edit and delete actions must mutate the LanceDB store."""
+class TestOnMemoryWrite:
+    """on_memory_write mirrors built-in memory tool writes. Per the host
+    contract (agent/tool_executor.py) it is called only for `add` and
+    `replace`, with the NEW content and a `memory`/`user` target."""
 
     def _provider(self, provider_cls, store):
         p = provider_cls(store=store, auto_smart_extraction=False)
         p.initialize("sess-1")
         return p
 
-    def test_add_stores_memory(self, provider_cls, real_store):
+    def test_add_user_target_stored_as_preference(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
         p.on_memory_write("add", "user", "The user loves cycling")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert any("cycling" in t for t in texts)
+        assert len(rows) == 1
+        assert "cycling" in rows[0]["text"]
+        assert rows[0]["category"] == "preference"
+        assert rows[0]["scope"] == "user"
 
-    def test_edit_supersedes_matching_memory(self, provider_cls, real_store):
+    def test_add_memory_target_stored_as_agent_scope(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "The user loves cycling")
-        p.on_memory_write("edit", "The user loves cycling", "The user loves running")
+        p.on_memory_write("add", "memory", "The build uses pnpm, not npm")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert any("running" in t for t in texts)
-        assert not any(t == "The user loves cycling" for t in texts), (
-            "old text should be archived, not visible in list_memories"
-        )
+        assert len(rows) == 1
+        assert "pnpm" in rows[0]["text"]
+        assert rows[0]["scope"] == "agent"
 
-    def test_delete_archives_matching_memory(self, provider_cls, real_store):
+    def test_replace_is_mirrored_as_new_content(self, provider_cls, real_store):
+        """The host passes only the NEW content for a `replace` (no old
+        text), so it must be stored — not silently dropped."""
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "agent", "Temporary task context")
-        p.on_memory_write("delete", "Temporary task context", "")
+        p.on_memory_write("replace", "user", "The user now prefers spaces")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert not any("Temporary task context" in t for t in texts)
+        assert len(rows) == 1
+        assert "spaces" in rows[0]["text"]
 
-    def test_edit_replace_all_updates_multiple(self, provider_cls, real_store):
+    def test_remove_action_is_ignored(self, provider_cls, real_store):
+        # The host never forwards `remove`; if it arrives we ignore it.
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "coffee preference: black")
-        p.on_memory_write("add", "user", "coffee preference: no sugar")
-        p.on_memory_write(
-            "edit",
-            "coffee preference",
-            "coffee preference: oat milk",
-            metadata={"replace_all": True},
-        )
-        rows = real_store.list_memories(limit=50)
-        updated = [r for r in rows if "oat milk" in r["text"]]
-        assert len(updated) >= 2, "both entries should be superseded with the new text"
+        p.on_memory_write("remove", "user", "something")
+        assert real_store.list_memories(limit=50) == []
 
     def test_unknown_action_is_ignored(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("replace", "target", "content")  # unknown — must not raise
+        p.on_memory_write("frobnicate", "user", "content")  # must not raise
         assert real_store.list_memories(limit=50) == []
 
-    def test_edit_empty_query_is_noop(self, provider_cls, real_store):
+    def test_empty_content_is_noop(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("edit", "", "")  # must not raise
+        p.on_memory_write("add", "user", "   ")  # must not raise
         assert real_store.list_memories(limit=50) == []
 
-    def test_add_skips_replace_all_in_metadata(self, provider_cls, real_store):
+    def test_metadata_arg_is_accepted(self, provider_cls, real_store):
+        # The host passes metadata={task_id, tool_call_id}; it must not crash.
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "test content", metadata={"replace_all": True})
-        rows = real_store.list_memories(limit=50)
-        assert len(rows) == 1
-        meta = rows[0].get("metadata", {})
-        assert "replace_all" not in meta, "replace_all must not be stored in row metadata"
+        p.on_memory_write(
+            "add", "memory", "a fact",
+            metadata={"task_id": "t1", "tool_call_id": "tc1"},
+        )
+        assert len(real_store.list_memories(limit=50)) == 1
 
 
 # ---------------------------------------------------------------------------
