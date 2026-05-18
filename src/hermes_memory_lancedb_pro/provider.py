@@ -712,6 +712,94 @@ def _maybe_auto_purge(store: MemoryStore) -> None:
         logger.warning("Auto-purge failed (will retry next session): %s", e)
 
 
+def _auto_anchor_session_if_needed(
+    user_content: str,
+    session_id: str,
+    store: MemoryStore,
+) -> None:
+    """Auto-create an active_task breadcrumb if no task anchor exists yet.
+
+    Without a pinned task, context compaction silently destroys all session
+    state and the model resets to greeting.  This breadcrumb gives
+    `before_prompt_build` something to return after compaction so the model
+    knows it is mid-session and must not greet.
+
+    Idempotent — skips when a formal task pin (has `state_path` in metadata)
+    or an auto-anchor for this session already exists.  Archives stale
+    auto-anchors from other sessions so only one breadcrumb is live at a time.
+    """
+    try:
+        existing = store.list_memories(
+            limit=10,
+            category="active_task",
+            include_archived=False,
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor check failed: %s", exc)
+        return
+
+    # Formal task pin present — nothing to do
+    if any(
+        isinstance(r.get("metadata"), dict) and r["metadata"].get("state_path")
+        for r in existing
+    ):
+        return
+
+    # Archive stale auto-anchors from other sessions
+    for r in existing:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if meta.get("auto_anchor"):
+            old_session = meta.get("source_session", "")
+            if old_session != (session_id or ""):
+                try:
+                    store.update(r["id"], metadata_extra={"state": "archived"})
+                    logger.debug(
+                        "lancedb_pro archived stale auto-anchor %s (session %s)",
+                        r["id"], old_session,
+                    )
+                except Exception as exc:
+                    logger.debug("lancedb_pro archive stale anchor failed: %s", exc)
+
+    # This session already has an auto-anchor — nothing to do
+    if session_id and any(
+        isinstance(r.get("metadata"), dict)
+        and r["metadata"].get("auto_anchor")
+        and r["metadata"].get("source_session") == session_id
+        for r in existing
+    ):
+        return
+
+    snippet = (user_content or "").strip()
+    if len(snippet) > 200:
+        snippet = snippet[:197] + "…"
+
+    anchor_text = (
+        "SESSION IN PROGRESS — do NOT greet.\n"
+        + (f'User started with: "{snippet}"\n' if snippet else "")
+        + "\nContinue from where you left off.\n"
+        "Run `hermes-memory-lancedb-pro task list` to check for pinned tasks.\n"
+        "If mid-task: resume it. Otherwise: answer the user's message directly."
+    )
+
+    meta: dict[str, Any] = {"auto_anchor": True, "priority": "must_include"}
+    if session_id:
+        meta["source_session"] = session_id
+
+    try:
+        store.store(
+            text=anchor_text,
+            category="active_task",
+            scope="agent",
+            importance=0.9,
+            metadata_extra=meta,
+        )
+        logger.debug(
+            "lancedb_pro auto-anchored session %s", session_id or "global"
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor write failed: %s", exc)
+
+
 def _build_provider_class():
     """Construct the LanceDBProMemoryProvider class lazily.
 
@@ -956,25 +1044,18 @@ def _build_provider_class():
                         include_archived=False,
                     )
                     task_mems = _refresh_active_task_memories(task_mems)
+                    # Prefer formal task pins (state_path) over auto-anchors
+                    # when both exist — the pin is always more authoritative.
+                    formal_pins = [
+                        m for m in task_mems
+                        if (m.get("metadata") or {}).get("state_path")
+                    ]
+                    if formal_pins:
+                        task_mems = formal_pins
                     if task_mems:
                         task_block = _format_recall(task_mems)
                         if task_block:
                             parts.append(task_block)
-                    elif _RECALL_TASK_PROTOCOL:
-                        # No pinned task found.  Add an explicit warning so the
-                        # model knows it has no recovery anchor.  Without a
-                        # pinned task, context compaction silently destroys all
-                        # task state and the model resets to greeting.
-                        parts.append(
-                            "⚠️  NO ACTIVE TASK PINNED\n"
-                            "If you are doing multi-step work (>3 tool calls, "
-                            "test runs, iterative loops), you MUST run:\n"
-                            "  hermes-memory-lancedb-pro task create --id <id> "
-                            "--objective \"<objective>\"\n"
-                            "  hermes-memory-lancedb-pro task pin <id>\n"
-                            "Do this NOW, before your next tool call, or your "
-                            "progress will be lost at context compaction."
-                        )
                 except Exception as _exc:
                     logger.debug(
                         "lancedb_pro no-query active task inject failed: %s", _exc
@@ -1217,6 +1298,18 @@ def _build_provider_class():
                     self._raw_sync_turn(
                         user_content, assistant_content, effective_session_id,
                         _store_override=_store,
+                    )
+
+                # Ensure a recovery anchor exists so before_prompt_build can
+                # return meaningful context after context compaction — even
+                # when the model hasn't explicitly run `task create` + `task pin`.
+                try:
+                    _auto_anchor_session_if_needed(
+                        user_content, effective_session_id, _store,
+                    )
+                except Exception as _anchor_exc:
+                    logger.debug(
+                        "lancedb_pro auto-anchor failed: %s", _anchor_exc
                     )
 
                 # Credit the memories the model saw in its prefetch — bypasses
