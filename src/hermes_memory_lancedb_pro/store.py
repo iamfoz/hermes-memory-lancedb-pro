@@ -75,7 +75,15 @@ SEARCH_OVERFETCH_MULTIPLIER: int = 3
 # Index training threshold — LanceDB IVF_PQ needs ~256 rows minimum
 VECTOR_INDEX_MIN_ROWS: int = 256
 
-MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other", "reflection"]
+# "active_task" backs the durable-task pin: `task pin`, the recall-guardrail
+# active-task pinning, `_format_recall`, `_refresh_active_task_memories` and the
+# session auto-anchor all read/write this category. It MUST be a recognised
+# category — otherwise `store()` silently coerces it to "other" and every
+# `list_memories(category="active_task")` lookup returns nothing, which
+# silently disables task-state recovery across context compaction.
+MEMORY_CATEGORIES = [
+    "preference", "fact", "decision", "entity", "other", "reflection", "active_task",
+]
 MEMORY_TIERS = ["core", "working", "peripheral"]
 MEMORY_STATES = ["pending", "confirmed", "archived"]
 

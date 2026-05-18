@@ -284,6 +284,27 @@ def _extract_message_texts(messages: Any) -> list[str]:
     return texts
 
 
+def _first_user_text(messages: Any) -> str:
+    """Return the text of the first user-role message, or "" if none.
+
+    Used by `on_pre_compress` to seed the session anchor with the user's
+    original objective rather than whatever short follow-up ("continue",
+    "yes") happens to be the most recent message before compaction."""
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content") or msg.get("text") or ""
+        if isinstance(content, list):
+            content = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 _MS_PER_DAY = 86_400_000
 _MS_PER_HOUR = 3_600_000
 _MS_PER_WEEK = 7 * _MS_PER_DAY
@@ -1164,8 +1185,12 @@ def _build_provider_class():
 
             recall_block = _format_recall(results)
             reflection_block = self._reflection_block(session_id)
-            protocol_block = _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
-            parts = [p for p in [protocol_block, reflection_block, recall_block] if p]
+            # The durable-task protocol is NOT injected here — it lives in
+            # `system_prompt_block()`, the authoritative per-turn system-prompt
+            # hook. Injecting it via prefetch too would duplicate ~375 tokens
+            # every turn and bust prompt caching (prefetch text changes turn
+            # to turn; the system prompt is stable and cacheable).
+            parts = [p for p in [reflection_block, recall_block] if p]
             return "\n\n".join(parts)
 
         def _reflection_block(self, session_id: str) -> str:
@@ -1214,20 +1239,82 @@ def _build_provider_class():
             self._flush_pending_write()
             return self._do_recall(query, session_id or self._session_id)
 
+        def system_prompt_block(self) -> str:
+            """Query-independent text injected into the SYSTEM PROMPT.
+
+            This is hermes-agent's authoritative memory hook: `MemoryManager.
+            build_system_prompt()` calls it once per turn and concatenates the
+            result into the system prompt itself.
+
+            It is the correct home for the durable-task protocol and the
+            active-task control block because:
+
+              * the system prompt is re-assembled every turn but is NOT
+                discarded by context compaction — so a "you are mid-task,
+                do not greet" directive placed here survives compaction
+                automatically, which `prefetch` context (user-message
+                position) does not;
+              * the model treats system-prompt text as ground truth rather
+                than as recalled data it might mistake for a user payload;
+              * the protocol text is stable, so keeping it here (instead of
+                in the turn-varying `prefetch` block) is a prompt-cache hit.
+
+            Returns the protocol plus the current active-task state, reloaded
+            fresh from state.json on every call via the empty-query branch of
+            `_do_recall`."""
+            self._flush_pending_write()
+            try:
+                return self._do_recall("", self._session_id)
+            except Exception as exc:
+                logger.debug("lancedb_pro system_prompt_block failed: %s", exc)
+                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+
+        def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+            """Called by the host right before context compression discards
+            old messages. The return value is merged into the compression
+            summary prompt, so anything returned here survives compaction
+            inside the compressed context itself.
+
+            Two jobs:
+              1. Ensure a session recovery anchor exists — compaction is the
+                 exact failure point for the greeting loop, so this is the
+                 last safe moment to guarantee `system_prompt_block` will
+                 have an active-task breadcrumb to surface afterwards.
+              2. Return the current active-task control block so the host
+                 folds it into the compressed summary as a second, redundant
+                 copy of the task state."""
+            try:
+                first_user = _first_user_text(messages)
+                _auto_anchor_session_if_needed(
+                    first_user, self._session_id, self._store,
+                )
+            except Exception as exc:
+                logger.debug("lancedb_pro on_pre_compress anchor failed: %s", exc)
+            try:
+                task_mems = self._store.list_memories(
+                    limit=5, category="active_task", include_archived=False,
+                )
+                task_mems = _refresh_active_task_memories(task_mems)
+                formal_pins = [
+                    m for m in task_mems
+                    if (m.get("metadata") or {}).get("state_path")
+                ]
+                if formal_pins:
+                    task_mems = formal_pins
+                return _format_recall(task_mems) if task_mems else ""
+            except Exception as exc:
+                logger.debug("lancedb_pro on_pre_compress export failed: %s", exc)
+                return ""
+
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
-            """System-prompt memory injection (new hermes-agent path).
+            """Forward-compat shim — NOT called by current hermes-agent.
 
-            On hosts that support the hook (introduced via the
-            corresponding hermes-agent PR), this places the recall
-            block in the system prompt — a more authoritative position
-            than the user message. The host calls this instead of
-            `prefetch` for providers that override it; we override it,
-            so on a new host we'll always go through here.
-
-            Older hosts never call this method, so it's dormant for
-            users who haven't picked up the hermes-agent change. The
-            plugin keeps both methods so the SAME wheel works against
-            both old and new hermes-agent."""
+            Upstream `agent/memory_manager.py` exposes `system_prompt_block`,
+            `prefetch`, `queue_prefetch`, `sync_turn` and `on_pre_compress`,
+            but no `before_prompt_build`. This method is kept only so the
+            same wheel keeps working if a future hermes-agent reintroduces a
+            turn-state system-prompt hook; on today's hosts it is dormant.
+            The live system-prompt path is `system_prompt_block()`."""
             self._flush_pending_write()
             query = str(turn_state.get("query") or "")
             session_id = str(turn_state.get("session_id") or "") or self._session_id
