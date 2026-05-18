@@ -622,19 +622,43 @@ def _apply_recall_guardrails(
     return pinned + rest
 
 
+def _stable_task_block(state: dict[str, Any]) -> str:
+    """A running-task block built ONLY from immutable fields (task id,
+    objective). Safe to place in the cached system prompt: it does not
+    change on every ``task advance`` the way ``build_control_block`` does
+    (current iteration, next action, recent summary). The model fetches
+    live iteration state with ``task resume`` instead."""
+    task_id = state.get("task_id", "unknown")
+    objective = state.get("objective", "(none)")
+    return (
+        "ACTIVE TASK — do NOT greet.\n"
+        f"Task ID:   {task_id}\n"
+        f"Objective: {objective}\n"
+        "Status:    running (you started this task in this conversation).\n"
+        "For the current iteration and next action, run:\n"
+        f"  hermes-memory-lancedb-pro task resume {task_id}\n"
+        "Then continue the task — do NOT greet, do NOT restart it."
+    )
+
+
 def _refresh_active_task_memories(
     results: list[dict[str, Any]],
+    *,
+    stable: bool = False,
 ) -> list[dict[str, Any]]:
-    """For pinned active_task memories that carry a state_path, reload the control
-    block text from disk on every recall.
+    """For pinned active_task memories that carry a state_path, reload the
+    control block text from ``state.json`` on every recall.
 
-    Without this, the pinned text is the snapshot from when ``task pin`` was run.
-    After ``advance_iteration`` increments the counter, the recall block shows a
-    stale iteration number.  More importantly, this makes the active task block
-    survive context compaction: even after compaction wipes the conversation history,
-    ``before_prompt_build`` still injects the *current* control block from
-    ``state.json`` so the model always knows what iteration it is on and what to
-    do next.
+    This keeps the injected task block current after ``advance_iteration``
+    and makes it survive context compaction.
+
+    ``stable``: when True the running-task block is rendered from immutable
+    fields only (see ``_stable_task_block``) so it does NOT change between
+    turns. The ``system_prompt_block`` path requires this — the system
+    prompt is prompt-cache breakpoint 1, and mutating it every turn busts
+    the cache (see the context-compression / caching guide). ``on_pre_compress``
+    leaves ``stable`` False: its output feeds the compression summary, which
+    is regenerated each compaction anyway, so the full live block is fine.
     """
     refreshed = []
     for r in results:
@@ -680,6 +704,8 @@ def _refresh_active_task_memories(
                     "Do NOT say the results are 'attached to your message' or 'a payload you sent'.\n"
                     "Do NOT greet. Do NOT re-run the task."
                 )
+            elif stable:
+                control_text = _stable_task_block(state)
             else:
                 control_text = _build_task_control_block(state)
 
@@ -1122,7 +1148,10 @@ def _build_provider_class():
                         m for m in task_mems
                         if _anchor_belongs(m.get("metadata") or {}, self._conversation_id)
                     ]
-                    task_mems = _refresh_active_task_memories(task_mems)
+                    # stable=True: this text lands in the cached system
+                    # prompt, so the running-task block must not change on
+                    # every `task advance`.
+                    task_mems = _refresh_active_task_memories(task_mems, stable=True)
                     # Prefer formal task pins (state_path) over auto-anchors
                     # when both exist — the pin is always more authoritative.
                     formal_pins = [
@@ -1328,9 +1357,13 @@ def _build_provider_class():
               * the protocol text is stable, so keeping it here (instead of
                 in the turn-varying `prefetch` block) is a prompt-cache hit.
 
-            Returns the protocol plus the current active-task state, reloaded
-            fresh from state.json on every call via the empty-query branch of
-            `_do_recall`."""
+            The system prompt is prompt-cache breakpoint 1 and must stay
+            stable between turns, so the active-task block injected here uses
+            the immutable-fields-only rendering (`_refresh_active_task_memories
+            (stable=True)`): it does not change on every `task advance`. The
+            model fetches live iteration state with `task resume`; the full
+            live block also reaches the compression summary via
+            `on_pre_compress`."""
             self._flush_pending_write()
             try:
                 return self._do_recall("", self._session_id)

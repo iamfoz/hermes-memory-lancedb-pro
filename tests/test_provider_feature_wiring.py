@@ -121,6 +121,22 @@ class TestPureHelpers:
         assert provider._first_user_text([{"role": "assistant", "content": "x"}]) == ""
         assert provider._first_user_text([]) == ""
 
+    def test_stable_task_block_omits_per_iteration_fields(self):
+        state = {
+            "task_id": "t1", "objective": "Do the thing", "status": "running",
+            "current_iteration": 7, "next_action": "step eight",
+            "recent_summary": "did stuff",
+        }
+        block = provider._stable_task_block(state)
+        assert "Do the thing" in block
+        assert "t1" in block
+        assert "do NOT greet" in block
+        # Per-iteration fields must be absent — including them would mutate
+        # the cached system prompt on every `task advance`.
+        assert "7" not in block
+        assert "step eight" not in block
+        assert "did stuff" not in block
+
 
 def test_build_reflection_prompt_contains_transcript_and_json_keys():
     from hermes_memory_lancedb_pro.extraction_prompts import build_reflection_prompt
@@ -130,6 +146,30 @@ def test_build_reflection_prompt_contains_transcript_and_json_keys():
     assert "invariants" in prompt
     assert "derived" in prompt
     assert "JSON" in prompt
+
+
+def test_refresh_active_task_stable_vs_live(tmp_path):
+    """stable=True omits per-iteration fields; the default keeps the full
+    live control block (current iteration / next action)."""
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    task_root = tmp_path / "tasks"
+    tl.create_task(
+        "t-x", objective="The objective", target_iterations=3, root=task_root
+    )
+    tl.advance_iteration("t-x", next_action="the next action", root=task_root)
+    state_path = str(tl._state_path("t-x", task_root))
+    mem = {
+        "category": "active_task", "text": "pinned snapshot",
+        "metadata": {"task_id": "t-x", "state_path": state_path},
+    }
+    live = provider._refresh_active_task_memories([dict(mem)])[0]["text"]
+    stable = provider._refresh_active_task_memories(
+        [dict(mem)], stable=True
+    )[0]["text"]
+    assert "the next action" in live
+    assert "the next action" not in stable
+    assert "The objective" in stable
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +674,37 @@ class TestSystemPromptBlockAndCompaction:
         recall = p.prefetch("anything the user might ask")
         assert "=== ACTIVE TASK STATE ===" not in recall
         assert "auto anchor breadcrumb" not in recall
+
+    def test_system_prompt_block_stable_across_task_advance(
+        self, provider_cls, real_store, tmp_path
+    ):
+        """system_prompt_block feeds the cached system prompt (cache
+        breakpoint 1). Its output must be byte-identical across a pinned
+        task advancing an iteration — otherwise the cache is busted every
+        task turn."""
+        from hermes_memory_lancedb_pro import task_ledger as tl
+
+        task_root = tmp_path / "tasks"
+        tl.create_task(
+            "t-cache", objective="Cache stability check",
+            target_iterations=5, root=task_root,
+        )
+        state_path = str(tl._state_path("t-cache", task_root))
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="pinned snapshot",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t-cache", "state_path": state_path},
+        )
+        before = p.system_prompt_block()
+        assert "Cache stability check" in before
+        assert "=== ACTIVE TASK STATE ===" in before
+        # Advance the task — current_iteration / next_action change on disk.
+        tl.advance_iteration("t-cache", next_action="do step 2", root=task_root)
+        after = p.system_prompt_block()
+        assert after == before, (
+            "system_prompt_block must not change when a pinned task advances"
+        )
 
     def test_system_prompt_block_isolates_conversations(
         self, provider_cls, real_store
