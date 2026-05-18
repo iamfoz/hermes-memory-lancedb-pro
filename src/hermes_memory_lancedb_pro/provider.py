@@ -945,12 +945,7 @@ def _build_provider_class():
             if not query or not query.strip():
                 # No query — before_prompt_build assembling the
                 # query-independent system prompt.  Return the protocol text
-                # PLUS any pinned active-task state from disk, so the model
-                # knows its task state even after context compaction wipes
-                # the conversation history.  Without the task-state injection
-                # here, the model sees "check task list" instructions but no
-                # state, has no context for what work was in progress, and
-                # defaults to a greeting — the loop that afflicted v0.11.22.
+                # PLUS any pinned active-task state from disk.
                 parts: list[str] = []
                 if _RECALL_TASK_PROTOCOL:
                     parts.append(_TASK_PROTOCOL_TEXT)
@@ -965,6 +960,21 @@ def _build_provider_class():
                         task_block = _format_recall(task_mems)
                         if task_block:
                             parts.append(task_block)
+                    elif _RECALL_TASK_PROTOCOL:
+                        # No pinned task found.  Add an explicit warning so the
+                        # model knows it has no recovery anchor.  Without a
+                        # pinned task, context compaction silently destroys all
+                        # task state and the model resets to greeting.
+                        parts.append(
+                            "⚠️  NO ACTIVE TASK PINNED\n"
+                            "If you are doing multi-step work (>3 tool calls, "
+                            "test runs, iterative loops), you MUST run:\n"
+                            "  hermes-memory-lancedb-pro task create --id <id> "
+                            "--objective \"<objective>\"\n"
+                            "  hermes-memory-lancedb-pro task pin <id>\n"
+                            "Do this NOW, before your next tool call, or your "
+                            "progress will be lost at context compaction."
+                        )
                 except Exception as _exc:
                     logger.debug(
                         "lancedb_pro no-query active task inject failed: %s", _exc
