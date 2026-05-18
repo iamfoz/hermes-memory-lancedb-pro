@@ -742,12 +742,14 @@ def _auto_anchor_session_if_needed(
 
     Without a pinned task, context compaction silently destroys all session
     state and the model resets to greeting.  This breadcrumb gives
-    `before_prompt_build` something to return after compaction so the model
+    `system_prompt_block` something to surface after compaction so the model
     knows it is mid-session and must not greet.
 
     Idempotent — skips when a formal task pin (has `state_path` in metadata)
-    or an auto-anchor for this session already exists.  Archives stale
-    auto-anchors from other sessions so only one breadcrumb is live at a time.
+    or any auto-anchor already exists. The anchor is intentionally NOT
+    re-scoped per session id: hermes-agent rotates `session_id` mid-process
+    on every context compression, so one breadcrumb is kept for the whole
+    conversation. A genuine `/reset` clears it via `_archive_auto_anchors`.
     """
     try:
         existing = store.list_memories(
@@ -759,33 +761,20 @@ def _auto_anchor_session_if_needed(
         logger.debug("lancedb_pro auto-anchor check failed: %s", exc)
         return
 
-    # Formal task pin present — nothing to do
+    # Formal task pin present — nothing to do.
     if any(
         isinstance(r.get("metadata"), dict) and r["metadata"].get("state_path")
         for r in existing
     ):
         return
 
-    # Archive stale auto-anchors from other sessions
-    for r in existing:
-        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
-        if meta.get("auto_anchor"):
-            old_session = meta.get("source_session", "")
-            if old_session != (session_id or ""):
-                try:
-                    store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
-                    logger.debug(
-                        "lancedb_pro archived stale auto-anchor %s (session %s)",
-                        r["id"], old_session,
-                    )
-                except Exception as exc:
-                    logger.debug("lancedb_pro archive stale anchor failed: %s", exc)
-
-    # This session already has an auto-anchor — nothing to do
-    if session_id and any(
-        isinstance(r.get("metadata"), dict)
-        and r["metadata"].get("auto_anchor")
-        and r["metadata"].get("source_session") == session_id
+    # An auto-anchor already exists — keep it. Matching on session id here
+    # would archive and re-create the anchor on every context compression
+    # (compression reassigns session_id and fires on_session_switch), and
+    # let the stored objective drift to whatever the latest turn said.
+    # `on_session_switch(reset=True)` is the only thing that drops it.
+    if any(
+        isinstance(r.get("metadata"), dict) and r["metadata"].get("auto_anchor")
         for r in existing
     ):
         return
