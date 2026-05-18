@@ -773,7 +773,7 @@ def _auto_anchor_session_if_needed(
             old_session = meta.get("source_session", "")
             if old_session != (session_id or ""):
                 try:
-                    store.update(r["id"], metadata_extra={"state": "archived"})
+                    store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
                     logger.debug(
                         "lancedb_pro archived stale auto-anchor %s (session %s)",
                         r["id"], old_session,
@@ -819,6 +819,33 @@ def _auto_anchor_session_if_needed(
         )
     except Exception as exc:
         logger.debug("lancedb_pro auto-anchor write failed: %s", exc)
+
+
+def _archive_auto_anchors(store: MemoryStore) -> int:
+    """Archive every live auto-anchor active_task memory; returns the count.
+
+    Called on a genuine session reset so a brand-new conversation does not
+    inherit the previous conversation's task breadcrumb on its first turn.
+    Formal `task pin` memories (those carrying a `state_path`) are left
+    untouched — they are explicit durable tasks the user resumes
+    deliberately, not implicit breadcrumbs."""
+    archived = 0
+    try:
+        rows = store.list_memories(
+            limit=20, category="active_task", include_archived=False,
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor archive scan failed: %s", exc)
+        return 0
+    for r in rows:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if meta.get("auto_anchor") and not meta.get("state_path"):
+            try:
+                store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
+                archived += 1
+            except Exception as exc:
+                logger.debug("lancedb_pro auto-anchor archive failed: %s", exc)
+    return archived
 
 
 def _build_provider_class():
@@ -1154,21 +1181,23 @@ def _build_provider_class():
                 except Exception as e:
                     logger.debug("lancedb_pro session anchor lookup failed: %s", e)
 
-            # Recall guardrails — pin active-task memories first, drop
-            # never-categories, enforce char/token budget.
+            # Drop active_task memories from the query-dependent recall path.
+            # They are owned by `system_prompt_block`, which injects the task
+            # protocol + active-task state into the system prompt every turn.
+            # Without this filter the auto-anchor (a recent session memory)
+            # would also be pulled in here via `recent_for_session`, injecting
+            # a second copy of the same block on every turn.
+            results = [r for r in results if r.get("category") != "active_task"]
+
+            # Recall guardrails — drop never-categories, enforce char/token
+            # budget. (Active-task pinning is a no-op here now that the
+            # category is filtered out above — see `system_prompt_block`.)
             results = _apply_recall_guardrails(
                 results,
                 _RECALL_NEVER_CATEGORIES,
                 _RECALL_CHAR_BUDGET,
                 _RECALL_ACTIVE_TASK_PIN,
             )
-
-            # Reload active_task control blocks from state.json so the injected
-            # text always reflects the current iteration — not a stale snapshot.
-            # This is the primary defence against post-compaction greeting-replay:
-            # even after the conversation history is wiped, the model still sees
-            # the current task objective and next_action in the system prompt.
-            results = _refresh_active_task_memories(results)
 
             logger.debug(
                 "lancedb_pro recall: injecting %d items [%s] for session %s",
@@ -1292,6 +1321,11 @@ def _build_provider_class():
               2. Return the current active-task control block so the host
                  folds it into the compressed summary as a second, redundant
                  copy of the task state."""
+            # Join any in-flight sync_turn write first. That thread also
+            # calls `_auto_anchor_session_if_needed`; flushing it here
+            # serialises the two callers so they cannot both pass the
+            # "no anchor exists" check and create duplicate anchors.
+            self._flush_pending_write()
             try:
                 first_user = _first_user_text(messages)
                 _auto_anchor_session_if_needed(
@@ -1506,6 +1540,9 @@ def _build_provider_class():
             reset: bool = False,
             **_kwargs: Any,
         ) -> None:
+            # Let the previous session's last write land before switching,
+            # so a reset can reliably see (and archive) its auto-anchor.
+            self._flush_pending_write()
             self._session_id = new_session_id
             # Drop any pending used-ids for the old session — we're not
             # going to credit recalls that were never confirmed.
@@ -1514,6 +1551,17 @@ def _build_provider_class():
                     self._pending_used_ids.pop(parent_session_id, None)
                 with self._reflection_lock:
                     self._reflection_cache.pop(parent_session_id, None)
+            # A genuine reset (/new, /reset) begins a fresh conversation.
+            # Archive the previous conversation's auto-anchor now — otherwise
+            # `system_prompt_block` would surface a stale "you are mid-task"
+            # breadcrumb on turn 1 of the new session, before `sync_turn` has
+            # a chance to clean it up. Formal `task pin`s are left intact.
+            if reset:
+                n = _archive_auto_anchors(self._store)
+                if n:
+                    logger.debug(
+                        "lancedb_pro session reset: archived %d auto-anchor(s)", n
+                    )
 
         def on_recall_used(
             self,

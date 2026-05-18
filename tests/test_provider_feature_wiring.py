@@ -536,7 +536,7 @@ class TestSystemPromptBlockAndCompaction:
             metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
         )
         block = p.system_prompt_block()
-        assert "ACTIVE TASK STATE" in block
+        assert "=== ACTIVE TASK STATE ===" in block
         assert "stress suite" in block
 
     def test_system_prompt_block_prefers_formal_pin_over_anchor(
@@ -571,7 +571,7 @@ class TestSystemPromptBlockAndCompaction:
             "Benchmark the retriever" in (m["text"] or "") for m in anchors
         )
         # Return value carries the task block for the compression summary.
-        assert "ACTIVE TASK STATE" in out
+        assert "=== ACTIVE TASK STATE ===" in out
 
     def test_on_pre_compress_anchor_survives_in_system_prompt(
         self, provider_cls, real_store
@@ -582,9 +582,46 @@ class TestSystemPromptBlockAndCompaction:
         ])
         # Simulate the post-compaction turn: the system prompt is rebuilt.
         block = p.system_prompt_block()
-        assert "ACTIVE TASK STATE" in block
+        assert "=== ACTIVE TASK STATE ===" in block
         assert "Migrate the schema" in block
         assert "do NOT greet" in block
+
+    def test_reset_session_drops_stale_anchor(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store, session="sess-old")
+        p.on_pre_compress([
+            {"role": "user", "content": "Refactor the auth module"},
+        ])
+        assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
+        # A genuine reset (/new, /reset) starts a fresh conversation.
+        p.on_session_switch("sess-new", parent_session_id="sess-old", reset=True)
+        block = p.system_prompt_block()
+        assert "Refactor the auth module" not in block
+        assert "=== ACTIVE TASK STATE ===" not in block
+
+    def test_non_reset_switch_keeps_anchor(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store, session="sess-old")
+        p.on_pre_compress([
+            {"role": "user", "content": "Refactor the auth module"},
+        ])
+        # /branch or /resume — reset=False — the task continues.
+        p.on_session_switch("sess-branch", parent_session_id="sess-old", reset=False)
+        assert "Refactor the auth module" in p.system_prompt_block()
+
+    def test_active_task_not_duplicated_in_recall_path(
+        self, provider_cls, real_store
+    ):
+        """The active-task block belongs to system_prompt_block; the
+        query-dependent recall path must not inject a second copy."""
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="auto anchor breadcrumb for the session",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+        )
+        assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
+        recall = p.prefetch("anything the user might ask")
+        assert "=== ACTIVE TASK STATE ===" not in recall
+        assert "auto anchor breadcrumb" not in recall
 
 
 @pytest.mark.integration
@@ -666,3 +703,31 @@ class TestAutoAnchor:
         )
         assert len(live) == 1
         assert "New work" in live[0]["text"]
+
+    def test_archive_auto_anchors_clears_all_live_anchors(self, real_store):
+        provider._auto_anchor_session_if_needed("work A", "sess-A", real_store)
+        n = provider._archive_auto_anchors(real_store)
+        assert n == 1
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert live == []
+
+    def test_archive_auto_anchors_leaves_formal_pins(self, real_store):
+        real_store.store(
+            text="auto anchor breadcrumb",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-A"},
+        )
+        real_store.store(
+            text="FORMAL PIN block",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
+        )
+        n = provider._archive_auto_anchors(real_store)
+        assert n == 1
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert len(live) == 1
+        assert "FORMAL PIN block" in live[0]["text"]
