@@ -733,27 +733,47 @@ def _maybe_auto_purge(store: MemoryStore) -> None:
         logger.warning("Auto-purge failed (will retry next session): %s", e)
 
 
+def _anchor_belongs(metadata: dict[str, Any], conversation_id: str) -> bool:
+    """True if an active_task memory should be visible to the conversation
+    identified by `conversation_id`.
+
+    A single hermes-agent gateway process serves many conversations from one
+    shared, profile-scoped `MemoryStore`. Formal `task pin`s (carrying a
+    `state_path`) are deliberate, global user actions and stay visible
+    everywhere. Auto-anchors are implicit breadcrumbs and must be visible
+    ONLY to the conversation that created them — otherwise one
+    conversation's "you are mid-task" state bleeds into another.
+
+    An empty `conversation_id` (no session id in play) matches everything —
+    the single-conversation / CLI fallback."""
+    if metadata.get("state_path"):
+        return True
+    if not conversation_id:
+        return True
+    return metadata.get("conversation_id", "") == conversation_id
+
+
 def _auto_anchor_session_if_needed(
     user_content: str,
     session_id: str,
+    conversation_id: str,
     store: MemoryStore,
 ) -> None:
-    """Auto-create an active_task breadcrumb if no task anchor exists yet.
+    """Auto-create an active_task breadcrumb if this conversation has none.
 
     Without a pinned task, context compaction silently destroys all session
     state and the model resets to greeting.  This breadcrumb gives
     `system_prompt_block` something to surface after compaction so the model
     knows it is mid-session and must not greet.
 
-    Idempotent — skips when a formal task pin (has `state_path` in metadata)
-    or any auto-anchor already exists. The anchor is intentionally NOT
-    re-scoped per session id: hermes-agent rotates `session_id` mid-process
-    on every context compression, so one breadcrumb is kept for the whole
-    conversation. A genuine `/reset` clears it via `_archive_auto_anchors`.
-    """
+    Idempotent — skips when a formal task pin exists, or when this
+    conversation already has an auto-anchor. The anchor is keyed by
+    `conversation_id` (stable across the context-compression session-id
+    rotations within one conversation), NOT by the raw session id. A genuine
+    `/reset` clears it via `_archive_auto_anchors`."""
     try:
         existing = store.list_memories(
-            limit=10,
+            limit=20,
             category="active_task",
             include_archived=False,
         )
@@ -768,13 +788,12 @@ def _auto_anchor_session_if_needed(
     ):
         return
 
-    # An auto-anchor already exists — keep it. Matching on session id here
-    # would archive and re-create the anchor on every context compression
-    # (compression reassigns session_id and fires on_session_switch), and
-    # let the stored objective drift to whatever the latest turn said.
-    # `on_session_switch(reset=True)` is the only thing that drops it.
+    # This conversation already has an auto-anchor — keep it. (A different
+    # conversation's anchor does not count: each conversation gets its own.)
     if any(
-        isinstance(r.get("metadata"), dict) and r["metadata"].get("auto_anchor")
+        isinstance(r.get("metadata"), dict)
+        and r["metadata"].get("auto_anchor")
+        and _anchor_belongs(r["metadata"], conversation_id)
         for r in existing
     ):
         return
@@ -791,7 +810,11 @@ def _auto_anchor_session_if_needed(
         "If mid-task: resume it. Otherwise: answer the user's message directly."
     )
 
-    meta: dict[str, Any] = {"auto_anchor": True, "priority": "must_include"}
+    meta: dict[str, Any] = {
+        "auto_anchor": True,
+        "priority": "must_include",
+        "conversation_id": conversation_id,
+    }
     if session_id:
         meta["source_session"] = session_id
 
@@ -804,20 +827,22 @@ def _auto_anchor_session_if_needed(
             metadata_extra=meta,
         )
         logger.debug(
-            "lancedb_pro auto-anchored session %s", session_id or "global"
+            "lancedb_pro auto-anchored conversation %s",
+            conversation_id or session_id or "global",
         )
     except Exception as exc:
         logger.debug("lancedb_pro auto-anchor write failed: %s", exc)
 
 
-def _archive_auto_anchors(store: MemoryStore) -> int:
-    """Archive every live auto-anchor active_task memory; returns the count.
+def _archive_auto_anchors(store: MemoryStore, conversation_id: str) -> int:
+    """Archive this conversation's live auto-anchor(s); returns the count.
 
     Called on a genuine session reset so a brand-new conversation does not
-    inherit the previous conversation's task breadcrumb on its first turn.
-    Formal `task pin` memories (those carrying a `state_path`) are left
-    untouched — they are explicit durable tasks the user resumes
-    deliberately, not implicit breadcrumbs."""
+    inherit the previous one's task breadcrumb. Only auto-anchors belonging
+    to `conversation_id` are archived — a reset in one conversation must not
+    disturb other conversations sharing the same store. An empty
+    `conversation_id` archives every auto-anchor (single-conversation
+    fallback). Formal `task pin`s (with a `state_path`) are left untouched."""
     archived = 0
     try:
         rows = store.list_memories(
@@ -828,12 +853,15 @@ def _archive_auto_anchors(store: MemoryStore) -> int:
         return 0
     for r in rows:
         meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
-        if meta.get("auto_anchor") and not meta.get("state_path"):
-            try:
-                store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
-                archived += 1
-            except Exception as exc:
-                logger.debug("lancedb_pro auto-anchor archive failed: %s", exc)
+        if not meta.get("auto_anchor") or meta.get("state_path"):
+            continue
+        if conversation_id and meta.get("conversation_id", "") != conversation_id:
+            continue
+        try:
+            store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
+            archived += 1
+        except Exception as exc:
+            logger.debug("lancedb_pro auto-anchor archive failed: %s", exc)
     return archived
 
 
@@ -887,6 +915,11 @@ def _build_provider_class():
             )
             self._prefetch_limit = prefetch_limit
             self._session_id: str = ""
+            # Stable per-conversation id. Unlike `_session_id` (which the host
+            # rotates on every context compression) this only changes on a
+            # genuine reset — so it cleanly scopes auto-anchors to one
+            # conversation even in a gateway serving many from one store.
+            self._conversation_id: str = ""
             self._sync_thread: threading.Thread | None = None
             # Protects _sync_thread reference against concurrent sync_turn /
             # on_session_end / shutdown calls from different threads.
@@ -940,6 +973,9 @@ def _build_provider_class():
             a separate database tree (e.g. ``~/.hermes/memory-lancedb``)
             rather than the process-wide default path."""
             self._session_id = session_id
+            # Seed the conversation id. Subsequent context-compression session
+            # rotations keep it; only a genuine /reset replaces it.
+            self._conversation_id = session_id
             agent_id = kwargs.get("agent_id")
             if agent_id and str(agent_id).strip():
                 self._agent_id = str(agent_id).strip()
@@ -1068,18 +1104,24 @@ def _build_provider_class():
             corresponding window.  Session anchors bypass this filter so
             task-framing memories are always present."""
             if not query or not query.strip():
-                # No query — before_prompt_build assembling the
+                # No query — system_prompt_block assembling the
                 # query-independent system prompt.  Return the protocol text
-                # PLUS any pinned active-task state from disk.
+                # PLUS this conversation's active-task state from disk.
                 parts: list[str] = []
                 if _RECALL_TASK_PROTOCOL:
                     parts.append(_TASK_PROTOCOL_TEXT)
                 try:
                     task_mems = self._store.list_memories(
-                        limit=5,
+                        limit=20,
                         category="active_task",
                         include_archived=False,
                     )
+                    # Scope to this conversation — formal pins stay global,
+                    # auto-anchors from other conversations are dropped.
+                    task_mems = [
+                        m for m in task_mems
+                        if _anchor_belongs(m.get("metadata") or {}, self._conversation_id)
+                    ]
                     task_mems = _refresh_active_task_memories(task_mems)
                     # Prefer formal task pins (state_path) over auto-anchors
                     # when both exist — the pin is always more authoritative.
@@ -1318,14 +1360,19 @@ def _build_provider_class():
             try:
                 first_user = _first_user_text(messages)
                 _auto_anchor_session_if_needed(
-                    first_user, self._session_id, self._store,
+                    first_user, self._session_id, self._conversation_id,
+                    self._store,
                 )
             except Exception as exc:
                 logger.debug("lancedb_pro on_pre_compress anchor failed: %s", exc)
             try:
                 task_mems = self._store.list_memories(
-                    limit=5, category="active_task", include_archived=False,
+                    limit=20, category="active_task", include_archived=False,
                 )
+                task_mems = [
+                    m for m in task_mems
+                    if _anchor_belongs(m.get("metadata") or {}, self._conversation_id)
+                ]
                 task_mems = _refresh_active_task_memories(task_mems)
                 formal_pins = [
                     m for m in task_mems
@@ -1383,11 +1430,12 @@ def _build_provider_class():
             fall back to writing raw user / assistant turns — same shape
             this provider has always used."""
             effective_session_id = session_id or self._session_id
-            # Capture store and extractor at dispatch time so a concurrent
-            # initialize() call cannot swap them out mid-write and redirect
-            # this turn's data to a different session's database.
+            # Capture store, extractor and conversation id at dispatch time so
+            # a concurrent initialize() / on_session_switch() call cannot swap
+            # them out mid-write and redirect this turn's data elsewhere.
             _extractor = self._smart_extractor
             _store = self._store
+            _conversation_id = self._conversation_id
 
             # Build a context string describing the source so the extraction
             # LLM knows what kind of data it's looking at.  Hindsight research
@@ -1429,12 +1477,13 @@ def _build_provider_class():
                         _store_override=_store,
                     )
 
-                # Ensure a recovery anchor exists so before_prompt_build can
+                # Ensure a recovery anchor exists so system_prompt_block can
                 # return meaningful context after context compaction — even
                 # when the model hasn't explicitly run `task create` + `task pin`.
                 try:
                     _auto_anchor_session_if_needed(
-                        user_content, effective_session_id, _store,
+                        user_content, effective_session_id, _conversation_id,
+                        _store,
                     )
                 except Exception as _anchor_exc:
                     logger.debug(
@@ -1532,6 +1581,22 @@ def _build_provider_class():
             # Let the previous session's last write land before switching,
             # so a reset can reliably see (and archive) its auto-anchor.
             self._flush_pending_write()
+            # A genuine reset (/new, /reset) begins a fresh conversation.
+            # Archive THIS conversation's auto-anchor before the id changes —
+            # otherwise `system_prompt_block` would surface a stale "you are
+            # mid-task" breadcrumb on turn 1 of the new conversation. Scoped
+            # to this conversation so a reset never disturbs others sharing
+            # the store. Formal `task pin`s are left intact.
+            if reset:
+                n = _archive_auto_anchors(self._store, self._conversation_id)
+                if n:
+                    logger.debug(
+                        "lancedb_pro session reset: archived %d auto-anchor(s)", n
+                    )
+                self._conversation_id = new_session_id
+            # A non-reset switch (context compression, /branch, /resume) is
+            # the SAME conversation continuing — `_conversation_id` is kept so
+            # the auto-anchor survives the session-id rotation.
             self._session_id = new_session_id
             # Drop any pending used-ids for the old session — we're not
             # going to credit recalls that were never confirmed.
@@ -1540,17 +1605,6 @@ def _build_provider_class():
                     self._pending_used_ids.pop(parent_session_id, None)
                 with self._reflection_lock:
                     self._reflection_cache.pop(parent_session_id, None)
-            # A genuine reset (/new, /reset) begins a fresh conversation.
-            # Archive the previous conversation's auto-anchor now — otherwise
-            # `system_prompt_block` would surface a stale "you are mid-task"
-            # breadcrumb on turn 1 of the new session, before `sync_turn` has
-            # a chance to clean it up. Formal `task pin`s are left intact.
-            if reset:
-                n = _archive_auto_anchors(self._store)
-                if n:
-                    logger.debug(
-                        "lancedb_pro session reset: archived %d auto-anchor(s)", n
-                    )
 
         def on_recall_used(
             self,
