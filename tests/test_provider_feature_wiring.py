@@ -537,6 +537,19 @@ class TestFormatRecallFreshnessTrend:
         out = provider._format_recall([self._make_result("Alice prefers Python")])
         assert "[" not in out.split("(")[1]  # no tag after score bracket
 
+    def test_oversized_memory_is_truncated(self):
+        """A single oversized memory (e.g. a whole source file wrongly stored
+        as a memory) must never flood the recall block."""
+        huge = "X" * 50_000
+        out = provider._format_recall([self._make_result(huge)])
+        assert "[…truncated]" in out
+        assert len(out) < 2_000  # the 50KB blob never reaches the model
+
+    def test_normal_memory_not_truncated(self):
+        out = provider._format_recall([self._make_result("a short normal fact")])
+        assert "[…truncated]" not in out
+        assert "a short normal fact" in out
+
 
 # ---------------------------------------------------------------------------
 # system_prompt_block + on_pre_compress — post-compaction greeting-loop defence

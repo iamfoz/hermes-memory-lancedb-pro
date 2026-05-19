@@ -154,6 +154,14 @@ _RECALL_NEVER_CATEGORIES: frozenset[str] = frozenset(
 # Approximate character budget for the full recall block injected each turn.
 # chars / 4 ≈ tokens, so the default 4800 ≈ 1200 tokens.  Set 0 to disable.
 _RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800"))
+# Hard per-memory cap for the recall block. A single recalled memory longer
+# than this is truncated. Without it, one oversized junk row — e.g. a whole
+# source file accidentally stored as a memory — floods the recall block, and
+# the model mistakes it for user-loaded context ("I see you have a massive
+# file loaded..."). A genuine memory is a fact or note, never a file.
+_RECALL_MAX_ITEM_CHARS: int = int(
+    os.environ.get("MEMORY_RECALL_MAX_ITEM_CHARS", "600")
+)
 # When True, memories with category="active_task" are pinned to the front of
 # the recall block and bypass the never-categories filter and char budget.
 # This ensures long-running task state is always in context.
@@ -548,7 +556,9 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
 
     active_task memories get a visually-distinct block so the model
     treats them as authoritative session state rather than recalled facts.
-    Regular memories keep the bullet-point format."""
+    Regular memories keep the bullet-point format, and each one is hard-capped
+    at `_RECALL_MAX_ITEM_CHARS` so a single oversized junk row cannot flood
+    the block."""
     if not results:
         return ""
     task_lines: list[str] = []
@@ -563,6 +573,8 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
             task_lines.append(text)
             task_lines.append("=" * 25)
         else:
+            if _RECALL_MAX_ITEM_CHARS > 0 and len(text) > _RECALL_MAX_ITEM_CHARS:
+                text = text[:_RECALL_MAX_ITEM_CHARS].rstrip() + " […truncated]"
             score = next(
                 (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
                 0.0,
