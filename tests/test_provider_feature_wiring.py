@@ -311,3 +311,45 @@ class TestSessionSwitch:
         p.on_session_switch("sess-2", parent_session_id="sess-1")
         with p._reflection_lock:
             assert "sess-1" not in p._reflection_cache
+
+
+_JMUNCH_ENV_VARS = (
+    "MEMORY_EXTRACTION_BASE_URL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_BASE_URL",
+)
+
+
+class TestJmunchRecallTuning:
+    """In jmunch mode the provider widens recall to offset the gateway's
+    lossy compression of the agent's conversation history."""
+
+    def test_default_recall_when_no_jmunch(self, provider_cls, real_store, monkeypatch):
+        for var in _JMUNCH_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        assert p._prefetch_limit == provider.DEFAULT_PREFETCH_LIMIT
+        assert p._min_score == provider.DEFAULT_MIN_RECALL_SCORE
+
+    def test_jmunch_mode_widens_recall(self, provider_cls, real_store, monkeypatch):
+        for var in _JMUNCH_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        assert p._prefetch_limit == provider._JMUNCH_PREFETCH_LIMIT
+        assert p._min_score == provider._JMUNCH_MIN_RECALL_SCORE
+        # The widened limit must actually be wider, or it is not "tuning".
+        assert provider._JMUNCH_PREFETCH_LIMIT > provider.DEFAULT_PREFETCH_LIMIT
+
+    def test_jmunch_mode_respects_explicit_min_score(
+        self, provider_cls, real_store, monkeypatch
+    ):
+        for var in _JMUNCH_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:7882/v1")
+        p = provider_cls(store=real_store, min_score=0.5, auto_smart_extraction=False)
+        # An explicit caller min_score is never overridden by jmunch mode...
+        assert p._min_score == 0.5
+        # ...but the prefetch limit is still widened.
+        assert p._prefetch_limit == provider._JMUNCH_PREFETCH_LIMIT

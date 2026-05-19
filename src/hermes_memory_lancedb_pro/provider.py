@@ -60,6 +60,22 @@ PROVIDER_NAME = "lancedb_pro"
 DEFAULT_PREFETCH_LIMIT: int = int(os.environ.get("MEMORY_PREFETCH_LIMIT", "5"))
 
 # ---------------------------------------------------------------------------
+# jmunch-mode recall configuration
+# ---------------------------------------------------------------------------
+# A jmunch gateway handle-ifies fat tool results in the agent's conversation
+# history — summarising away detail the agent needs to stay on task. The
+# memory block this plugin injects is NOT handle-ified, so it is a lossless
+# channel; when jmunch is detected, recall is widened to push more task
+# context back through it. These values apply ONLY in jmunch mode — off
+# jmunch the standard MEMORY_PREFETCH_LIMIT / min_score are left untouched.
+_JMUNCH_PREFETCH_LIMIT: int = int(
+    os.environ.get("MEMORY_JMUNCH_PREFETCH_LIMIT", "12")
+)
+_JMUNCH_MIN_RECALL_SCORE: float = float(
+    os.environ.get("MEMORY_JMUNCH_MIN_RECALL_SCORE", "0.0")
+)
+
+# ---------------------------------------------------------------------------
 # Auto-purge configuration
 # ---------------------------------------------------------------------------
 # Purge cooldown: minimum hours between automatic purge runs.  Set 0 to
@@ -463,6 +479,22 @@ def _build_provider_class():
                 min_score if min_score is not None else DEFAULT_MIN_RECALL_SCORE
             )
             self._prefetch_limit = prefetch_limit
+            # jmunch mode: the gateway lossily compresses the agent's
+            # conversation history, so the agent loses task detail mid-run.
+            # The injected memory block is not handle-ified — a lossless
+            # side-channel — so widen recall to re-surface that context.
+            # Fully gated: off jmunch the recall config above is untouched.
+            # An explicitly-passed min_score is always respected.
+            if is_jmunch_in_use():
+                self._prefetch_limit = _JMUNCH_PREFETCH_LIMIT
+                if min_score is None:
+                    self._min_score = _JMUNCH_MIN_RECALL_SCORE
+                logger.info(
+                    "lancedb_pro: jmunch mode — widened recall "
+                    "(prefetch_limit=%d, min_score=%.2f) to offset gateway "
+                    "context compression.",
+                    self._prefetch_limit, self._min_score,
+                )
             self._session_id: str = ""
             self._sync_thread: threading.Thread | None = None
             # Protects _sync_thread reference against concurrent sync_turn /
