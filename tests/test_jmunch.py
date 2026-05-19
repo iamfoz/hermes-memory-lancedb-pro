@@ -29,13 +29,13 @@ class TestIsJmunchUrl:
     @pytest.mark.parametrize(
         "url",
         [
-            "http://127.0.0.1:7881/v1",
+            "http://127.0.0.1:7879/v1",  # jmunch gateway default port
             "http://127.0.0.1:7883/v1",  # the README example
             "http://localhost:7888/v1",
             "http://[::1]:7882/v1",
             "127.0.0.1:7881",  # scheme is optional
             "https://127.0.0.1:7890",
-            "http://127.0.0.1:7896/v1",  # top of the default range (base+span-1)
+            "http://127.0.0.1:7894/v1",  # top of the default range (base+span-1)
         ],
     )
     def test_detects_local_jmunch_ports(self, url):
@@ -49,8 +49,8 @@ class TestIsJmunchUrl:
             "http://127.0.0.1:8080/v1",
             "http://localhost:11434/v1",  # Ollama's default port
             "http://127.0.0.1:1234/v1",  # LM Studio's default port
-            "http://127.0.0.1:7880/v1",  # one below the base
-            "http://127.0.0.1:7897/v1",  # one past the range (base+span)
+            "http://127.0.0.1:7878/v1",  # the jmunch dashboard — not an LLM endpoint
+            "http://127.0.0.1:7895/v1",  # one past the range (base+span)
             "http://192.168.1.5:7881/v1",  # jmunch port but not loopback
             "http://127.0.0.1/v1",  # no port
         ],
@@ -69,8 +69,8 @@ class TestIsJmunchUrl:
         assert is_jmunch_url("http://127.0.0.1:9000/v1") is True
         assert is_jmunch_url("http://127.0.0.1:9003/v1") is True
         assert is_jmunch_url("http://127.0.0.1:9004/v1") is False
-        # The old default range no longer matches.
-        assert is_jmunch_url("http://127.0.0.1:7881/v1") is False
+        # The jmunch default range no longer matches.
+        assert is_jmunch_url("http://127.0.0.1:7879/v1") is False
 
 
 class TestDetectionFromEnv:
