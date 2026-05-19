@@ -20,6 +20,8 @@ import os
 import re
 from typing import Any, Protocol
 
+from .jmunch import jmunch_request_headers
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -252,10 +254,15 @@ class OpenAICompatibleLlmClient:
                 "Install it with: pip install openai"
             ) from exc
 
+        # When `base_url` is a jmunch gateway, tell it not to inject its
+        # drill-in verb tools into our calls — the extractor wants a plain
+        # JSON completion. `jmunch_request_headers` returns {} for any
+        # non-jmunch endpoint, so this is a no-op off jmunch.
         self._client = _openai.OpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            default_headers=jmunch_request_headers(base_url) or None,
         )
         self.model = model
         self.base_url = base_url
@@ -333,7 +340,16 @@ class AnthropicLlmClient:
                 "Install it with: pip install anthropic"
             ) from exc
 
-        self._client = _anthropic.Anthropic(api_key=api_key)
+        # The anthropic SDK reads ANTHROPIC_BASE_URL from the environment
+        # itself; mirror that here so a jmunch gateway configured on that
+        # var also gets the no-inject header. No-op off jmunch.
+        self._client = _anthropic.Anthropic(
+            api_key=api_key,
+            default_headers=jmunch_request_headers(
+                os.environ.get("ANTHROPIC_BASE_URL")
+            )
+            or None,
+        )
         self.model = model
         self._max_tokens = max_tokens
         self._last_error: str | None = None

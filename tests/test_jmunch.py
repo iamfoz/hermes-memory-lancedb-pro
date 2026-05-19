@@ -9,6 +9,7 @@ from hermes_memory_lancedb_pro.jmunch import (
     detected_jmunch_endpoint,
     is_jmunch_in_use,
     is_jmunch_url,
+    jmunch_request_headers,
 )
 
 _URL_ENV_VARS = (
@@ -97,3 +98,24 @@ class TestDetectionFromEnv:
         monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "https://api.openai.com/v1")
         assert detected_jmunch_endpoint() is None
         assert is_jmunch_in_use() is False
+
+
+class TestRequestHeaders:
+    def test_no_inject_header_for_jmunch_url(self):
+        assert jmunch_request_headers("http://127.0.0.1:7879/v1") == {
+            "X-Jmunch-Inject": "false"
+        }
+
+    def test_empty_for_non_jmunch_url(self):
+        assert jmunch_request_headers("https://api.openai.com/v1") == {}
+
+    def test_empty_for_none(self):
+        assert jmunch_request_headers(None) == {}
+
+    def test_returns_fresh_dict_each_call(self):
+        # Callers must be free to mutate the result; mutating one call's
+        # dict must not leak into the next or into the module constant.
+        first = jmunch_request_headers("http://127.0.0.1:7879/v1")
+        first["X-Other"] = "1"
+        second = jmunch_request_headers("http://127.0.0.1:7879/v1")
+        assert second == {"X-Jmunch-Inject": "false"}
