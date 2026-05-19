@@ -144,6 +144,10 @@ _REFLECTION_AGENT_ID: str = os.environ.get(
 _ADMISSION_PRESET: str = os.environ.get(
     "MEMORY_ADMISSION_PRESET", "balanced"
 ).strip().lower()
+# Whether the operator pinned the preset explicitly. When they didn't,
+# jmunch mode is free to raise the default to `high-recall` — see
+# `_maybe_build_admission_controller`.
+_ADMISSION_PRESET_EXPLICIT: bool = "MEMORY_ADMISSION_PRESET" in os.environ
 
 # ---------------------------------------------------------------------------
 # Extraction rate-limit configuration
@@ -240,20 +244,36 @@ def _maybe_build_admission_controller(store: MemoryStore, llm: Any) -> Any:
 
     Returns None when the preset is `off` or construction fails — the
     extractor then runs without an admission gate. An unrecognised preset
-    falls back to `balanced` rather than disabling the gate silently."""
+    falls back to `balanced` rather than disabling the gate silently.
+
+    In jmunch mode, when the operator hasn't pinned a preset, the default
+    is raised to `high-recall`: a jmunch gateway lossily compresses the
+    agent's conversation history, so the memory store must capture more —
+    `high-recall` rejects fewer candidates (notably task-progress events).
+    This is the capture half of the jmunch-mode compensation; widened
+    recall (see `_JMUNCH_PREFETCH_LIMIT`) is the surfacing half. An
+    explicitly-set preset — including `off` — is always respected."""
     if _ADMISSION_PRESET in ("off", "disabled", "none", ""):
         return None
-    preset = (
-        _ADMISSION_PRESET
-        if _ADMISSION_PRESET in ("balanced", "conservative", "high-recall")
-        else "balanced"
-    )
+    jmunch_default = not _ADMISSION_PRESET_EXPLICIT and is_jmunch_in_use()
+    if jmunch_default:
+        preset = "high-recall"
+    elif _ADMISSION_PRESET in ("balanced", "conservative", "high-recall"):
+        preset = _ADMISSION_PRESET
+    else:
+        preset = "balanced"
     try:
         from .admission_control import AdmissionController, get_preset
-        return AdmissionController(store, config=get_preset(preset), llm=llm)
+        controller = AdmissionController(store, config=get_preset(preset), llm=llm)
     except Exception as e:
         logger.debug("lancedb_pro: admission controller unavailable: %s", e)
         return None
+    if jmunch_default:
+        logger.info(
+            "lancedb_pro: jmunch mode — admission preset 'high-recall' so "
+            "more task-relevant context is captured into memory.",
+        )
+    return controller
 
 
 def _spawn_warmup(store: MemoryStore) -> None:

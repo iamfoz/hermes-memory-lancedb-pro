@@ -133,6 +133,43 @@ class TestAdmissionControllerWiring:
         assert ctrl is not None
 
 
+@pytest.mark.integration
+class TestJmunchAdmissionPreset:
+    """In jmunch mode the admission gate defaults to `high-recall` so more
+    task context is captured — unless the operator pinned a preset."""
+
+    def test_jmunch_defaults_to_high_recall(self, real_store, monkeypatch):
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET", "balanced")
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", False)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        ctrl = provider._maybe_build_admission_controller(real_store, None)
+        assert ctrl is not None
+        assert ctrl.config.preset == "high-recall"
+
+    def test_no_jmunch_keeps_default_preset(self, real_store, monkeypatch):
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET", "balanced")
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", False)
+        for var in _JMUNCH_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        ctrl = provider._maybe_build_admission_controller(real_store, None)
+        assert ctrl is not None
+        assert ctrl.config.preset == "balanced"
+
+    def test_explicit_preset_respected_in_jmunch_mode(self, real_store, monkeypatch):
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET", "conservative")
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", True)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        ctrl = provider._maybe_build_admission_controller(real_store, None)
+        assert ctrl is not None
+        assert ctrl.config.preset == "conservative"
+
+    def test_explicit_off_respected_in_jmunch_mode(self, real_store, monkeypatch):
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET", "off")
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", True)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        assert provider._maybe_build_admission_controller(real_store, None) is None
+
+
 # ---------------------------------------------------------------------------
 # Auto-compaction
 # ---------------------------------------------------------------------------

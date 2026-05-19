@@ -664,7 +664,7 @@ Environment variables (all optional):
 | `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
 | `MEMORY_PURGE_GRACE_DAYS`      | `30`                               | Archived rows younger than this many days are left alone during auto-purge. Raise this for a longer audit window; lower it to reclaim space sooner. |
 | `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS` | `168`                        | Hours between automatic memory-compaction runs (clustering + merging near-duplicate old memories). Default weekly; set `0` to disable. |
-| `MEMORY_ADMISSION_PRESET`      | `balanced`                         | Admission-control gate wired into the smart extractor: `balanced` / `conservative` / `high-recall`, or `off` to disable the gate. |
+| `MEMORY_ADMISSION_PRESET`      | `balanced`                         | Admission-control gate wired into the smart extractor: `balanced` / `conservative` / `high-recall`, or `off` to disable the gate. When a jmunch gateway is detected and this is left unset, the default becomes `high-recall` so more task context is captured. |
 | `MEMORY_REFLECTION`            | `on`                               | Capture session reflections at session end and replay ranked invariant/derived slices on recall. Set `off` to disable both paths. |
 | `MEMORY_REFLECTION_SCAN_LIMIT` | `200`                              | Rows scanned when loading reflection slices for recall. |
 | `MEMORY_REFLECTION_AGENT_ID`   | `main`                             | Agent identity used for reflection ownership. Multi-agent hosts can instead pass `agent_id` to `initialize()`. |
