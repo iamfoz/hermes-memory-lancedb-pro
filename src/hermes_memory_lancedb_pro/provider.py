@@ -2,14 +2,14 @@
 
 Wraps `MemoryStore` + `MemoryRetriever` in the `agent.memory_provider.MemoryProvider`
 ABC so hermes-agent can drop this plugin into
-`~/.hermes/plugins/memory/lancedb_pro/` and have it be discoverable, with
+`$HERMES_HOME/plugins/lancedb_pro/` and have it be discoverable, with
 proper session scoping wired through.
 
 This module imports `agent.memory_provider` lazily — the rest of the package
 remains usable as a standalone library, and tests / non-Hermes consumers
 don't need hermes-agent installed.
 
-USAGE (in your `~/.hermes/plugins/memory/lancedb_pro/__init__.py`):
+USAGE (in your `$HERMES_HOME/plugins/lancedb_pro/__init__.py`):
 
     from hermes_memory_lancedb_pro.provider import register
 
@@ -1886,15 +1886,18 @@ LanceDBProMemoryProvider = _build_provider_class()
 def register(ctx: Any) -> None:
     """Plugin entry point per the Hermes memory-provider plugin spec.
 
-    Called by hermes-agent's plugin discovery when it loads
-    ``~/.hermes/hermes-agent/plugins/memory/lancedb_pro/``. Registers a configured
+    Called by hermes-agent's plugin discovery when it loads the user-plugin
+    directory ``$HERMES_HOME/plugins/lancedb_pro/``. Registers a configured
     LanceDBProMemoryProvider with the host context.
 
-    A `~/.hermes/hermes-agent/plugins/memory/lancedb_pro/__init__.py` shim needs only:
+    A `$HERMES_HOME/plugins/lancedb_pro/__init__.py` shim needs only:
 
         from hermes_memory_lancedb_pro.provider import register
 
         __all__ = ["register"]
+
+    `hermes-memory-lancedb-pro install-plugin` creates this shim. Then set
+    `memory.provider: lancedb_pro` in hermes-agent's config.yaml.
     """
     base = _load_memory_provider_base()
     if base is None:

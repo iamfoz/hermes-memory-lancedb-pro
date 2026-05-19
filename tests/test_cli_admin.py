@@ -24,6 +24,8 @@ from hermes_memory_lancedb_pro._cli import (
     _cmd_doctor,
     _cmd_export,
     _cmd_import,
+    _cmd_install_plugin,
+    _cmd_uninstall_plugin,
     main,
     register_cli,
 )
@@ -337,6 +339,62 @@ class TestCli:
         assert rc == 0
         captured = capsys.readouterr()
         assert len(captured.out) > 0  # some help text
+
+
+class TestInstallPlugin:
+    """install-plugin must write the shim where hermes-agent actually scans
+    for user-installed memory providers: $HERMES_HOME/plugins/<name>/ (flat),
+    NOT the plugins/memory/ subdir (that is only for bundled providers)."""
+
+    import argparse as _argparse
+
+    def _ns(self, hermes_home, force=False):
+        return self._argparse.Namespace(
+            hermes_home=str(hermes_home), force=force, quiet=True,
+        )
+
+    def test_install_creates_flat_path(self, tmp_path):
+        rc = _cmd_install_plugin(self._ns(tmp_path))
+        assert rc == 0
+        flat = tmp_path / "plugins" / "lancedb_pro"
+        assert (flat / "__init__.py").exists()
+        assert (flat / "cli.py").exists()
+        assert (flat / "plugin.yaml").exists()
+        # The plugins/memory/ subdir must NOT be used for a user install.
+        assert not (tmp_path / "plugins" / "memory" / "lancedb_pro").exists()
+
+    def test_install_shim_reexports_register(self, tmp_path):
+        _cmd_install_plugin(self._ns(tmp_path))
+        shim = (tmp_path / "plugins" / "lancedb_pro" / "__init__.py").read_text()
+        assert "from hermes_memory_lancedb_pro.provider import register" in shim
+
+    def test_install_migrates_from_legacy_memory_path(self, tmp_path):
+        # Simulate a 0.11.1–0.11.37 install under the wrong plugins/memory/ path.
+        legacy = tmp_path / "plugins" / "memory" / "lancedb_pro"
+        legacy.mkdir(parents=True)
+        (legacy / "__init__.py").write_text("# old shim")
+        (legacy / "plugin.yaml").write_text("name: lancedb_pro\n")
+
+        rc = _cmd_install_plugin(self._ns(tmp_path))
+        assert rc == 0
+        flat = tmp_path / "plugins" / "lancedb_pro"
+        assert (flat / "__init__.py").exists()
+        # Migrated content is refreshed to the current shim.
+        assert "from hermes_memory_lancedb_pro.provider import register" in (
+            flat / "__init__.py"
+        ).read_text()
+        assert not legacy.exists()
+
+    def test_uninstall_removes_flat_and_legacy(self, tmp_path):
+        _cmd_install_plugin(self._ns(tmp_path))
+        legacy = tmp_path / "plugins" / "memory" / "lancedb_pro"
+        legacy.mkdir(parents=True)
+        (legacy / "stale.txt").write_text("x")
+
+        rc = _cmd_uninstall_plugin(self._ns(tmp_path))
+        assert rc == 0
+        assert not (tmp_path / "plugins" / "lancedb_pro").exists()
+        assert not legacy.exists()
 
     def test_unknown_subcommand_exits_nonzero(self, monkeypatch):
         """hermes-memory-lancedb-pro bogus-cmd exits non-zero."""

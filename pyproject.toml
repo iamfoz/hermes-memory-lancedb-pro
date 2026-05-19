@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.11.38"
+version = "0.11.39"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
