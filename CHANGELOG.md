@@ -11,32 +11,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - jmunch gateway detection (`hermes_memory_lancedb_pro.jmunch`).
-  `is_jmunch_in_use()` reports — best-effort — whether the plugin's
-  configured LLM endpoint is a local jmunch gateway (a loopback host on a
-  port in the jmunch range: gateway default 7879, counting up for each
-  additional instance). Detection is a soft URL pattern-match over
-  `MEMORY_EXTRACTION_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, and
-  `ANTHROPIC_BASE_URL`; it creates no code dependency on jmunch-mcp, so the
-  two packages stay independent. `JMUNCH_PORT_BASE` / `JMUNCH_PORT_SPAN`
-  env vars tune the detected port range. The provider logs an info line
-  when jmunch is detected on the extraction endpoint.
-- When the memory extractor's LLM endpoint is a jmunch gateway, its calls
-  now send the `X-Jmunch-Inject: false` header so the gateway does not
-  inject its drill-in verb tools into an extraction request — the
-  extractor expects a plain JSON completion, and verb injection would
-  derail a tool-capable model into calling a jmunch verb instead. The
-  header is added only when the client's own base URL is a jmunch gateway;
-  every non-jmunch call is byte-for-byte unchanged.
+  `is_jmunch_in_use()` reports whether a jmunch gateway is in the LLM
+  path. Detection is two-stage and creates no code dependency on
+  jmunch-mcp: it is confirmed passively from the `X-Jmunch-Gateway`
+  response header that jmunch >= 0.3.0 stamps on every reply (works on
+  any port; latched by `record_response_headers()`), and can also be
+  declared up front via `MEMORY_JMUNCH_MODE=true` so the startup-time
+  tuning is correct before the first response arrives.
+- The memory extractor's LLM calls send `X-Jmunch-Inject: false` and
+  `X-Jmunch-Handleify: false` when jmunch is in use, making the gateway a
+  pure pass-through for those calls — no verb injection, no
+  handle-ification — so the extractor sees full-fidelity tool content.
+  Both headers are inert on any non-jmunch endpoint. A warning is logged
+  if a jmunch gateway older than 0.3.0 (which ignores `X-Jmunch-Handleify`)
+  is observed.
 - In jmunch mode the provider widens memory recall — a higher prefetch
   limit (`MEMORY_JMUNCH_PREFETCH_LIMIT`, default 12) and a permissive
   `min_score` (`MEMORY_JMUNCH_MIN_RECALL_SCORE`, default 0.0). A jmunch
   gateway lossily compresses the agent's conversation history by
   handle-ifying tool results, so the agent loses task detail mid-run; the
   memory block this plugin injects is not handle-ified, so widening recall
-  pushes more task context back through that lossless channel. Applies
-  only when jmunch is detected — off jmunch the standard
-  `MEMORY_PREFETCH_LIMIT` / `min_score` are untouched — and an
-  explicitly-passed `min_score` is never overridden.
+  pushes more task context back through that lossless channel. Resolved on
+  every recall, so jmunch confirmed mid-session takes effect from the next
+  turn. Off jmunch the standard `MEMORY_PREFETCH_LIMIT` / `min_score` are
+  untouched, and an explicitly-passed `min_score` is never overridden.
 - In jmunch mode the admission gate defaults to the `high-recall` preset
   (when `MEMORY_ADMISSION_PRESET` is not explicitly set), so fewer
   task-relevant candidates — notably progress `events` — are rejected

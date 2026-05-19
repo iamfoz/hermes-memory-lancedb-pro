@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from hermes_memory_lancedb_pro import provider
+from hermes_memory_lancedb_pro import jmunch, provider
 from hermes_memory_lancedb_pro.smart_extractor import SmartExtractor
 from hermes_memory_lancedb_pro.store import VECTOR_DIM, MemoryStore
 
@@ -72,6 +72,17 @@ def provider_cls(monkeypatch):
     """Rebuild LanceDBProMemoryProvider against a fake base class."""
     monkeypatch.setattr(provider, "_load_memory_provider_base", lambda: _FakeBase)
     return provider._build_provider_class()
+
+
+@pytest.fixture(autouse=True)
+def _reset_jmunch_state(monkeypatch):
+    """Each test starts with jmunch neither declared nor observed."""
+    monkeypatch.delenv("MEMORY_JMUNCH_MODE", raising=False)
+    monkeypatch.setattr(
+        jmunch,
+        "_state",
+        {"observed": False, "version": None, "warned_old": False},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +152,17 @@ class TestJmunchAdmissionPreset:
     def test_jmunch_defaults_to_high_recall(self, real_store, monkeypatch):
         monkeypatch.setattr(provider, "_ADMISSION_PRESET", "balanced")
         monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", False)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        monkeypatch.setenv("MEMORY_JMUNCH_MODE", "true")
+        ctrl = provider._maybe_build_admission_controller(real_store, None)
+        assert ctrl is not None
+        assert ctrl.config.preset == "high-recall"
+
+    def test_passive_observation_also_triggers_high_recall(
+        self, real_store, monkeypatch
+    ):
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET", "balanced")
+        monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", False)
+        jmunch.record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
         ctrl = provider._maybe_build_admission_controller(real_store, None)
         assert ctrl is not None
         assert ctrl.config.preset == "high-recall"
@@ -149,8 +170,6 @@ class TestJmunchAdmissionPreset:
     def test_no_jmunch_keeps_default_preset(self, real_store, monkeypatch):
         monkeypatch.setattr(provider, "_ADMISSION_PRESET", "balanced")
         monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", False)
-        for var in _JMUNCH_ENV_VARS:
-            monkeypatch.delenv(var, raising=False)
         ctrl = provider._maybe_build_admission_controller(real_store, None)
         assert ctrl is not None
         assert ctrl.config.preset == "balanced"
@@ -158,7 +177,7 @@ class TestJmunchAdmissionPreset:
     def test_explicit_preset_respected_in_jmunch_mode(self, real_store, monkeypatch):
         monkeypatch.setattr(provider, "_ADMISSION_PRESET", "conservative")
         monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", True)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        monkeypatch.setenv("MEMORY_JMUNCH_MODE", "true")
         ctrl = provider._maybe_build_admission_controller(real_store, None)
         assert ctrl is not None
         assert ctrl.config.preset == "conservative"
@@ -166,7 +185,7 @@ class TestJmunchAdmissionPreset:
     def test_explicit_off_respected_in_jmunch_mode(self, real_store, monkeypatch):
         monkeypatch.setattr(provider, "_ADMISSION_PRESET", "off")
         monkeypatch.setattr(provider, "_ADMISSION_PRESET_EXPLICIT", True)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
+        monkeypatch.setenv("MEMORY_JMUNCH_MODE", "true")
         assert provider._maybe_build_admission_controller(real_store, None) is None
 
 
@@ -350,43 +369,37 @@ class TestSessionSwitch:
             assert "sess-1" not in p._reflection_cache
 
 
-_JMUNCH_ENV_VARS = (
-    "MEMORY_EXTRACTION_BASE_URL",
-    "OPENAI_BASE_URL",
-    "OPENAI_API_BASE",
-    "ANTHROPIC_BASE_URL",
-)
-
-
 class TestJmunchRecallTuning:
-    """In jmunch mode the provider widens recall to offset the gateway's
-    lossy compression of the agent's conversation history."""
+    """In jmunch mode `_effective_recall_config` widens recall to offset
+    the gateway's lossy compression of the agent's conversation history.
+    It is resolved per recall, so jmunch confirmed mid-session counts."""
 
-    def test_default_recall_when_no_jmunch(self, provider_cls, real_store, monkeypatch):
-        for var in _JMUNCH_ENV_VARS:
-            monkeypatch.delenv(var, raising=False)
-        p = provider_cls(store=real_store, auto_smart_extraction=False)
-        assert p._prefetch_limit == provider.DEFAULT_PREFETCH_LIMIT
-        assert p._min_score == provider.DEFAULT_MIN_RECALL_SCORE
+    def test_no_widening_when_not_jmunch(self):
+        assert provider._effective_recall_config(
+            5, 0.2, min_score_explicit=False
+        ) == (5, 0.2)
 
-    def test_jmunch_mode_widens_recall(self, provider_cls, real_store, monkeypatch):
-        for var in _JMUNCH_ENV_VARS:
-            monkeypatch.delenv(var, raising=False)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7879/v1")
-        p = provider_cls(store=real_store, auto_smart_extraction=False)
-        assert p._prefetch_limit == provider._JMUNCH_PREFETCH_LIMIT
-        assert p._min_score == provider._JMUNCH_MIN_RECALL_SCORE
+    def test_widens_when_jmunch_declared(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_JMUNCH_MODE", "true")
+        limit, score = provider._effective_recall_config(
+            5, 0.2, min_score_explicit=False
+        )
+        assert limit == provider._JMUNCH_PREFETCH_LIMIT
+        assert score == provider._JMUNCH_MIN_RECALL_SCORE
         # The widened limit must actually be wider, or it is not "tuning".
-        assert provider._JMUNCH_PREFETCH_LIMIT > provider.DEFAULT_PREFETCH_LIMIT
+        assert provider._JMUNCH_PREFETCH_LIMIT > 5
 
-    def test_jmunch_mode_respects_explicit_min_score(
-        self, provider_cls, real_store, monkeypatch
-    ):
-        for var in _JMUNCH_ENV_VARS:
-            monkeypatch.delenv(var, raising=False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:7882/v1")
-        p = provider_cls(store=real_store, min_score=0.5, auto_smart_extraction=False)
-        # An explicit caller min_score is never overridden by jmunch mode...
-        assert p._min_score == 0.5
-        # ...but the prefetch limit is still widened.
-        assert p._prefetch_limit == provider._JMUNCH_PREFETCH_LIMIT
+    def test_widens_when_jmunch_observed_passively(self):
+        jmunch.record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        limit, _ = provider._effective_recall_config(
+            5, 0.2, min_score_explicit=False
+        )
+        assert limit == provider._JMUNCH_PREFETCH_LIMIT
+
+    def test_explicit_min_score_respected(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_JMUNCH_MODE", "true")
+        limit, score = provider._effective_recall_config(
+            5, 0.5, min_score_explicit=True
+        )
+        assert score == 0.5  # explicit caller value kept
+        assert limit == provider._JMUNCH_PREFETCH_LIMIT  # limit still widened

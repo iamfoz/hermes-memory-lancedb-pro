@@ -657,8 +657,9 @@ Environment variables (all optional):
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300`                            | Min seconds between access_count increments for the same memory  |
 | `MEMORY_MIN_RECALL_SCORE`      | `0.0`                              | Default `min_score` for `MemoryRetriever.retrieve()` (0 = permissive) |
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
-| `MEMORY_JMUNCH_PREFETCH_LIMIT` | `12`                               | Recall size used *instead of* `MEMORY_PREFETCH_LIMIT` when a jmunch gateway is detected on the LLM endpoint. jmunch lossily compresses the agent's history, so recall is widened to re-surface task context. |
-| `MEMORY_JMUNCH_MIN_RECALL_SCORE` | `0.0`                            | `min_score` used when a jmunch gateway is detected (0 = permissive). An explicitly-passed `min_score` is never overridden. |
+| `MEMORY_JMUNCH_MODE`           | `false`                            | Declare up front that a jmunch gateway is in the LLM path. Optional — jmunch is also auto-detected from the `X-Jmunch-Gateway` response header — but setting this `true` makes the startup-time tuning (admission preset, turn-one recall) correct before the first response arrives. |
+| `MEMORY_JMUNCH_PREFETCH_LIMIT` | `12`                               | Recall size used *instead of* `MEMORY_PREFETCH_LIMIT` when jmunch is in use. jmunch lossily compresses the agent's history, so recall is widened to re-surface task context. |
+| `MEMORY_JMUNCH_MIN_RECALL_SCORE` | `0.0`                            | `min_score` used when jmunch is in use (0 = permissive). An explicitly-passed `min_score` is never overridden. |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
 | `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
@@ -711,7 +712,7 @@ the extractor doesn't accidentally hit a different model than the agent.
 | Variable                     | Purpose                                                                                  |
 |------------------------------|------------------------------------------------------------------------------------------|
 | `MEMORY_EXTRACTION_API_KEY`  | API key for the extraction provider. Required to enable LLM extraction.                  |
-| `MEMORY_EXTRACTION_BASE_URL` | OpenAI-compatible base URL (e.g. `http://127.0.0.1:7883/v1` for jmunch).                 |
+| `MEMORY_EXTRACTION_BASE_URL` | OpenAI-compatible base URL (e.g. `http://127.0.0.1:7879/v1` for jmunch).                 |
 | `MEMORY_EXTRACTION_MODEL`    | Model id (e.g. `Qwen3.6`, `gpt-4o-mini`, `claude-3-5-haiku-latest`).                     |
 | `MEMORY_EXTRACTION_PROVIDER` | `openai` (default, OpenAI-compatible) or `anthropic` (native Anthropic SDK).             |
 
@@ -723,10 +724,18 @@ the extractor at the same proxy:
 ```bash
 # ~/.hermes/.env
 MEMORY_EXTRACTION_PROVIDER=openai
-MEMORY_EXTRACTION_BASE_URL=http://127.0.0.1:7883/v1
+MEMORY_EXTRACTION_BASE_URL=http://127.0.0.1:7879/v1
 MEMORY_EXTRACTION_MODEL=Qwen3.6
 MEMORY_EXTRACTION_API_KEY=local        # jmunch usually ignores the value
+MEMORY_JMUNCH_MODE=true                # declare jmunch up front (see env table)
 ```
+
+With `MEMORY_JMUNCH_MODE=true`, the plugin treats jmunch as in-use from
+startup — it asks the gateway to pass extraction calls through verbatim
+(`X-Jmunch-Inject` / `X-Jmunch-Handleify`) and widens recall/admission to
+offset the gateway's lossy compression of the agent's history. jmunch is
+also auto-detected once a response carries an `X-Jmunch-Gateway` header,
+but the flag makes turn one correct too.
 
 Without `MEMORY_EXTRACTION_*` set the extractor falls back to whichever
 of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` it finds first; if neither is

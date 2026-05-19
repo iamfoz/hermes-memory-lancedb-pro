@@ -46,13 +46,12 @@ from .extraction_prompts import (  # noqa: F401
     build_merge_prompt,
 )
 
-# jmunch proxy detection. Pure-Python; pattern-matches endpoint URLs and
-# creates no dependency on jmunch-mcp.
+# jmunch gateway detection. Pure-stdlib; no dependency on jmunch-mcp.
 from .jmunch import (  # noqa: F401
-    detected_jmunch_endpoint,
     is_jmunch_in_use,
-    is_jmunch_url,
+    jmunch_mode_configured,
     jmunch_request_headers,
+    record_response_headers,
 )
 from .llm_client import (  # noqa: F401
     AnthropicLlmClient,
@@ -174,10 +173,10 @@ __all__ = [
     "classify_temporal",
     "infer_expiry",
     # jmunch gateway detection
-    "detected_jmunch_endpoint",
     "is_jmunch_in_use",
-    "is_jmunch_url",
+    "jmunch_mode_configured",
     "jmunch_request_headers",
+    "record_response_headers",
     # Session compressor
     "ScoredText",
     "CompressResult",
