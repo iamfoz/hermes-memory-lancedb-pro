@@ -592,18 +592,76 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
 
 def _resolve_hermes_home(explicit: str | None) -> Path:
-    """Pick the hermes profile dir: explicit arg > $HERMES_HOME > ~/.hermes/hermes-agent."""
+    """Pick the hermes home dir, matching hermes-agent's own
+    ``hermes_constants.get_hermes_home()``:
+
+        explicit ``--hermes-home`` arg  >  $HERMES_HOME env  >  ~/.hermes
+
+    The default MUST be ``~/.hermes`` (not ``~/.hermes/hermes-agent``):
+    that is where the host scans ``plugins/<name>/`` for user-installed
+    providers. A mismatch here installs the shim where the host never
+    looks, so the plugin is silently undiscovered."""
     if explicit:
         return Path(explicit).expanduser().resolve()
     env = os.environ.get("HERMES_HOME", "").strip()
     if env:
         return Path(env).expanduser().resolve()
-    return Path.home() / ".hermes" / "hermes-agent"
+    return (Path.home() / ".hermes").resolve()
+
+
+def _host_hermes_home() -> Path | None:
+    """The home dir hermes-agent itself will use, via its own
+    ``hermes_constants.get_hermes_home()`` — or None when hermes-agent is
+    not importable from this environment. Used only to warn on a mismatch."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home()).expanduser().resolve()
+    except Exception:
+        return None
 
 
 def _packaged_plugin_yaml() -> Path:
     """Return the path to the plugin.yaml shipped inside the installed wheel."""
     return Path(__file__).resolve().parent / "plugin.yaml"
+
+
+def _cleanup_stale_home_roots(current_home: Path, quiet: bool) -> None:
+    """Remove lancedb_pro shims left under the OLD wrong default home
+    (``~/.hermes/hermes-agent``) by pre-0.11.41 installers. The host scans
+    ``~/.hermes/plugins/`` — anything under the old root is dead weight."""
+    old_home = (Path.home() / ".hermes" / "hermes-agent").resolve()
+    if old_home == current_home.resolve():
+        return
+    for stale in (
+        old_home / "plugins" / PLUGIN_NAME,
+        old_home / "plugins" / "memory" / PLUGIN_NAME,
+    ):
+        if stale.exists():
+            try:
+                shutil.rmtree(str(stale))
+                if not quiet:
+                    sys.stdout.write(
+                        f"Removed stale install from the old default home: {stale}\n"
+                    )
+            except Exception as e:
+                _stderr(f"Could not remove stale install {stale}: {e}", quiet=False)
+
+
+def _warn_home_mismatch(installed_home: Path, quiet: bool) -> None:
+    """If hermes-agent is importable here and resolves a DIFFERENT home dir
+    than where we installed, warn loudly — the plugin would be undiscovered."""
+    host_home = _host_hermes_home()
+    if host_home is not None and host_home != installed_home.resolve():
+        _stderr(
+            f"WARNING: hermes-agent resolves its home to\n"
+            f"  {host_home}\n"
+            f"but the shim was installed under\n"
+            f"  {installed_home}\n"
+            f"The host will NOT discover the plugin. Re-run with:\n"
+            f"  hermes-memory-lancedb-pro install-plugin --hermes-home {host_home}\n"
+            f"or set $HERMES_HOME so both agree.",
+            quiet=False,
+        )
 
 
 def _cmd_install_plugin(args: argparse.Namespace) -> int:
@@ -659,6 +717,9 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
                 f"`rm -rf {legacy_dir}` to clean it up.\n"
             )
 
+    # Remove installs left under the old wrong default home (~/.hermes/hermes-agent).
+    _cleanup_stale_home_roots(hermes_home, quiet)
+
     existing_files = [p for p in (init_path, cli_path, yaml_target) if p.exists()]
     # Detect a stale shim — package upgraded but the shim files not
     # regenerated. The shim MUST match the installed package (an outdated
@@ -685,6 +746,7 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
                 f"{PLUGIN_NAME} plugin already installed and up to date at "
                 f"{plugin_dir}\n"
             )
+        _warn_home_mismatch(hermes_home, quiet)
         return 0
 
     plugin_dir.mkdir(parents=True, exist_ok=True)
@@ -699,9 +761,10 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
             f"  - {init_path.name} (discovery shim)\n"
             f"  - {cli_path.name} (plugin CLI shim)\n"
             f"  - {yaml_target.name} (manifest)\n"
-            f"Next: restart the Hermes gateway, then `hermes memory setup`\n"
-            f"to configure the LLM extraction key (optional).\n"
+            f"Next: set `memory.provider: lancedb_pro` in config.yaml, restart\n"
+            f"the Hermes gateway, then `hermes memory setup` (optional).\n"
         )
+    _warn_home_mismatch(hermes_home, quiet)
     return 0
 
 
@@ -1292,7 +1355,7 @@ def main() -> int:
         "--hermes-home",
         default=None,
         metavar="PATH",
-        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes/hermes-agent)",
+        help="Hermes home dir (default: $HERMES_HOME or ~/.hermes)",
     )
     p_install.add_argument(
         "--force",
@@ -1316,7 +1379,7 @@ def main() -> int:
         "--hermes-home",
         default=None,
         metavar="PATH",
-        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes/hermes-agent)",
+        help="Hermes home dir (default: $HERMES_HOME or ~/.hermes)",
     )
     p_uninstall.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
                              help=argparse.SUPPRESS)
