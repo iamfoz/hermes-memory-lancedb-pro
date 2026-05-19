@@ -368,6 +368,29 @@ class TestInstallPlugin:
         shim = (tmp_path / "plugins" / "lancedb_pro" / "__init__.py").read_text()
         assert "from hermes_memory_lancedb_pro.provider import register" in shim
 
+    def test_install_shim_passes_host_discovery_textscan(self, tmp_path):
+        """hermes-agent's _is_memory_provider_dir() text-scans __init__.py for
+        'register_memory_provider' or 'MemoryProvider'. The shim MUST contain
+        one — otherwise the host never recognises the plugin directory and
+        both the provider and `hermes lancedb_pro` silently disappear."""
+        _cmd_install_plugin(self._ns(tmp_path))
+        shim = (tmp_path / "plugins" / "lancedb_pro" / "__init__.py").read_text()
+        assert "register_memory_provider" in shim or "MemoryProvider" in shim
+
+    def test_reinstall_up_to_date_is_noop(self, tmp_path):
+        assert _cmd_install_plugin(self._ns(tmp_path)) == 0
+        # Second run with no changes: succeeds (rc 0), nothing to do.
+        assert _cmd_install_plugin(self._ns(tmp_path)) == 0
+
+    def test_reinstall_refreshes_a_stale_shim(self, tmp_path):
+        _cmd_install_plugin(self._ns(tmp_path))
+        init_path = tmp_path / "plugins" / "lancedb_pro" / "__init__.py"
+        init_path.write_text("# stale outdated shim\n")
+        # Re-running install (no --force) must auto-refresh the stale shim.
+        assert _cmd_install_plugin(self._ns(tmp_path)) == 0
+        refreshed = init_path.read_text()
+        assert "register_memory_provider" in refreshed or "MemoryProvider" in refreshed
+
     def test_install_migrates_from_legacy_memory_path(self, tmp_path):
         # Simulate a 0.11.1–0.11.37 install under the wrong plugins/memory/ path.
         legacy = tmp_path / "plugins" / "memory" / "lancedb_pro"
