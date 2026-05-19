@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.11.5"
+__version__ = "0.11.6"
 
 # Pure-Python re-exports (safe — no heavy deps)
 # Reflection layer (PR 2). Pure-Python; the storage adapter delegates to
@@ -44,6 +44,14 @@ from .extraction_prompts import (  # noqa: F401
     build_dedup_prompt,
     build_extraction_prompt,
     build_merge_prompt,
+)
+
+# jmunch proxy detection. Pure-Python; pattern-matches endpoint URLs and
+# creates no dependency on jmunch-mcp.
+from .jmunch import (  # noqa: F401
+    detected_jmunch_endpoint,
+    is_jmunch_in_use,
+    is_jmunch_url,
 )
 from .llm_client import (  # noqa: F401
     AnthropicLlmClient,
@@ -164,6 +172,10 @@ __all__ = [
     "TemporalType",
     "classify_temporal",
     "infer_expiry",
+    # jmunch proxy detection
+    "detected_jmunch_endpoint",
+    "is_jmunch_in_use",
+    "is_jmunch_url",
     # Session compressor
     "ScoredText",
     "CompressResult",

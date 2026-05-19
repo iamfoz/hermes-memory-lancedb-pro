@@ -7,6 +7,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.6] — 2026-05-21
+
+### Added
+- jmunch proxy detection (`hermes_memory_lancedb_pro.jmunch`).
+  `is_jmunch_in_use()` reports — best-effort — whether the plugin's
+  configured LLM endpoint is a local jmunch proxy (a loopback host on a
+  port in the jmunch range, base 7881 and counting up for each additional
+  proxy). Detection is a soft URL pattern-match: it reads
+  `MEMORY_EXTRACTION_BASE_URL` / `OPENAI_BASE_URL` / `OPENAI_API_BASE` and
+  creates no code dependency on jmunch-mcp, so the two packages stay
+  independent. `JMUNCH_PORT_BASE` / `JMUNCH_PORT_SPAN` env vars tune the
+  detected port range. The provider logs an info line when jmunch is
+  detected on the extraction endpoint.
+
+---
+
 ## [0.11.5] — 2026-05-21
 
 ### Fixed

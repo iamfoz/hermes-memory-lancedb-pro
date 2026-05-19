@@ -37,6 +37,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from .jmunch import detected_jmunch_endpoint, is_jmunch_in_use
 from .memory_compactor import (
     CompactionConfig,
     record_compaction_run,
@@ -197,6 +198,12 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
         return None
     if llm is None:
         return None
+    if is_jmunch_in_use():
+        logger.info(
+            "lancedb_pro: jmunch proxy detected on the extraction endpoint "
+            "(%s); LLM calls route to a small-context local model.",
+            detected_jmunch_endpoint(),
+        )
     admission = _maybe_build_admission_controller(store, llm)
     rate_limiter = (
         ExtractionRateLimiter(max_per_hour=_EXTRACTION_RATE_LIMIT)
