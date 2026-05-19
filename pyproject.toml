@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.11.40"
+version = "0.11.41"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -87,7 +87,9 @@ ignore = [
 # hermes-agent is on PYTHONPATH; the lazy import is by design. _do_recall is a
 # long but linear read path — its statement count is readability, not sprawl.
 "src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415", "PLR0911", "PLR0912", "PLR0915"]
-"src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912", "PLR0915"]
+# _cli.py lazy-imports the host's `hermes_constants` only when running inside
+# hermes-agent's environment — a top-level import would fail standalone.
+"src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912", "PLR0915", "PLC0415"]
 # smart_extractor's process_candidate is a long dispatch table over the 7
 # dedup decisions — collapsing it via a function-table hurts readability
 # and the per-branch logic is what reviewers want to read.
