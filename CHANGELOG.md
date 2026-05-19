@@ -7,6 +7,31 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.5] — 2026-05-21
+
+### Fixed
+- File-descriptor exhaustion under sustained write load. Every `store()`,
+  `store_many()`, `store_raw()`, and supersede wrote a new on-disk LanceDB
+  fragment, and every read has to open every fragment of the table's
+  current version — so a store that had absorbed thousands of single-row
+  writes opened thousands of files per query, exhausted `ulimit -n`, and
+  degraded catastrophically (inserts and searches slowed to a crawl and
+  timed out). The store now compacts automatically: after every
+  `MEMORY_AUTO_OPTIMIZE_EVERY` fragment-creating writes (default 256) it
+  merges the small fragments into a few large files and refreshes the FTS
+  and vector indexes. A 2,500-insert run at `ulimit -n 256` that previously
+  stalled past ~2,000 rows now completes without degradation.
+
+### Added
+- `MemoryStore.optimize()` — public, best-effort fragment compaction. Safe
+  to call manually (e.g. from a scheduled maintenance job) or concurrently
+  with reads and writes; the write path also calls it automatically.
+- `MEMORY_AUTO_OPTIMIZE_EVERY` environment variable — number of
+  fragment-creating writes between automatic compactions (default 256; set
+  to 0 to disable).
+
+---
+
 ## [0.11.4] — 2026-05-20
 
 ### Fixed
@@ -18,9 +43,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upgrading from pre-0.11.1 don't need to manually move the directory.
 - `uninstall-plugin` also removes the old `plugins/lancedb_pro/` directory
   when found, as part of the same migration cleanup.
-- Stale remote branches (`claude/restructure-repo-branches-BiSQH`,
-  `feat/spec-compliance`) that contained old commit messages with AI
-  session URLs were overwritten to point to clean main history.
+- Stale remote feature branches that contained outdated commit history
+  were overwritten to point to clean main history.
 
 ---
 

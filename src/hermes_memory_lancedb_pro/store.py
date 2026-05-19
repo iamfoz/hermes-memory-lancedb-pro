@@ -75,6 +75,18 @@ SEARCH_OVERFETCH_MULTIPLIER: int = 3
 # Index training threshold — LanceDB IVF_PQ needs ~256 rows minimum
 VECTOR_INDEX_MIN_ROWS: int = 256
 
+# Auto-compaction threshold. Every `_table.add()` writes a new on-disk data
+# fragment, and every read has to open every fragment of the table's current
+# version. A store that has absorbed thousands of single-row writes therefore
+# opens thousands of files per query, which exhausts the process
+# file-descriptor limit (`ulimit -n`) and degrades catastrophically — inserts
+# and searches slow to a crawl and eventually time out.
+#
+# After this many fragment-creating writes the store runs `optimize()`, which
+# compacts the small fragments into a few large ones (and folds newly-written
+# rows into the FTS / vector indexes). Set to 0 to disable auto-compaction.
+AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256"))
+
 MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other", "reflection"]
 MEMORY_TIERS = ["core", "working", "peripheral"]
 MEMORY_STATES = ["pending", "confirmed", "archived"]
@@ -236,6 +248,13 @@ class MemoryStore:
         self._db = None
         self._table = None
         self._initialised = False
+        # Fragment-compaction bookkeeping — see AUTO_OPTIMIZE_EVERY. The
+        # counter tracks fragment-creating writes; `_optimize_counter_lock`
+        # guards it, while `_optimize_run_lock` single-flights the compaction
+        # so only one runs at a time even under heavy concurrent writes.
+        self._writes_since_optimize = 0
+        self._optimize_counter_lock = threading.Lock()
+        self._optimize_run_lock = threading.Lock()
 
     # ----- lifecycle -----
 
@@ -337,6 +356,73 @@ class MemoryStore:
             if "already exists" in msg or "exists" in msg:
                 return False
             logger.warning("Vector index creation failed: %s", e)
+            return False
+
+    # ----- maintenance -----
+
+    def _table_add(self, rows: list[MemorySchema]) -> None:
+        """Append `rows` to the table, then run cooldown-gated fragment
+        compaction.
+
+        Every write path funnels through here so a single counter sees all
+        fragment-creating writes. Keeping `self._table.add` out of the
+        individual CRUD methods means the compaction policy lives in exactly
+        one place. See `optimize`."""
+        self._table.add(rows)
+        self._maybe_optimize()
+
+    def _maybe_optimize(self) -> None:
+        """Run `optimize()` once `AUTO_OPTIMIZE_EVERY` fragment-creating
+        writes have accumulated.
+
+        The counter is incremented and reset under `_optimize_counter_lock`
+        so exactly one writer per cycle is elected to compact. The compaction
+        itself runs *without* that lock held — concurrent writers keep
+        flowing — and is single-flighted by a non-blocking acquire of
+        `_optimize_run_lock`: if a previous compaction is still in progress
+        this cycle is skipped, and the next threshold crossing retries."""
+        if AUTO_OPTIMIZE_EVERY <= 0:
+            return
+        with self._optimize_counter_lock:
+            self._writes_since_optimize += 1
+            if self._writes_since_optimize < AUTO_OPTIMIZE_EVERY:
+                return
+            self._writes_since_optimize = 0
+        if not self._optimize_run_lock.acquire(blocking=False):
+            return
+        try:
+            self.optimize()
+        finally:
+            self._optimize_run_lock.release()
+
+    def optimize(self) -> bool:
+        """Compact on-disk fragments and refresh indexes.
+
+        Each individual write creates its own small LanceDB fragment. Left
+        unchecked, a high-volume store accumulates thousands of fragment
+        files and every query has to open all of them at once, exhausting
+        the file-descriptor limit and grinding throughput to a halt.
+        `optimize()` merges those fragments into a few large files, prunes
+        table versions older than LanceDB's default retention window, and
+        folds newly-written rows into the FTS / vector indexes.
+
+        The row count is never changed. Safe to call concurrently with reads
+        and writes — LanceDB resolves the compaction commit against
+        concurrent appends. Best-effort: any failure is logged and swallowed
+        so a maintenance hiccup never breaks the write path. Returns True
+        when compaction succeeded.
+
+        Called automatically by the write path (see `AUTO_OPTIMIZE_EVERY`);
+        also safe to call manually, e.g. from a scheduled maintenance job."""
+        if self._table is None:
+            return False
+        try:
+            self._table.optimize()
+            return True
+        except Exception as e:
+            logger.warning(
+                "MemoryStore.optimize (fragment compaction) failed: %s", e
+            )
             return False
 
     # ----- embedding -----
@@ -448,7 +534,7 @@ class MemoryStore:
         )
 
         vector = self.encode(text)
-        self._table.add([
+        self._table_add([
             MemorySchema(
                 id=mem_id,
                 text=text,
@@ -511,7 +597,7 @@ class MemoryStore:
             )
             ids.append(mem_id)
 
-        self._table.add(prepared)
+        self._table_add(prepared)
         return ids
 
     def store_raw(
@@ -547,7 +633,7 @@ class MemoryStore:
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
         importance = max(0.0, min(1.0, float(importance)))
 
-        self._table.add([
+        self._table_add([
             MemorySchema(
                 id=mem_id,
                 text=text,
@@ -728,7 +814,7 @@ class MemoryStore:
 
         # Atomic-ish: do the write of the new row first so a partial failure
         # leaves the old row visible (preferred over a missing row).
-        self._table.add([
+        self._table_add([
             MemorySchema(
                 id=new_id,
                 text=text,
