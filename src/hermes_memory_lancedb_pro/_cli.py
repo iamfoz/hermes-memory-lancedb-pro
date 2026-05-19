@@ -23,20 +23,28 @@ from .store import (
 )
 
 PLUGIN_NAME = "lancedb_pro"
+# IMPORTANT: hermes-agent's `_is_memory_provider_dir()` gates user-installed
+# plugins with a cheap TEXT SCAN of this __init__.py — it must contain the
+# literal string "register_memory_provider" or "MemoryProvider" or the host
+# will not recognise the directory as a memory provider at all (no provider,
+# no `hermes lancedb_pro` CLI). Both `register` and `register_memory_provider`
+# are re-exported so the host's loader finds an entry point either way.
 PLUGIN_SHIM_CONTENT = '''\
 """Hermes plugin discovery shim for hermes-memory-lancedb-pro.
 
 The heavy package (lancedb, sentence-transformers, ...) must be installed
 into Hermes' own Python environment with `hermes-pip install
-hermes-memory-lancedb-pro`; this shim only re-exports `register` so
-hermes-agent's plugin loader can discover it. If the import below fails,
-the package landed in the wrong environment — reinstall with hermes-pip.
+hermes-memory-lancedb-pro`; this shim only re-exports the plugin's
+`register` / `register_memory_provider` entry points so hermes-agent's
+plugin loader recognises and discovers this MemoryProvider. If the import
+below fails, the package landed in the wrong environment — reinstall with
+hermes-pip.
 
-Regenerate with: hermes-memory install-plugin
+Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
-from hermes_memory_lancedb_pro.provider import register
+from hermes_memory_lancedb_pro.provider import register, register_memory_provider
 
-__all__ = ["register"]
+__all__ = ["register", "register_memory_provider"]
 '''
 
 PLUGIN_CLI_CONTENT = '''\
@@ -652,17 +660,32 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
             )
 
     existing_files = [p for p in (init_path, cli_path, yaml_target) if p.exists()]
-    # A just-migrated directory carries the OLD shim — always refresh it to the
-    # current version rather than refusing as "already installed".
-    force = bool(getattr(args, "force", False)) or migrated
+    # Detect a stale shim — package upgraded but the shim files not
+    # regenerated. The shim MUST match the installed package (an outdated
+    # __init__.py can fail the host's discovery text-scan), so a stale
+    # install is auto-refreshed rather than refused as "already installed".
+    stale = False
+    if existing_files:
+        try:
+            stale = (
+                not init_path.exists()
+                or init_path.read_text(encoding="utf-8") != PLUGIN_SHIM_CONTENT
+                or not cli_path.exists()
+                or cli_path.read_text(encoding="utf-8") != PLUGIN_CLI_CONTENT
+                or not yaml_target.exists()
+                or yaml_target.read_bytes() != yaml_source.read_bytes()
+            )
+        except Exception:
+            stale = True
+    # A just-migrated directory carries the OLD shim — always refresh it.
+    force = bool(getattr(args, "force", False)) or migrated or stale
     if existing_files and not force:
-        _stderr(
-            f"Plugin already installed at {plugin_dir}\n"
-            f"Pass --force to overwrite, or remove with:\n"
-            f"    hermes-memory-lancedb-pro uninstall-plugin",
-            quiet=False,
-        )
-        return 1
+        if not quiet:
+            sys.stdout.write(
+                f"{PLUGIN_NAME} plugin already installed and up to date at "
+                f"{plugin_dir}\n"
+            )
+        return 0
 
     plugin_dir.mkdir(parents=True, exist_ok=True)
     init_path.write_text(PLUGIN_SHIM_CONTENT, encoding="utf-8")
