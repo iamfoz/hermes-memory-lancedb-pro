@@ -36,11 +36,13 @@ import os
 from urllib.parse import urlparse
 
 __all__ = [
+    "JMUNCH_NO_INJECT_HEADER",
     "JMUNCH_PORT_BASE",
     "JMUNCH_PORT_SPAN",
     "detected_jmunch_endpoint",
     "is_jmunch_in_use",
     "is_jmunch_url",
+    "jmunch_request_headers",
 ]
 
 # jmunch binds the loopback interface. Its gateway defaults to port 7879
@@ -65,6 +67,12 @@ _CANDIDATE_URL_ENV_VARS = (
     "OPENAI_API_BASE",
     "ANTHROPIC_BASE_URL",
 )
+
+# Header that tells a jmunch gateway not to inject its drill-in verb tools
+# into a call. The memory extractor expects a plain JSON completion, not
+# tool calls — verb injection would derail a tool-capable model into
+# calling a jmunch verb instead of returning the extraction result.
+JMUNCH_NO_INJECT_HEADER: dict[str, str] = {"X-Jmunch-Inject": "false"}
 
 
 def is_jmunch_url(url: str | None) -> bool:
@@ -114,3 +122,13 @@ def is_jmunch_in_use() -> bool:
     is on the same gateway. See the module docstring for the detection's
     limits."""
     return detected_jmunch_endpoint() is not None
+
+
+def jmunch_request_headers(base_url: str | None) -> dict[str, str]:
+    """HTTP headers to attach to an LLM call when `base_url` points at a
+    jmunch gateway; an empty dict otherwise.
+
+    Callers can splat the result unconditionally: an empty dict leaves the
+    request unchanged, so a non-jmunch call is byte-for-byte identical to
+    one made without this helper."""
+    return dict(JMUNCH_NO_INJECT_HEADER) if is_jmunch_url(base_url) else {}

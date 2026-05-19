@@ -20,6 +20,13 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two packages stay independent. `JMUNCH_PORT_BASE` / `JMUNCH_PORT_SPAN`
   env vars tune the detected port range. The provider logs an info line
   when jmunch is detected on the extraction endpoint.
+- When the memory extractor's LLM endpoint is a jmunch gateway, its calls
+  now send the `X-Jmunch-Inject: false` header so the gateway does not
+  inject its drill-in verb tools into an extraction request — the
+  extractor expects a plain JSON completion, and verb injection would
+  derail a tool-capable model into calling a jmunch verb instead. The
+  header is added only when the client's own base URL is a jmunch gateway;
+  every non-jmunch call is byte-for-byte unchanged.
 
 ---
 

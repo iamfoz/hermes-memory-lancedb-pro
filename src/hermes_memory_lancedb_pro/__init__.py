@@ -52,6 +52,7 @@ from .jmunch import (  # noqa: F401
     detected_jmunch_endpoint,
     is_jmunch_in_use,
     is_jmunch_url,
+    jmunch_request_headers,
 )
 from .llm_client import (  # noqa: F401
     AnthropicLlmClient,
@@ -172,10 +173,11 @@ __all__ = [
     "TemporalType",
     "classify_temporal",
     "infer_expiry",
-    # jmunch proxy detection
+    # jmunch gateway detection
     "detected_jmunch_endpoint",
     "is_jmunch_in_use",
     "is_jmunch_url",
+    "jmunch_request_headers",
     # Session compressor
     "ScoredText",
     "CompressResult",
