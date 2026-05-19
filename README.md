@@ -651,6 +651,7 @@ Environment variables (all optional):
 | `GOOGLE_CLOUD_PROJECT`         | *(none)*                           | Enables Google Discovery Engine Ranking API. Also accepted as `GOOGLE_PROJECT_ID` or `GOOGLE_PROJECT`. Ensure the [Discovery Engine API](https://console.cloud.google.com/apis/library/discoveryengine.googleapis.com) is enabled for the project. Free tier: 1,000 queries/month; ~$0.001/query thereafter. **No API key needed** — authentication uses Application Default Credentials (see below). |
 | `MEMORY_GOOGLE_RANKING_MODEL`  | `semantic-ranker-512@latest`       | Google ranking model name (advanced). |
 | `MEMORY_MAX_SCAN_ROWS`         | `100000`                           | Cap on full-table scans in `stats` / `purge_archived`             |
+| `MEMORY_AUTO_OPTIMIZE_EVERY`   | `256`                              | Fragment-creating writes between automatic on-disk compactions. Each write creates a new LanceDB fragment; compaction merges them so a high-volume store doesn't exhaust the file-descriptor limit. Set `0` to disable. |
 | `MEMORY_TIER_EVAL_FREQUENCY`   | `10`                               | Retrievals between full tier re-evaluations (set 0 to disable)    |
 | `MEMORY_TIER_EVAL_BATCH`       | `500`                              | Rows fetched per tier evaluation                                  |
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300`                            | Min seconds between access_count increments for the same memory  |

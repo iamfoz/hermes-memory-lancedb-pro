@@ -258,3 +258,71 @@ class TestSingleton:
             # Same path returns same instance
             s_a2 = MemoryStore.get_instance(db_path=a)
             assert s_a is s_a2
+
+
+class TestCompaction:
+    """Fragment compaction — each write creates a new on-disk fragment, and
+    a store left uncompacted exhausts the file-descriptor limit on read."""
+
+    def test_optimize_preserves_rows(self, store):
+        ids = store.store_many([{"text": f"row number {i}"} for i in range(20)])
+        assert store.optimize() is True
+        # Compaction never changes the row count, and every row survives.
+        assert len(store._table) == 20
+        for mid in ids:
+            assert store.get_by_id(mid) is not None
+
+    def test_optimize_safe_on_empty_table(self, store):
+        assert store.optimize() is True
+        assert len(store._table) == 0
+
+    def test_auto_optimize_fires_after_threshold(self, store, monkeypatch):
+        import hermes_memory_lancedb_pro.store as store_mod
+
+        monkeypatch.setattr(store_mod, "AUTO_OPTIMIZE_EVERY", 10)
+        calls: list[int] = []
+        real_optimize = store.optimize
+        monkeypatch.setattr(
+            store, "optimize", lambda: (calls.append(1), real_optimize())[1]
+        )
+
+        for i in range(25):
+            store.store(text=f"auto compaction entry {i}")
+
+        # 25 writes at threshold 10 -> compaction elected at write 10 and 20.
+        assert len(calls) == 2
+        assert len(store._table) == 25
+        assert store._writes_since_optimize == 5
+
+    def test_auto_optimize_disabled_when_zero(self, store, monkeypatch):
+        import hermes_memory_lancedb_pro.store as store_mod
+
+        monkeypatch.setattr(store_mod, "AUTO_OPTIMIZE_EVERY", 0)
+        calls: list[int] = []
+        monkeypatch.setattr(store, "optimize", lambda: calls.append(1))
+
+        for i in range(15):
+            store.store(text=f"no compaction entry {i}")
+
+        assert calls == []
+        assert len(store._table) == 15
+
+    def test_concurrent_writes_with_compaction_keep_exact_count(
+        self, store, monkeypatch
+    ):
+        """Compaction running mid-stream against concurrent writers must not
+        drop or duplicate rows."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import hermes_memory_lancedb_pro.store as store_mod
+
+        monkeypatch.setattr(store_mod, "AUTO_OPTIMIZE_EVERY", 16)
+
+        def worker(tid: int) -> None:
+            for i in range(40):
+                store.store(text=f"thread {tid} entry {i}")
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(worker, range(6)))
+
+        assert len(store._table) == 6 * 40
