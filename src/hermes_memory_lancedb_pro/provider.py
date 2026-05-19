@@ -37,7 +37,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from .jmunch import detected_jmunch_endpoint, is_jmunch_in_use
+from .jmunch import JMUNCH_MODE_ENV, is_jmunch_in_use
 from .memory_compactor import (
     CompactionConfig,
     record_compaction_run,
@@ -74,6 +74,26 @@ _JMUNCH_PREFETCH_LIMIT: int = int(
 _JMUNCH_MIN_RECALL_SCORE: float = float(
     os.environ.get("MEMORY_JMUNCH_MIN_RECALL_SCORE", "0.0")
 )
+
+
+def _effective_recall_config(
+    base_limit: int,
+    base_min_score: float,
+    *,
+    min_score_explicit: bool,
+) -> tuple[int, float]:
+    """Resolve the (limit, min_score) for the next recall.
+
+    In jmunch mode the limit is widened and `min_score` relaxed to
+    re-surface task context the gateway compressed out of the agent's
+    history. Re-evaluated on every recall (not cached at construction) so
+    that jmunch confirmed passively mid-session — via an `X-Jmunch-Gateway`
+    response header — takes effect from the next turn. An explicitly
+    configured `min_score` is never overridden."""
+    if not is_jmunch_in_use():
+        return base_limit, base_min_score
+    min_score = base_min_score if min_score_explicit else _JMUNCH_MIN_RECALL_SCORE
+    return _JMUNCH_PREFETCH_LIMIT, min_score
 
 # ---------------------------------------------------------------------------
 # Auto-purge configuration
@@ -220,9 +240,9 @@ def _maybe_build_default_smart_extractor(store: MemoryStore) -> Any:
         return None
     if is_jmunch_in_use():
         logger.info(
-            "lancedb_pro: jmunch proxy detected on the extraction endpoint "
-            "(%s); LLM calls route to a small-context local model.",
-            detected_jmunch_endpoint(),
+            "lancedb_pro: jmunch mode active (declared via %s); memory "
+            "extraction calls will request gateway pass-through.",
+            JMUNCH_MODE_ENV,
         )
     admission = _maybe_build_admission_controller(store, llm)
     rate_limiter = (
@@ -495,26 +515,14 @@ def _build_provider_class():
             self._explicit_store = store is not None
             self._store = store or MemoryStore.get_instance()
             self._retriever = retriever or MemoryRetriever(self._store)
+            # Base recall config. jmunch-mode widening is applied per
+            # recall in `_do_recall` (see `_effective_recall_config`), not
+            # cached here — jmunch may only be confirmed mid-session.
             self._min_score = (
                 min_score if min_score is not None else DEFAULT_MIN_RECALL_SCORE
             )
+            self._min_score_explicit = min_score is not None
             self._prefetch_limit = prefetch_limit
-            # jmunch mode: the gateway lossily compresses the agent's
-            # conversation history, so the agent loses task detail mid-run.
-            # The injected memory block is not handle-ified — a lossless
-            # side-channel — so widen recall to re-surface that context.
-            # Fully gated: off jmunch the recall config above is untouched.
-            # An explicitly-passed min_score is always respected.
-            if is_jmunch_in_use():
-                self._prefetch_limit = _JMUNCH_PREFETCH_LIMIT
-                if min_score is None:
-                    self._min_score = _JMUNCH_MIN_RECALL_SCORE
-                logger.info(
-                    "lancedb_pro: jmunch mode — widened recall "
-                    "(prefetch_limit=%d, min_score=%.2f) to offset gateway "
-                    "context compression.",
-                    self._prefetch_limit, self._min_score,
-                )
             self._session_id: str = ""
             self._sync_thread: threading.Thread | None = None
             # Protects _sync_thread reference against concurrent sync_turn /
@@ -686,12 +694,17 @@ def _build_provider_class():
             returns the combined text."""
             if not query or not query.strip():
                 return ""
+            limit, min_score = _effective_recall_config(
+                self._prefetch_limit,
+                self._min_score,
+                min_score_explicit=self._min_score_explicit,
+            )
             try:
                 results = self._retriever.retrieve(
                     query,
-                    limit=self._prefetch_limit,
+                    limit=limit,
                     session_id=session_id or None,
-                    min_score=self._min_score,
+                    min_score=min_score,
                     source="auto-recall",
                 )
             except Exception as e:

@@ -1,134 +1,176 @@
-"""Best-effort detection of a local jmunch gateway.
+"""Detection of a jmunch gateway in the LLM request path.
 
-jmunch (https://github.com/iamfoz/jmunch-mcp) is a local gateway that sits
-between an app and an upstream OpenAI- or Anthropic-compatible LLM API. Its
-job is token reduction: it "handle-ifies" fat tool results in outgoing
-requests — a 100 KB tool payload becomes a ~1 KB summary plus an opaque
-handle, and jmunch injects drill-in verbs (`peek`, `slice`, `search`, ...)
-so the model can fetch detail on demand.
+jmunch (https://github.com/iamfoz/jmunch-mcp) is a gateway that sits
+between an app and an upstream OpenAI- or Anthropic-compatible LLM API. It
+reduces tokens by "handle-ifying" fat tool results — replacing a large
+payload with a short summary plus an opaque handle. That lossily
+compresses the agent's conversation history, so this plugin wants to know
+when jmunch is in the path: it tunes recall/admission to compensate (see
+`provider.py`) and asks the gateway to pass memory-extraction calls
+through untouched.
 
-That matters to this plugin for two reasons, so callers want to know when
-jmunch is in the path:
+Detection is two-stage, and creates no code dependency on jmunch-mcp:
 
-  * The agent's conversation history is lossily compressed. Tool results
-    from earlier in a task get summarised away, which is why a long task
-    can "lose the thread" even on a large-context model.
-  * If the memory extractor's own LLM calls route through the gateway,
-    jmunch injects its verbs into those calls and handle-ifies their
-    request payloads — neither of which the extractor wants.
+  * Passive confirmation — jmunch >= 0.3.0 stamps every response with an
+    `X-Jmunch-Gateway: <version>` header. `record_response_headers()`,
+    called by the LLM client after each call, latches that observation.
+    It is authoritative and works on any port — but only from the first
+    response onward.
+  * Startup declaration — because the passive signal isn't available
+    before the first call, the operator can set `MEMORY_JMUNCH_MODE=true`
+    to declare jmunch up front, so the startup-time tuning (admission
+    preset, and recall from turn one) is correct immediately.
 
-Detection is deliberately a *soft*, observational check: it pattern-matches
-the configured endpoint URL and creates no code dependency on jmunch-mcp.
-hermes-memory and jmunch-mcp remain completely independent packages (see
-the README) — this module never imports, calls, or inspects jmunch itself.
-
-Limitations: the plugin can only see the LLM endpoints it is configured
-with (`MEMORY_EXTRACTION_BASE_URL` and the OpenAI-/Anthropic-SDK base-URL
-env vars). If the host agent routes through jmunch but the plugin's
-extractor is pointed elsewhere — or jmunch runs on a non-default port with
-no `JMUNCH_PORT_BASE` override — detection cannot see it. Treat a True
-result as a strong hint, not a guarantee.
+`is_jmunch_in_use()` is true when either signal has fired.
 """
 
 from __future__ import annotations
 
-import os
-from urllib.parse import urlparse
+import logging
+import threading
+from os import environ
+from typing import Any
 
 __all__ = [
-    "JMUNCH_NO_INJECT_HEADER",
-    "JMUNCH_PORT_BASE",
-    "JMUNCH_PORT_SPAN",
-    "detected_jmunch_endpoint",
+    "JMUNCH_MODE_ENV",
     "is_jmunch_in_use",
-    "is_jmunch_url",
+    "jmunch_mode_configured",
     "jmunch_request_headers",
+    "jmunch_supports_passthrough",
+    "observed_jmunch_version",
+    "record_response_headers",
 ]
 
-# jmunch binds the loopback interface. Its gateway defaults to port 7879
-# (the dashboard — not an LLM endpoint — is 7878). Each additional gateway
-# instance claims the next free port, so a host running several proxies
-# exposes a contiguous range (7879, 7880, 7881, ...). Both knobs are
-# env-overridable for non-default deployments.
-JMUNCH_PORT_BASE: int = int(os.environ.get("JMUNCH_PORT_BASE", "7879"))
-# How many ports above the base count as jmunch. Bounded on purpose: an
-# unbounded range would misdetect any unrelated high-port localhost service.
-JMUNCH_PORT_SPAN: int = int(os.environ.get("JMUNCH_PORT_SPAN", "16"))
+logger = logging.getLogger(__name__)
 
-# Hostnames that mean "this machine". jmunch only ever binds loopback.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# Env var by which an operator declares, at startup, that jmunch is in the
+# LLM path — see the module docstring.
+JMUNCH_MODE_ENV = "MEMORY_JMUNCH_MODE"
 
-# Env vars that can point an OpenAI-/Anthropic-compatible client at a base
-# URL. The plugin's own extractor var comes first; the rest are what the
-# host agent (and the OpenAI / Anthropic SDKs) commonly set.
-_CANDIDATE_URL_ENV_VARS = (
-    "MEMORY_EXTRACTION_BASE_URL",
-    "OPENAI_BASE_URL",
-    "OPENAI_API_BASE",
-    "ANTHROPIC_BASE_URL",
-)
+# Response header jmunch >= 0.3.0 stamps on every response (lower-cased
+# here; lookups are case-insensitive).
+_GATEWAY_HEADER = "x-jmunch-gateway"
 
-# Header that tells a jmunch gateway not to inject its drill-in verb tools
-# into a call. The memory extractor expects a plain JSON completion, not
-# tool calls — verb injection would derail a tool-capable model into
-# calling a jmunch verb instead of returning the extraction result.
-JMUNCH_NO_INJECT_HEADER: dict[str, str] = {"X-Jmunch-Inject": "false"}
+# First jmunch version that honours `X-Jmunch-Handleify: false`. Older
+# gateways silently ignore it — sending it is still harmless.
+_MIN_PASSTHROUGH_VERSION = (0, 3, 0)
 
+# Request headers that make jmunch a pure pass-through for a call: no verb
+# injection, no handle-ification, so the memory extractor sees the raw
+# tool content. Both are inert on any non-jmunch endpoint.
+_PASSTHROUGH_HEADERS: dict[str, str] = {
+    "X-Jmunch-Inject": "false",
+    "X-Jmunch-Handleify": "false",
+}
 
-def is_jmunch_url(url: str | None) -> bool:
-    """True when `url` points at what looks like a local jmunch gateway: a
-    loopback host on a port in the jmunch range ``[BASE, BASE + SPAN)``.
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 
-    Accepts URLs with or without a scheme (``127.0.0.1:7879`` works as well
-    as ``http://127.0.0.1:7879/v1``). Returns False for anything it can't
-    confidently classify rather than raising."""
-    if not url:
-        return False
-    raw = url.strip()
-    if not raw:
-        return False
-    # urlparse only populates hostname/port when a scheme is present.
-    if "://" not in raw:
-        raw = "http://" + raw
-    try:
-        parsed = urlparse(raw)
-        host = (parsed.hostname or "").lower()
-        port = parsed.port
-    except ValueError:
-        # Malformed authority (e.g. a non-numeric port) — not classifiable.
-        return False
-    if host not in _LOOPBACK_HOSTS or port is None:
-        return False
-    return JMUNCH_PORT_BASE <= port < JMUNCH_PORT_BASE + JMUNCH_PORT_SPAN
+# Latched observation of a jmunch gateway seen on the wire. A mutable
+# holder (rather than rebound module scalars) so the latching helper needs
+# no `global`. Written from the LLM-call thread, read from the recall path
+# — guarded by `_lock`. The fields are monotonic latches, so the worst a
+# race could do is delay an observation by one turn.
+_lock = threading.Lock()
+_state: dict[str, Any] = {
+    "observed": False,    # an X-Jmunch-Gateway header has been seen
+    "version": None,      # parsed gateway version tuple, or None
+    "warned_old": False,  # whether the "upgrade jmunch" warning has fired
+}
 
 
-def detected_jmunch_endpoint() -> str | None:
-    """Return the first configured LLM base URL that looks like a local
-    jmunch gateway, or None when none do.
-
-    Checks the plugin's own extraction endpoint first, then the OpenAI- /
-    Anthropic-SDK base-URL env vars the host agent commonly sets — see
-    `_CANDIDATE_URL_ENV_VARS`."""
-    for var in _CANDIDATE_URL_ENV_VARS:
-        url = os.environ.get(var)
-        if is_jmunch_url(url):
-            return url
-    return None
+def jmunch_mode_configured() -> bool:
+    """True when the operator declared jmunch via `MEMORY_JMUNCH_MODE`.
+    This is the only signal available before the first LLM response."""
+    return environ.get(JMUNCH_MODE_ENV, "").strip().lower() in _TRUE_TOKENS
 
 
 def is_jmunch_in_use() -> bool:
-    """Best-effort: True when a configured LLM endpoint is a local jmunch
-    gateway. A jmunch extraction endpoint strongly implies the host agent
-    is on the same gateway. See the module docstring for the detection's
-    limits."""
-    return detected_jmunch_endpoint() is not None
+    """True when jmunch is known to be in the LLM path — declared via
+    `MEMORY_JMUNCH_MODE`, or confirmed by an `X-Jmunch-Gateway` response
+    header seen on an earlier call."""
+    if jmunch_mode_configured():
+        return True
+    with _lock:
+        return _state["observed"]
 
 
-def jmunch_request_headers(base_url: str | None) -> dict[str, str]:
-    """HTTP headers to attach to an LLM call when `base_url` points at a
-    jmunch gateway; an empty dict otherwise.
+def observed_jmunch_version() -> tuple[int, ...] | None:
+    """The jmunch gateway version parsed from an observed `X-Jmunch-Gateway`
+    header, or None when none has been seen (or it was unparseable)."""
+    with _lock:
+        return _state["version"]
 
-    Callers can splat the result unconditionally: an empty dict leaves the
-    request unchanged, so a non-jmunch call is byte-for-byte identical to
-    one made without this helper."""
-    return dict(JMUNCH_NO_INJECT_HEADER) if is_jmunch_url(base_url) else {}
+
+def jmunch_supports_passthrough() -> bool:
+    """True when the observed jmunch version honours `X-Jmunch-Handleify`
+    (>= 0.3.0). False when no version has been observed yet."""
+    version = observed_jmunch_version()
+    return version is not None and version >= _MIN_PASSTHROUGH_VERSION
+
+
+def jmunch_request_headers() -> dict[str, str]:
+    """Headers to attach to an LLM call when jmunch is in use: they tell
+    the gateway to pass the request through verbatim — no verb injection,
+    no handle-ification — so the memory extractor sees full-fidelity tool
+    content. An empty dict when jmunch is not in use, so callers can splat
+    the result unconditionally."""
+    return dict(_PASSTHROUGH_HEADERS) if is_jmunch_in_use() else {}
+
+
+def record_response_headers(headers: Any) -> None:
+    """Inspect an LLM response's headers for `X-Jmunch-Gateway` and latch
+    the observation. Call it after every LLM call with any headers mapping
+    (a dict or an httpx.Headers); a no-op when the header is absent, so it
+    is safe and transparent on non-jmunch endpoints."""
+    raw = _lookup_header(headers, _GATEWAY_HEADER)
+    if raw is None:
+        return
+    version = _parse_version(str(raw))
+    old_version_str: str | None = None
+    with _lock:
+        _state["observed"] = True
+        if version is not None:
+            _state["version"] = version
+            if version < _MIN_PASSTHROUGH_VERSION and not _state["warned_old"]:
+                _state["warned_old"] = True
+                old_version_str = ".".join(str(p) for p in version)
+    if old_version_str is not None:
+        logger.warning(
+            "hermes-memory: jmunch gateway %s is older than 0.3.0 and "
+            "ignores X-Jmunch-Handleify — memory-extraction calls will be "
+            "handle-ified. Upgrade jmunch for full-fidelity extraction.",
+            old_version_str,
+        )
+
+
+def _lookup_header(headers: Any, name: str) -> Any:
+    """Case-insensitive header lookup over a dict- or httpx.Headers-like
+    mapping. Returns None when not found or `headers` is not a mapping."""
+    if headers is None:
+        return None
+    try:
+        items = list(headers.items())
+    except (AttributeError, TypeError):
+        return None
+    lname = name.lower()
+    for key, value in items:
+        if str(key).lower() == lname:
+            return value
+    return None
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    """Parse a dotted version (e.g. ``0.3.0`` or ``0.3.0-rc1``) into a
+    tuple of ints. Returns None when nothing numeric can be read."""
+    nums: list[int] = []
+    for part in text.strip().split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        nums.append(int(digits))
+    return tuple(nums) if nums else None

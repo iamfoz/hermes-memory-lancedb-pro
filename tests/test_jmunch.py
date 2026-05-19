@@ -1,4 +1,4 @@
-"""Tests for jmunch proxy detection."""
+"""Tests for jmunch gateway detection."""
 
 from __future__ import annotations
 
@@ -6,116 +6,121 @@ import pytest
 
 from hermes_memory_lancedb_pro import jmunch
 from hermes_memory_lancedb_pro.jmunch import (
-    detected_jmunch_endpoint,
+    JMUNCH_MODE_ENV,
     is_jmunch_in_use,
-    is_jmunch_url,
+    jmunch_mode_configured,
     jmunch_request_headers,
-)
-
-_URL_ENV_VARS = (
-    "MEMORY_EXTRACTION_BASE_URL",
-    "OPENAI_BASE_URL",
-    "OPENAI_API_BASE",
+    jmunch_supports_passthrough,
+    observed_jmunch_version,
+    record_response_headers,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_url_env(monkeypatch):
-    """Every test starts with no LLM base-URL env vars set."""
-    for var in _URL_ENV_VARS:
-        monkeypatch.delenv(var, raising=False)
-
-
-class TestIsJmunchUrl:
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "http://127.0.0.1:7879/v1",  # jmunch gateway default port
-            "http://127.0.0.1:7883/v1",  # the README example
-            "http://localhost:7888/v1",
-            "http://[::1]:7882/v1",
-            "127.0.0.1:7881",  # scheme is optional
-            "https://127.0.0.1:7890",
-            "http://127.0.0.1:7894/v1",  # top of the default range (base+span-1)
-        ],
+def _reset_jmunch_state(monkeypatch):
+    """Every test starts with no declaration and no observed gateway."""
+    monkeypatch.delenv(JMUNCH_MODE_ENV, raising=False)
+    monkeypatch.setattr(
+        jmunch,
+        "_state",
+        {"observed": False, "version": None, "warned_old": False},
     )
-    def test_detects_local_jmunch_ports(self, url):
-        assert is_jmunch_url(url) is True
-
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "https://api.openai.com/v1",
-            "https://api.anthropic.com",
-            "http://127.0.0.1:8080/v1",
-            "http://localhost:11434/v1",  # Ollama's default port
-            "http://127.0.0.1:1234/v1",  # LM Studio's default port
-            "http://127.0.0.1:7878/v1",  # the jmunch dashboard — not an LLM endpoint
-            "http://127.0.0.1:7895/v1",  # one past the range (base+span)
-            "http://192.168.1.5:7881/v1",  # jmunch port but not loopback
-            "http://127.0.0.1/v1",  # no port
-        ],
-    )
-    def test_rejects_non_jmunch_urls(self, url):
-        assert is_jmunch_url(url) is False
-
-    @pytest.mark.parametrize("url", [None, "", "   ", "not a url", "http://"])
-    def test_rejects_empty_and_malformed(self, url):
-        # Must classify, never raise.
-        assert is_jmunch_url(url) is False
-
-    def test_respects_configured_port_range(self, monkeypatch):
-        monkeypatch.setattr(jmunch, "JMUNCH_PORT_BASE", 9000)
-        monkeypatch.setattr(jmunch, "JMUNCH_PORT_SPAN", 4)
-        assert is_jmunch_url("http://127.0.0.1:9000/v1") is True
-        assert is_jmunch_url("http://127.0.0.1:9003/v1") is True
-        assert is_jmunch_url("http://127.0.0.1:9004/v1") is False
-        # The jmunch default range no longer matches.
-        assert is_jmunch_url("http://127.0.0.1:7879/v1") is False
 
 
-class TestDetectionFromEnv:
-    def test_none_when_no_env(self):
-        assert detected_jmunch_endpoint() is None
+class TestModeConfigured:
+    @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "on", " true "])
+    def test_truthy_values_enable(self, monkeypatch, value):
+        monkeypatch.setenv(JMUNCH_MODE_ENV, value)
+        assert jmunch_mode_configured() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "  "])
+    def test_falsy_values_disable(self, monkeypatch, value):
+        monkeypatch.setenv(JMUNCH_MODE_ENV, value)
+        assert jmunch_mode_configured() is False
+
+    def test_unset_is_disabled(self):
+        assert jmunch_mode_configured() is False
+
+
+class TestIsJmunchInUse:
+    def test_false_by_default(self):
         assert is_jmunch_in_use() is False
 
-    def test_detects_extraction_base_url(self, monkeypatch):
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7881/v1")
-        assert detected_jmunch_endpoint() == "http://127.0.0.1:7881/v1"
+    def test_true_when_declared(self, monkeypatch):
+        monkeypatch.setenv(JMUNCH_MODE_ENV, "true")
         assert is_jmunch_in_use() is True
 
-    def test_detects_openai_base_url_fallback(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:7884/v1")
-        assert detected_jmunch_endpoint() == "http://localhost:7884/v1"
+    def test_true_when_observed(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
         assert is_jmunch_in_use() is True
 
-    def test_extraction_var_takes_precedence(self, monkeypatch):
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "http://127.0.0.1:7882/v1")
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:7885/v1")
-        assert detected_jmunch_endpoint() == "http://127.0.0.1:7882/v1"
 
-    def test_cloud_endpoint_is_not_jmunch(self, monkeypatch):
-        monkeypatch.setenv("MEMORY_EXTRACTION_BASE_URL", "https://api.openai.com/v1")
-        assert detected_jmunch_endpoint() is None
+class TestRecordResponseHeaders:
+    def test_latches_on_gateway_header(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        assert is_jmunch_in_use() is True
+        assert observed_jmunch_version() == (0, 3, 0)
+
+    def test_case_insensitive_header_name(self):
+        record_response_headers({"x-jmunch-gateway": "0.3.1"})
+        assert observed_jmunch_version() == (0, 3, 1)
+
+    def test_noop_when_header_absent(self):
+        record_response_headers({"content-type": "application/json"})
         assert is_jmunch_in_use() is False
+        assert observed_jmunch_version() is None
+
+    @pytest.mark.parametrize("headers", [None, "not a mapping", 42])
+    def test_safe_on_non_mapping(self, headers):
+        record_response_headers(headers)  # must not raise
+        assert is_jmunch_in_use() is False
+
+    def test_observation_latches_permanently(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        # A later non-jmunch response must not un-latch the observation.
+        record_response_headers({"content-type": "application/json"})
+        assert is_jmunch_in_use() is True
+
+    def test_prerelease_version_parsed(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.3.0-rc1"})
+        assert observed_jmunch_version() == (0, 3, 0)
+
+    def test_unparseable_version_still_detects(self):
+        record_response_headers({"X-Jmunch-Gateway": "weird"})
+        assert is_jmunch_in_use() is True
+        assert observed_jmunch_version() is None
+
+
+class TestSupportsPassthrough:
+    def test_false_when_nothing_observed(self):
+        assert jmunch_supports_passthrough() is False
+
+    def test_true_for_0_3_0(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        assert jmunch_supports_passthrough() is True
+
+    def test_true_for_newer(self):
+        record_response_headers({"X-Jmunch-Gateway": "1.2.0"})
+        assert jmunch_supports_passthrough() is True
+
+    def test_false_for_older_but_still_detected(self):
+        record_response_headers({"X-Jmunch-Gateway": "0.2.1"})
+        assert jmunch_supports_passthrough() is False
+        assert is_jmunch_in_use() is True
 
 
 class TestRequestHeaders:
-    def test_no_inject_header_for_jmunch_url(self):
-        assert jmunch_request_headers("http://127.0.0.1:7879/v1") == {
-            "X-Jmunch-Inject": "false"
-        }
+    _EXPECTED = {"X-Jmunch-Inject": "false", "X-Jmunch-Handleify": "false"}
 
-    def test_empty_for_non_jmunch_url(self):
-        assert jmunch_request_headers("https://api.openai.com/v1") == {}
+    def test_passthrough_headers_when_in_use(self, monkeypatch):
+        monkeypatch.setenv(JMUNCH_MODE_ENV, "true")
+        assert jmunch_request_headers() == self._EXPECTED
 
-    def test_empty_for_none(self):
-        assert jmunch_request_headers(None) == {}
+    def test_empty_when_not_in_use(self):
+        assert jmunch_request_headers() == {}
 
-    def test_returns_fresh_dict_each_call(self):
-        # Callers must be free to mutate the result; mutating one call's
-        # dict must not leak into the next or into the module constant.
-        first = jmunch_request_headers("http://127.0.0.1:7879/v1")
+    def test_returns_fresh_dict_each_call(self, monkeypatch):
+        monkeypatch.setenv(JMUNCH_MODE_ENV, "true")
+        first = jmunch_request_headers()
         first["X-Other"] = "1"
-        second = jmunch_request_headers("http://127.0.0.1:7879/v1")
-        assert second == {"X-Jmunch-Inject": "false"}
+        assert jmunch_request_headers() == self._EXPECTED

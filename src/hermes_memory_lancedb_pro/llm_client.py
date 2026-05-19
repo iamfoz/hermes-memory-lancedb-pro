@@ -20,7 +20,7 @@ import os
 import re
 from typing import Any, Protocol
 
-from .jmunch import jmunch_request_headers
+from .jmunch import jmunch_request_headers, record_response_headers
 
 logger = logging.getLogger(__name__)
 
@@ -254,15 +254,10 @@ class OpenAICompatibleLlmClient:
                 "Install it with: pip install openai"
             ) from exc
 
-        # When `base_url` is a jmunch gateway, tell it not to inject its
-        # drill-in verb tools into our calls — the extractor wants a plain
-        # JSON completion. `jmunch_request_headers` returns {} for any
-        # non-jmunch endpoint, so this is a no-op off jmunch.
         self._client = _openai.OpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            default_headers=jmunch_request_headers(base_url) or None,
         )
         self.model = model
         self.base_url = base_url
@@ -278,7 +273,11 @@ class OpenAICompatibleLlmClient:
         effective_label = label or "generic"
         self._last_error = None
         try:
-            response = self._client.chat.completions.create(
+            # `with_raw_response` keeps the HTTP response so we can read
+            # jmunch's `X-Jmunch-Gateway` header off it. `extra_headers`
+            # asks a jmunch gateway to pass this call through verbatim;
+            # it is empty (a no-op) when jmunch is not in use.
+            raw_response = self._client.chat.completions.with_raw_response.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
@@ -286,9 +285,15 @@ class OpenAICompatibleLlmClient:
                 ],
                 temperature=0.1,
                 max_tokens=4096,
+                extra_headers=jmunch_request_headers() or None,
             )
+            record_response_headers(raw_response.headers)
+            response = raw_response.parse()
             raw = response.choices[0].message.content
         except Exception as exc:  # noqa: BLE001
+            record_response_headers(
+                getattr(getattr(exc, "response", None), "headers", None)
+            )
             self._last_error = (
                 f"hermes-memory-lancedb-pro: llm-client [{effective_label}] "
                 f"request failed for model {self.model}: {exc}"
@@ -340,16 +345,7 @@ class AnthropicLlmClient:
                 "Install it with: pip install anthropic"
             ) from exc
 
-        # The anthropic SDK reads ANTHROPIC_BASE_URL from the environment
-        # itself; mirror that here so a jmunch gateway configured on that
-        # var also gets the no-inject header. No-op off jmunch.
-        self._client = _anthropic.Anthropic(
-            api_key=api_key,
-            default_headers=jmunch_request_headers(
-                os.environ.get("ANTHROPIC_BASE_URL")
-            )
-            or None,
-        )
+        self._client = _anthropic.Anthropic(api_key=api_key)
         self.model = model
         self._max_tokens = max_tokens
         self._last_error: str | None = None
@@ -364,15 +360,24 @@ class AnthropicLlmClient:
         effective_label = label or "generic"
         self._last_error = None
         try:
-            response = self._client.messages.create(
+            # See OpenAICompatibleLlmClient.complete_json — `with_raw_response`
+            # exposes jmunch's `X-Jmunch-Gateway` header; `extra_headers`
+            # requests gateway pass-through and is a no-op off jmunch.
+            raw_response = self._client.messages.with_raw_response.create(
                 model=self.model,
                 max_tokens=self._max_tokens,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
+                extra_headers=jmunch_request_headers() or None,
             )
+            record_response_headers(raw_response.headers)
+            response = raw_response.parse()
             raw = response.content[0].text
         except Exception as exc:  # noqa: BLE001
+            record_response_headers(
+                getattr(getattr(exc, "response", None), "headers", None)
+            )
             self._last_error = (
                 f"hermes-memory-lancedb-pro: llm-client [{effective_label}] "
                 f"request failed for model {self.model}: {exc}"
