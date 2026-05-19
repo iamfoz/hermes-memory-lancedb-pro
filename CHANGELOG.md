@@ -37,6 +37,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only when jmunch is detected — off jmunch the standard
   `MEMORY_PREFETCH_LIMIT` / `min_score` are untouched — and an
   explicitly-passed `min_score` is never overridden.
+- In jmunch mode the admission gate defaults to the `high-recall` preset
+  (when `MEMORY_ADMISSION_PRESET` is not explicitly set), so fewer
+  task-relevant candidates — notably progress `events` — are rejected
+  before they reach the store. This is the capture half of the jmunch-mode
+  compensation; the widened recall above is the surfacing half. An
+  explicitly-set preset, including `off`, is always respected.
 
 ---
 
