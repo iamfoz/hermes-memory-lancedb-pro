@@ -27,6 +27,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   derail a tool-capable model into calling a jmunch verb instead. The
   header is added only when the client's own base URL is a jmunch gateway;
   every non-jmunch call is byte-for-byte unchanged.
+- In jmunch mode the provider widens memory recall — a higher prefetch
+  limit (`MEMORY_JMUNCH_PREFETCH_LIMIT`, default 12) and a permissive
+  `min_score` (`MEMORY_JMUNCH_MIN_RECALL_SCORE`, default 0.0). A jmunch
+  gateway lossily compresses the agent's conversation history by
+  handle-ifying tool results, so the agent loses task detail mid-run; the
+  memory block this plugin injects is not handle-ified, so widening recall
+  pushes more task context back through that lossless channel. Applies
+  only when jmunch is detected — off jmunch the standard
+  `MEMORY_PREFETCH_LIMIT` / `min_score` are untouched — and an
+  explicitly-passed `min_score` is never overridden.
 
 ---
 

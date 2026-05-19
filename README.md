@@ -657,6 +657,8 @@ Environment variables (all optional):
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300`                            | Min seconds between access_count increments for the same memory  |
 | `MEMORY_MIN_RECALL_SCORE`      | `0.0`                              | Default `min_score` for `MemoryRetriever.retrieve()` (0 = permissive) |
 | `MEMORY_PREFETCH_LIMIT`        | `5`                                | Default recall size when used via the hermes-agent adapter        |
+| `MEMORY_JMUNCH_PREFETCH_LIMIT` | `12`                               | Recall size used *instead of* `MEMORY_PREFETCH_LIMIT` when a jmunch gateway is detected on the LLM endpoint. jmunch lossily compresses the agent's history, so recall is widened to re-surface task context. |
+| `MEMORY_JMUNCH_MIN_RECALL_SCORE` | `0.0`                            | `min_score` used when a jmunch gateway is detected (0 = permissive). An explicitly-passed `min_score` is never overridden. |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3`                            | A memory recalled across this many distinct session_ids gets auto-promoted to `cross_session=True` |
 | `MEMORY_INJECTION_GUARD`       | `warn`                             | Prompt-injection guard mode at write time: `off` / `warn` / `reject` / `sanitize` |
 | `MEMORY_AUTO_PURGE_COOLDOWN_HOURS` | `24`                           | Hours between automatic `purge_archived` runs at session end. Set `0` to disable auto-purge (call `purge_archived()` manually or via `hermes-memory doctor`). |
