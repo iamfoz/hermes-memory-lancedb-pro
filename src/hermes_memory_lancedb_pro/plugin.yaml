@@ -1,5 +1,5 @@
 name: lancedb_pro
-version: 0.11.43
+version: 0.12.0
 kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
 # `before_prompt_build` is intentionally NOT implemented: overriding it makes
