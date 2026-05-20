@@ -7,6 +7,191 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.14] — 2026-05-20
+
+### Added
+- **`init` command in `register_cli`** — `hermes lancedb_pro init` was missing from
+  the plugin CLI namespace despite being available in the standalone CLI. Added
+  `p_init` subparser block and `"init": _cmd_init` to `_dispatch_plugin_cli`.
+- **Confirmation gate for `init` and `reset`** — both commands now prompt
+  `Type "yes" to proceed:` before making any changes to the database. Pass `-y` /
+  `--yes` to skip the prompt for scripted or automated use. The `--yes` flag is
+  added to the parsers in both `register_cli` (plugin CLI) and `main()` (standalone
+  CLI).
+
+### Tests
+- `test_register_cli_uses_own_subparsers_group` extended to include `"init"` in
+  the commands-parse check.
+
+---
+
+## [0.11.13] — 2026-05-20
+
+### Fixed
+- **`register_cli` rewritten to match hermes memory plugin spec exactly** — the
+  0.11.12 implementation incorrectly tried to inject commands into the *existing*
+  `hermes memory` subparsers group by scanning `parser._actions`. The spec says
+  hermes-agent passes a **fresh** ArgumentParser for the provider's own namespace
+  (`hermes lancedb_pro`) and `register_cli` should call `add_subparsers()` on it
+  directly. Commands now appear at `hermes lancedb_pro doctor|export|import|reset`.
+  The top-level `subparser.set_defaults(func=_dispatch_plugin_cli)` pattern from
+  the spec is restored.
+- **`reset` renamed back from `lancedb-reset`** — "lancedb-reset" was needed to
+  avoid collision with `hermes memory reset`. In the provider's own namespace
+  (`hermes lancedb_pro`), there is no such collision, so the simpler name is correct.
+- **`PLUGIN_CLI_CONTENT` shim** comment corrected to `hermes lancedb_pro`.
+
+### Tests
+- `TestRegisterCli` refreshed: removed the two tests that verified the incorrect
+  injection behaviour; replaced with `test_register_cli_uses_own_subparsers_group`
+  (commands parse under `lancedb_pro_command` dest), `test_register_cli_top_level_func_for_dispatch`
+  (spec pattern: func on parent parser), and `test_register_cli_reset_is_reset_not_lancedb_reset`.
+
+---
+
+## [0.11.12] — 2026-05-20
+
+### Fixed
+- **`register_cli` now injects into the existing subparsers group** — the previous
+  implementation called `parser.add_subparsers()` on the parser hermes-agent passes,
+  creating a *second* nested subparsers group. Argparse only dispatches through the
+  first group, so `hermes memory doctor` resolved as an invalid choice instead of
+  routing to the plugin. Fixed: `register_cli` now iterates `parser._actions` to find
+  the pre-existing `_SubParsersAction` (the one that already holds setup/status/off/reset)
+  and calls `add_parser()` on it directly, so our commands appear at the same level.
+- **`lancedb-reset` instead of `reset`** — the plugin was registering a `reset` command
+  that collided with hermes-agent's built-in `hermes memory reset`. Renamed to
+  `lancedb-reset` to avoid the conflict.
+- **Each subparser sets its own `func` default** — commands now set
+  `p_xxx.set_defaults(func=_cmd_xxx)` so hermes-agent's standard `args.func(args)`
+  dispatch pattern routes directly without going through an intermediate
+  `_dispatch_plugin_cli` wrapper.
+- **`PLUGIN_CLI_CONTENT` shim comment** corrected from `hermes lancedb-pro` to
+  `hermes memory`.
+
+### Tests
+- `TestRegisterCli` extended with 3 new cases: commands extend an existing subparsers
+  group (the real hermes-agent scenario), every command has a callable `args.func`
+  default, and `lancedb-reset` is registered without overwriting the built-in `reset`.
+
+---
+
+## [0.11.11] — 2026-05-20
+
+### Fixed
+- **Plugin path corrected everywhere** — `memory_init.sh` and its embedded Python
+  fallback both used the stale pre-0.11.1 path `~/.hermes/plugins/lancedb_pro`.
+  Corrected to `~/.hermes/hermes-agent/plugins/memory/lancedb_pro` matching what
+  `install-plugin` actually creates. `register()` docstring in `provider.py` updated.
+- **`compute_decay_score` falls back to top-level `timestamp`** — entries written
+  without `metadata.created_at` (e.g. by external tooling) silently defaulted to
+  `now_ms` for recency, making them look brand-new regardless of age. Fixed: when
+  `metadata.created_at` is absent, the top-level LanceDB `timestamp` column is used
+  instead. `metadata.created_at` still takes priority when present.
+- **Temporal classifier recognises `current` (adjective)** — "Current stock price",
+  "my current address" were classified as static because the pattern only matched
+  `\bcurrently\b`. Broadened to `\bcurrent(?:ly)?\b`.
+- **Greeting detector handles "Hi there" / "Hello there"** — the GREETING_PATTERNS
+  regex required the string to end immediately after the greeting word. "Hi there"
+  fell through to `short_statement` (0.4) instead of `greeting` (0.1). Added
+  optional `(\s+there)?` group.
+
+### Added
+- **`init`, `reset`, `doctor`, `export`, `import` subcommands in the standalone CLI** —
+  `hermes-memory-lancedb-pro` now exposes all admin commands directly:
+  - `init` — open/create the memory store and optionally seed from MEMORY.md
+  - `reset` — wipe the DB directory and re-run init
+  - `doctor` — diagnostic report (previously only via `hermes lancedb-pro doctor`)
+  - `export` — JSONL export
+  - `import` — JSONL import
+  The shell scripts `memory_init.sh` / `memory_reset.sh` remain for environments
+  without the package installed, but the Python implementations are now canonical.
+
+### Tests
+- `TestCreatedAtFallback` (2 tests): ancient top-level timestamp produces low recency;
+  `metadata.created_at` takes priority over top-level timestamp.
+- `TestCurrentPattern` (3 tests): "current" adjective, "currently", compound phrase.
+- `TestGreetingHiThere` (3 tests): "Hi there", "Hello there!", "Hi" alone.
+
+---
+
+## [0.11.10] — 2026-05-20
+
+### Added
+- **`freshness_trend` in recall block** — `_format_recall` now appends a `[forming]` /
+  `[strengthening]` / `[weakening]` tag to each recalled memory when the evidence-weighted
+  trend is not "stable".  The agent sees at a glance which memories are contested or newly
+  forming and can weight them accordingly.
+- **`entities` typed field in `SmartMemoryMetadata`** — LLM-extracted entity names are now
+  a first-class field (`entities: list[str]`) rather than landing in the opaque `extras`
+  blob.  `parse_smart_metadata` validates and strips non-strings; `stringify_smart_metadata`
+  emits the field when non-empty; `build_smart_metadata` unions base + patch entities so
+  previously tagged names survive subsequent updates.
+- **Entity-overlap boost in retriever** — `MemoryRetriever.retrieve` now calls
+  `_apply_entity_boost` (step 2.5) immediately after vector-dominant fusion.  Any fused
+  result whose stored entity list contains a term that appears verbatim in the query
+  receives a multiplicative score boost (×1.2 per match, capped at ×1.6 for 3+ matches)
+  before the scoring pipeline applies decay weights.  Solves the case where an entity name
+  lives only in metadata rather than in the memory text.
+
+### Tests
+- `TestEntitiesTypedField` (9 tests): parse, extras isolation, filter non-strings, stringify
+  emit/omit, build union merge, base-preserve, roundtrip.
+- `TestFormatRecallFreshnessTrend` (5 tests): weakening/forming/strengthening present,
+  stable omitted, no-decay no tag.
+- `TestEntityOverlapBoost` (8 tests): single match boosts, no-match unchanged, missing
+  entities key unchanged, multi > single, 3-match cap, case-insensitive, `_entity_matches`
+  field set, empty list.
+
+---
+
+## [0.11.9] — 2026-05-20
+
+### Added / Changed — prompted by Hindsight (vectorize.io) best-practices review
+
+**Extraction context field** (`extraction_prompts.py`, `smart_extractor.py`):
+`build_extraction_prompt` now accepts a `context` parameter — a short
+description of the content source (e.g. "Hermes agent turn, session=s-123,
+scope=agent"). Injected as `## Content Context` into the extraction prompt.
+Hindsight research identifies this as the single highest-impact extraction
+quality lever. `sync_turn` constructs and passes this context automatically.
+
+**Structured conversation JSON** (`smart_extractor._format_conversation`):
+Turn content is now passed to the extraction LLM as a JSON conversation array
+with explicit `role` and `timestamp` fields rather than a flat string.
+Preserves entity relationships, causal context, and temporal markers that the
+flat format loses (e.g. "moved away from Redux *last quarter*" stays bound to
+the migration fact rather than fragmenting).
+
+**Named entity extraction** (`extraction_prompts.py`, `smart_extractor.py`):
+The extraction prompt now requests an `entities` list (proper nouns: people,
+projects, tools, organisations) alongside each memory. Parsed and stored in
+`metadata.entities` for future graph-traversal retrieval. A narrative-unit
+rule is also added: "keep causally interdependent facts as a single memory
+rather than splitting them".
+
+**Evidence-weighted confidence + freshness trend** (`decay.py`):
+`compute_decay_score` now reads `metadata.support_info.global_strength`
+(ratio of confirmations to total observations) and blends it into the
+effective confidence used for the intrinsic score component. Requires ≥ 3
+observations to avoid penalising newly-created memories. Formula:
+`confidence × (0.4 + 0.6 × global_strength)` — a fully contradicted memory
+(strength=0) is scored at 40% of its write-time confidence; a fully confirmed
+one (strength=1) is unchanged. The score dict now also includes
+`freshness_trend` ("forming" / "strengthening" / "stable" / "weakening").
+Fixed a latent bug: `0.0 or 0.5` was silently coercing a zero global_strength
+to 0.5, defeating the penalty.
+
+**Temporal query intent post-filter** (`provider.py`):
+`_do_recall` now detects temporal language in the query ("yesterday",
+"last week", "this morning", "recently", named months, …) via
+`_parse_temporal_intent` and post-filters relevance results to memories whose
+`timestamp` falls in the corresponding window. Session anchors (task-framing)
+bypass the filter so they are always present. When the filter would produce an
+empty result set it falls back to the unfiltered list.
+
+---
+
 ## [0.11.8] — 2026-05-20
 
 ### Fixed

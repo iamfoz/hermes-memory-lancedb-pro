@@ -96,8 +96,9 @@ ignore = [
 # read more cleanly with explicit early returns than nested gates.
 "src/hermes_memory_lancedb_pro/llm_client.py" = ["PLR0911", "PLR0912"]
 # smart_metadata's defaults / context-normalisation switch on many enum
-# values — flat returns are clearer than match/case here.
-"src/hermes_memory_lancedb_pro/smart_metadata.py" = ["PLR0911"]
+# values — flat returns are clearer than match/case here. stringify has many
+# optional field branches that are cleaner as sequential if-guards.
+"src/hermes_memory_lancedb_pro/smart_metadata.py" = ["PLR0911", "PLR0912"]
 # score_text is a flat lookup over many score buckets — collapsing the
 # returns into a single expression hurts readability.
 "src/hermes_memory_lancedb_pro/session_compressor.py" = ["PLR0911", "PLR1714"]
@@ -105,3 +106,6 @@ ignore = [
 # google-auth is an optional reranker dep imported lazily inside the
 # auth-token method so the rest of the module loads without it.
 "src/hermes_memory_lancedb_pro/retriever.py" = ["PLR0911", "PLR0912", "PLR0915", "PLC0415"]
+# compute_decay_score grew by the support_info blending + created_at fallback
+# blocks but the linear flow is easier to read than helpers extracted for lint.
+"src/hermes_memory_lancedb_pro/decay.py" = ["PLR0912", "PLR0915"]

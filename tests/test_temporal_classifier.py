@@ -244,3 +244,18 @@ def test_zh_day_after_tomorrow_beats_tomorrow_rule() -> None:
     result = infer_expiry("后天明天", now_ms=NOW_MS)
     # 后天 appears first in rules (48h), so that should win
     assert result == NOW_MS + 48 * _MS_PER_HOUR
+
+
+# ---------------------------------------------------------------------------
+# TestCurrentPattern
+# ---------------------------------------------------------------------------
+
+class TestCurrentPattern:
+    def test_current_adjective_classified_dynamic(self):
+        assert classify_temporal("Current stock price is $150") == "dynamic"
+
+    def test_currently_classified_dynamic(self):
+        assert classify_temporal("I am currently working on this") == "dynamic"
+
+    def test_current_in_compound_classified_dynamic(self):
+        assert classify_temporal("My current address is 42 Main St") == "dynamic"

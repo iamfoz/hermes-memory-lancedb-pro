@@ -16,6 +16,7 @@ Entry point — see `SmartExtractor.extract_and_persist(...)`."""
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import re
@@ -313,6 +314,7 @@ class SmartExtractor:
         scope_filter: list[str] | None = None,
         user_content: str = "",
         assistant_content: str = "",
+        context: str = "",
     ) -> ExtractionStats:
         """Extract memories from a conversation and persist them.
 
@@ -322,6 +324,12 @@ class SmartExtractor:
         - When the extractor has an LLM: build `conversation_text` from
           `user_content` / `assistant_content` if not supplied, then run
           the full LLM pipeline.
+
+        Args:
+            context: Short description of the content source and nature
+                (e.g. "Agent conversation turn, session s-123, scope=agent").
+                High-impact on extraction quality — pass it when available.
+
         Returns an `ExtractionStats` describing what happened."""
         target_scope = scope or self.config.default_scope
         effective_filter = scope_filter if scope_filter is not None else [target_scope]
@@ -359,6 +367,7 @@ class SmartExtractor:
             session_key=session_key,
             target_scope=target_scope,
             scope_filter=effective_filter,
+            context=context,
         )
 
     # -- legacy fallback -------------------------------------------------------
@@ -411,12 +420,21 @@ class SmartExtractor:
 
     @staticmethod
     def _format_conversation(user_content: str, assistant_content: str) -> str:
-        parts = []
+        """Format a turn as a structured JSON conversation array.
+
+        Structured JSON preserves roles, turn order, and temporal markers so
+        the extraction LLM can see entity relationships and causal context that
+        a flat pre-joined string loses (e.g. "moved away from Redux last
+        quarter" → the temporal marker stays attached to the right fact)."""
+        ts = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        turns: list[dict[str, str]] = []
         if user_content and user_content.strip():
-            parts.append(f"User: {user_content.strip()}")
+            turns.append({"role": "user", "content": user_content.strip(), "timestamp": ts})
         if assistant_content and assistant_content.strip():
-            parts.append(f"Assistant: {assistant_content.strip()}")
-        return "\n\n".join(parts)
+            turns.append({"role": "assistant", "content": assistant_content.strip()})
+        if not turns:
+            return ""
+        return json.dumps(turns, ensure_ascii=False)
 
     # -- LLM pipeline ----------------------------------------------------------
 
@@ -427,9 +445,10 @@ class SmartExtractor:
         session_key: str,
         target_scope: str,
         scope_filter: list[str],
+        context: str = "",
     ) -> ExtractionStats:
         stats = ExtractionStats()
-        candidates = self._extract_candidates(conversation_text)
+        candidates = self._extract_candidates(conversation_text, context=context)
         if not candidates:
             logger.debug("smart-extractor: no candidates extracted")
             return stats
@@ -516,7 +535,9 @@ class SmartExtractor:
 
     # -- step 1: LLM extraction ------------------------------------------------
 
-    def _extract_candidates(self, conversation_text: str) -> list[CandidateMemory]:
+    def _extract_candidates(
+        self, conversation_text: str, *, context: str = ""
+    ) -> list[CandidateMemory]:
         max_chars = self.config.extract_max_chars
         truncated = (
             conversation_text[-max_chars:]
@@ -525,7 +546,7 @@ class SmartExtractor:
         )
         cleaned = strip_envelope_metadata(truncated)
 
-        prompt = build_extraction_prompt(cleaned, self.config.user)
+        prompt = build_extraction_prompt(cleaned, self.config.user, context=context)
         result = self._llm_complete_json_with_retry(
             prompt, label="extract-candidates",
         )
@@ -550,11 +571,22 @@ class SmartExtractor:
                 continue
             if is_noise(abstract):
                 continue
+            # Parse named entities extracted by the LLM for this memory
+            raw_entities = raw.get("entities")
+            entities: list[str] = (
+                [str(e).strip() for e in raw_entities if str(e).strip()]
+                if isinstance(raw_entities, list)
+                else []
+            )
+            meta: dict[str, Any] = {}
+            if entities:
+                meta["entities"] = entities
             out.append(CandidateMemory(
                 category=category,
                 abstract=abstract,
                 overview=overview,
                 content=content,
+                metadata_extra=meta,
             ))
         return out
 

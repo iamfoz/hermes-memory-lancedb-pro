@@ -376,3 +376,54 @@ class TestRegisterCli:
         with pytest.raises(SystemExit) as exc_info:
             parser.parse_args(["export", "--help"])
         assert exc_info.value.code == 0
+
+    def test_register_cli_uses_own_subparsers_group(self):
+        """register_cli must call add_subparsers on the fresh parser it receives.
+
+        Per the hermes memory plugin spec, hermes-agent passes a FRESH
+        ArgumentParser for the provider's own namespace.  Commands appear as
+        'hermes lancedb_pro <subcommand>', NOT inside 'hermes memory'.
+        """
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        register_cli(parser)
+
+        # All five commands parse correctly in the provider's own namespace
+        for cmd in ("init", "doctor", "export", "import", "reset"):
+            args = parser.parse_args([cmd])
+            assert getattr(args, "lancedb_pro_command", None) == cmd, (
+                f"'{cmd}' should be a valid lancedb_pro_command"
+            )
+
+    def test_register_cli_top_level_func_for_dispatch(self):
+        """register_cli must set func on the top-level parser for args.func(args) dispatch.
+
+        The spec pattern is: subparser.set_defaults(func=dispatcher)
+        A single dispatcher reads args.lancedb_pro_command to route.
+        """
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        register_cli(parser)
+
+        # Top-level func must be callable even before a subcommand is specified
+        args = parser.parse_args([])
+        assert callable(getattr(args, "func", None)), (
+            "register_cli must call subparser.set_defaults(func=...) on the parent parser"
+        )
+
+    def test_register_cli_reset_is_reset_not_lancedb_reset(self):
+        """DB-reset command is 'reset' (not 'lancedb-reset') in the provider's own namespace.
+
+        There is no collision: 'hermes lancedb_pro reset' and 'hermes memory reset'
+        are separate namespaces.  The lancedb-reset workaround is not needed.
+        """
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        register_cli(parser)
+
+        args = parser.parse_args(["reset"])
+        assert args.lancedb_pro_command == "reset"
+        assert callable(getattr(args, "func", None))

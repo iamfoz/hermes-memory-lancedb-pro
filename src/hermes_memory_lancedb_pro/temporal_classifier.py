@@ -27,7 +27,7 @@ _DYNAMIC_PATTERNS_EN: list[re.Pattern[str]] = [
     re.compile(r"\byesterday\b", re.IGNORECASE),
     re.compile(r"\btomorrow\b", re.IGNORECASE),
     re.compile(r"\brecently\b", re.IGNORECASE),
-    re.compile(r"\bcurrently\b", re.IGNORECASE),
+    re.compile(r"\bcurrent(?:ly)?\b", re.IGNORECASE),
     re.compile(r"\bright now\b", re.IGNORECASE),
     re.compile(r"\bthis week\b", re.IGNORECASE),
     re.compile(r"\bthis month\b", re.IGNORECASE),
