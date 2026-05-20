@@ -1,14 +1,15 @@
 """Durable task-state management for long-running agent tasks.
 
-Task state lives outside the LLM context window, in
-``~/.hermes/workspace/tasks/<task_id>/``.  The runner re-reads ``state.json``
-at the start of every iteration and updates it atomically after each step so
-context compaction, model resets, and session restarts cannot silently lose
-task progress.
+Task state lives outside the LLM context window, under ``<task root>/<task_id>/``
+where the task root is profile-isolated (see ``_resolve_task_root``): it follows
+``HERMES_HOME`` when set, falling back to ``~/.hermes``.  The runner re-reads
+``state.json`` at the start of every iteration and updates it atomically after
+each step so context compaction, model resets, and session restarts cannot
+silently lose task progress.
 
 Layout::
 
-    ~/.hermes/workspace/tasks/<task_id>/
+    <task root>/<task_id>/         # <task root> = $HERMES_HOME/workspace/tasks
         state.json      — objective, status, iteration counter, next_action
         results.jsonl   — per-iteration pass/fail log
         events.jsonl    — reset detections, retries, blockers
@@ -38,13 +39,29 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Task root directory
 # ---------------------------------------------------------------------------
+# Resolution order, highest priority first:
+#   1. HERMES_TASK_ROOT  — explicit override of the task ledger location.
+#   2. HERMES_HOME       — the per-profile home hermes-agent exports for each
+#                          `hermes -p <name>` profile. Anchoring under it keeps
+#                          each profile's task ledger isolated, matching the
+#                          profile isolation the rest of the plugin already
+#                          honours via the `hermes_home` initialize() kwarg.
+#   3. ~/.hermes         — legacy single-profile default.
+# The env vars are read at import time; a profile sets them before launch, and
+# a `task` CLI subprocess spawned by the agent inherits them.
 
-_TASK_ROOT_ENV = os.environ.get("HERMES_TASK_ROOT", "").strip()
-TASK_ROOT: Path = (
-    Path(_TASK_ROOT_ENV).expanduser()
-    if _TASK_ROOT_ENV
-    else Path.home() / ".hermes" / "workspace" / "tasks"
-)
+
+def _resolve_task_root() -> Path:
+    task_root_env = os.environ.get("HERMES_TASK_ROOT", "").strip()
+    if task_root_env:
+        return Path(task_root_env).expanduser()
+    hermes_home_env = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home_env:
+        return Path(hermes_home_env).expanduser() / "workspace" / "tasks"
+    return Path.home() / ".hermes" / "workspace" / "tasks"
+
+
+TASK_ROOT: Path = _resolve_task_root()
 
 # ---------------------------------------------------------------------------
 # Defaults
