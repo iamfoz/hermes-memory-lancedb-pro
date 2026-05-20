@@ -403,3 +403,140 @@ class TestJmunchRecallTuning:
         )
         assert score == 0.5  # explicit caller value kept
         assert limit == provider._JMUNCH_PREFETCH_LIMIT  # limit still widened
+
+
+# ---------------------------------------------------------------------------
+# on_memory_write — edit / delete / replace_all
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestOnMemoryWriteEditDelete:
+    """on_memory_write edit and delete actions must mutate the LanceDB store."""
+
+    def _provider(self, provider_cls, store):
+        p = provider_cls(store=store, auto_smart_extraction=False)
+        p.initialize("sess-1")
+        return p
+
+    def test_add_stores_memory(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("add", "user", "The user loves cycling")
+        rows = real_store.list_memories(limit=50)
+        texts = [r["text"] for r in rows]
+        assert any("cycling" in t for t in texts)
+
+    def test_edit_supersedes_matching_memory(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("add", "user", "The user loves cycling")
+        p.on_memory_write("edit", "The user loves cycling", "The user loves running")
+        rows = real_store.list_memories(limit=50)
+        texts = [r["text"] for r in rows]
+        assert any("running" in t for t in texts)
+        assert not any(t == "The user loves cycling" for t in texts), (
+            "old text should be archived, not visible in list_memories"
+        )
+
+    def test_delete_archives_matching_memory(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("add", "agent", "Temporary task context")
+        p.on_memory_write("delete", "Temporary task context", "")
+        rows = real_store.list_memories(limit=50)
+        texts = [r["text"] for r in rows]
+        assert not any("Temporary task context" in t for t in texts)
+
+    def test_edit_replace_all_updates_multiple(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("add", "user", "coffee preference: black")
+        p.on_memory_write("add", "user", "coffee preference: no sugar")
+        p.on_memory_write(
+            "edit",
+            "coffee preference",
+            "coffee preference: oat milk",
+            metadata={"replace_all": True},
+        )
+        rows = real_store.list_memories(limit=50)
+        updated = [r for r in rows if "oat milk" in r["text"]]
+        assert len(updated) >= 2, "both entries should be superseded with the new text"
+
+    def test_unknown_action_is_ignored(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("replace", "target", "content")  # unknown — must not raise
+        assert real_store.list_memories(limit=50) == []
+
+    def test_edit_empty_query_is_noop(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("edit", "", "")  # must not raise
+        assert real_store.list_memories(limit=50) == []
+
+    def test_add_skips_replace_all_in_metadata(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        p.on_memory_write("add", "user", "test content", metadata={"replace_all": True})
+        rows = real_store.list_memories(limit=50)
+        assert len(rows) == 1
+        meta = rows[0].get("metadata", {})
+        assert "replace_all" not in meta, "replace_all must not be stored in row metadata"
+
+
+# ---------------------------------------------------------------------------
+# first_for_session / session anchor coverage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestSessionAnchors:
+    """first_for_session returns oldest memories; _do_recall includes them."""
+
+    def test_first_for_session_returns_oldest(self, real_store):
+        sess = "anchor-sess"
+        real_store.store(
+            text="Task framing from turn one",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        time.sleep(0.01)
+        real_store.store(
+            text="Detail from turn two",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        time.sleep(0.01)
+        real_store.store(
+            text="Detail from turn three",
+            category="other", scope="agent", importance=0.5,
+            metadata_extra={"source_session": sess},
+        )
+        first = real_store.first_for_session(sess, limit=1)
+        assert len(first) == 1
+        assert "turn one" in first[0]["text"]
+
+    def test_first_for_session_empty_when_no_session(self, real_store):
+        assert real_store.first_for_session("") == []
+
+    def test_recall_includes_task_framing_after_many_turns(
+        self, provider_cls, real_store
+    ):
+        """After several turns, recall must still surface the session-start
+        memory (task framing) via first_for_session anchors."""
+        p = provider_cls(store=real_store, auto_smart_extraction=False)
+        p.initialize("anchor-sess-2")
+        sess = "anchor-sess-2"
+
+        # Simulate 5 turns of conversation stored directly to bypass threading
+        texts = [
+            "Stress-test my memory — this is the task framing",
+            "Turn two payload ABC",
+            "Turn three payload DEF",
+            "Turn four payload GHI",
+            "Turn five payload JKL",
+        ]
+        for t in texts:
+            real_store.store(
+                text=t, category="other", scope="agent", importance=0.5,
+                metadata_extra={"source_session": sess},
+            )
+            time.sleep(0.02)
+
+        # Query is semantically unrelated to task framing
+        block = p._do_recall("check slot 7", sess)
+        assert "task framing" in block.lower() or "stress-test" in block.lower(), (
+            "task framing memory from turn 1 must be in recall even after 5 turns"
+        )

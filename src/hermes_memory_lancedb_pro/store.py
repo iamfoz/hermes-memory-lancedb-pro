@@ -245,6 +245,7 @@ class MemoryStore:
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.embedding_model_name = embedding_model
         self._embedder: SentenceTransformer | None = None
+        self._embedder_lock = threading.Lock()
         self._db = None
         self._table = None
         self._initialised = False
@@ -285,10 +286,13 @@ class MemoryStore:
         self._initialised = True
 
     def _load_embedder(self):
-        if self._embedder is None:
-            from sentence_transformers import SentenceTransformer  # heavy import
-            logger.debug("Loading embedding model: %s", self.embedding_model_name)
-            self._embedder = SentenceTransformer(self.embedding_model_name)
+        if self._embedder is not None:
+            return
+        with self._embedder_lock:
+            if self._embedder is None:  # double-checked under lock
+                from sentence_transformers import SentenceTransformer  # heavy import
+                logger.debug("Loading embedding model: %s", self.embedding_model_name)
+                self._embedder = SentenceTransformer(self.embedding_model_name)
 
     def warmup(self) -> None:
         """Pre-load the embedding model + run a throwaway encode.
@@ -967,17 +971,34 @@ class MemoryStore:
 
     # ----- CRUD: read -----
 
-    def get_by_id(self, mem_id: str) -> dict[str, Any] | None:
-        """Retrieve a memory by ID (regardless of archive state)."""
-        results = (
-            self._table.search()
-            .where(f"id = '{_escape_sql(mem_id)}'")
-            .limit(1)
-            .to_list()
-        )
-        if not results:
-            return None
-        return self._row_to_dict(results[0])
+    def get_by_id(self, mem_id: str, *, follow_chain: bool = True) -> dict[str, Any] | None:
+        """Retrieve a memory by ID (regardless of archive state).
+
+        If *follow_chain* is True (the default) and the requested row is
+        archived with a ``superseded_by`` pointer, the method follows that
+        chain until it reaches the current live version, guarding against
+        cycles with a depth limit of 32.
+        """
+        seen: set[str] = set()
+        current_id = mem_id
+        while True:
+            results = (
+                self._table.search()
+                .where(f"id = '{_escape_sql(current_id)}'")
+                .limit(1)
+                .to_list()
+            )
+            if not results:
+                return None
+            row = self._row_to_dict(results[0])
+            if not follow_chain:
+                return row
+            meta = row.get("metadata") or {}
+            next_id: str | None = meta.get("superseded_by") if meta.get("state") == ARCHIVED_STATE else None
+            if not next_id or next_id in seen or len(seen) >= 32:
+                return row
+            seen.add(current_id)
+            current_id = next_id
 
     def has_id(self, mem_id: str) -> bool:
         """True if the ID exists and is not archived. Used for BM25 ghost
@@ -1070,6 +1091,64 @@ class MemoryStore:
         if session_id is not None:
             rows = [r for r in rows if _match_session(r["metadata"], session_id)]
         return rows[offset : offset + limit]
+
+    def recent_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
+        """Return the *limit* most recently written non-archived memories for
+        *session_id*, ordered newest-first by timestamp.
+
+        Used by the recall path as a recency anchor so the agent keeps sight
+        of the latest instruction even when the current query is semantically
+        distant from earlier task framing."""
+        if not session_id:
+            return []
+        try:
+            rows = (
+                self._table.search()
+                .where(f"timestamp > 0")
+                .limit(MAX_SCAN_ROWS)
+                .to_list()
+            )
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            d = self._row_to_dict(r)
+            if d["metadata"].get("state") == ARCHIVED_STATE:
+                continue
+            if not _match_session(d["metadata"], session_id):
+                continue
+            out.append(d)
+        out.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return out[:limit]
+
+    def first_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
+        """Return the *limit* oldest non-archived memories for *session_id*,
+        ordered oldest-first by timestamp.
+
+        Used alongside `recent_for_session` to pin task-framing memories
+        (written at the start of a session) so they are always injected even
+        after many subsequent turns push them out of the recency window."""
+        if not session_id:
+            return []
+        try:
+            rows = (
+                self._table.search()
+                .where(f"timestamp > 0")
+                .limit(MAX_SCAN_ROWS)
+                .to_list()
+            )
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            d = self._row_to_dict(r)
+            if d["metadata"].get("state") == ARCHIVED_STATE:
+                continue
+            if not _match_session(d["metadata"], session_id):
+                continue
+            out.append(d)
+        out.sort(key=lambda x: x.get("timestamp", 0))  # ascending — oldest first
+        return out[:limit]
 
     def search(
         self,

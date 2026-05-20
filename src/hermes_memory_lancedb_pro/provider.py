@@ -37,6 +37,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from ._sql import ARCHIVED_STATE as _ARCHIVED_STATE
+from .decay import is_noise as _is_noise
 from .jmunch import JMUNCH_MODE_ENV, is_jmunch_in_use
 from .memory_compactor import (
     CompactionConfig,
@@ -691,7 +693,13 @@ def _build_provider_class():
             `before_prompt_build`. Runs a session-scoped recall, caches
             the returned ids in `_pending_used_ids[session_id]` so we
             can credit them later, prepends the reflection block, and
-            returns the combined text."""
+            returns the combined text.
+
+            Relevance-based recall can miss earlier task framing when the
+            current query is semantically distant (e.g. "check slot 7"
+            doesn't match "stress test my memory"). To keep context
+            continuity, the two most-recently-written session memories are
+            injected as anchors, deduplicated against the relevance results."""
             if not query or not query.strip():
                 return ""
             limit, min_score = _effective_recall_config(
@@ -710,6 +718,29 @@ def _build_provider_class():
             except Exception as e:
                 logger.warning("lancedb_pro recall failed: %s", e)
                 results = []
+
+            # Session anchors — always append the 2 oldest (task framing) and
+            # 2 most-recently-written session memories so context continuity
+            # holds regardless of how many turns have passed.  Without the
+            # "first" anchors, task framing from turn 1 falls out of the
+            # recency window after turn 3 and is only recoverable by relevance
+            # search, which fails when the current query is semantically
+            # distant (e.g. "check slot 7" vs "stress test my memory").
+            if session_id:
+                try:
+                    existing_ids = {r.get("id") for r in results}
+                    first_anchors = self._store.first_for_session(session_id, limit=2)
+                    recent_anchors = self._store.recent_for_session(session_id, limit=2)
+                    seen: set[str | None] = set(existing_ids)
+                    extra_anchors = []
+                    for m in first_anchors + recent_anchors:
+                        mid = m.get("id")
+                        if mid not in seen:
+                            extra_anchors.append(m)
+                            seen.add(mid)
+                    results = results + extra_anchors
+                except Exception as e:
+                    logger.debug("lancedb_pro session anchor lookup failed: %s", e)
 
             if results and session_id:
                 with self._pending_lock:
@@ -766,6 +797,7 @@ def _build_provider_class():
             called — the host detects our override and skips prefetch
             to avoid double-injection. On older hermes-agent, this is
             the only injection point."""
+            self._flush_pending_write()
             return self._do_recall(query, session_id or self._session_id)
 
         def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
@@ -782,6 +814,7 @@ def _build_provider_class():
             users who haven't picked up the hermes-agent change. The
             plugin keeps both methods so the SAME wheel works against
             both old and new hermes-agent."""
+            self._flush_pending_write()
             query = str(turn_state.get("query") or "")
             session_id = str(turn_state.get("session_id") or "") or self._session_id
             return self._do_recall(query, session_id)
@@ -865,6 +898,19 @@ def _build_provider_class():
                     self._sync_thread = new_thread
                 new_thread.start()
 
+        def _flush_pending_write(self, timeout: float = 2.0) -> None:
+            """Wait briefly for the previous sync_turn write thread to finish.
+
+            Called at the top of prefetch / before_prompt_build so that
+            the previous turn's memories are visible to the upcoming recall.
+            Without this, a slow embedding (e.g. first-ever model load on a
+            brand-new install) causes the read to race the write and return
+            empty results for the first several turns."""
+            with self._thread_lock:
+                thread = self._sync_thread
+            if thread and thread.is_alive():
+                thread.join(timeout=timeout)
+
         def _raw_sync_turn(
             self,
             user_content: str,
@@ -877,6 +923,13 @@ def _build_provider_class():
             configured, or as a fail-safe if the extractor orchestrator
             itself raises (per-candidate failures don't reach here).
 
+            Only user-side content is stored, and only after passing the noise
+            filter. Assistant responses are deliberately excluded: they are
+            verbose, agent-side text that creates a feedback loop when recalled
+            (e.g. an early greeting gets injected back later, causing the agent
+            to re-greet). The smart_extractor path handles both sides properly
+            by extracting facts rather than storing raw turns.
+
             ``_store_override`` lets the sync_turn daemon thread pass the
             store it captured at dispatch time, preventing a concurrent
             initialize() from redirecting writes to the wrong database."""
@@ -886,9 +939,10 @@ def _build_provider_class():
                 if session_id else {"source": "agent_turn"}
             )
             try:
-                if user_content and user_content.strip():
+                text = (user_content or "").strip()
+                if text and not _is_noise(text):
                     store.store(
-                        text=user_content.strip(),
+                        text=text,
                         category="other",
                         scope="agent",
                         importance=0.4,
@@ -896,18 +950,6 @@ def _build_provider_class():
                     )
             except Exception as e:
                 logger.warning("lancedb_pro sync_turn user write failed: %s", e)
-
-            try:
-                if assistant_content and assistant_content.strip():
-                    store.store(
-                        text=assistant_content.strip(),
-                        category="other",
-                        scope="agent",
-                        importance=0.4,
-                        metadata_extra={**metadata_extra, "role": "assistant"},
-                    )
-            except Exception as e:
-                logger.warning("lancedb_pro sync_turn assistant write failed: %s", e)
 
         # ---- Lifecycle ----------------------------------------------------
 
@@ -1005,20 +1047,94 @@ def _build_provider_class():
         ) -> None:
             """Mirror writes from the built-in memory tool into our store
             so hermes-agent's `/memory` commands and our recall stay in
-            sync. Idempotent on duplicate writes — we just add a row.
+            sync.
 
-            ``edit`` and ``delete`` actions are noted in the debug log but
-            not yet wired to store mutations — the exact `target`/`content`
-            semantics for those actions are not yet finalised in the spec."""
+            ``add``: stores ``content`` with provenance from ``target``
+            (namespace: "user" → preference/user scope, else other/agent).
+
+            ``edit``: BM25-searches for memories matching ``target`` (the
+            old text), then supersedes each match with ``content`` (the new
+            text).  Pass ``metadata={"replace_all": True}`` to update every
+            matching entry; without it only the single best match is updated.
+
+            ``delete``: BM25-searches for memories matching ``target`` (or
+            ``content`` when target is a namespace keyword) and soft-archives
+            each match.  ``replace_all`` applies here too."""
             if action not in ("add", "edit", "delete"):
                 return
+
             if action in ("edit", "delete"):
-                logger.debug(
-                    "lancedb_pro on_memory_write: action %r not yet handled "
-                    "(target=%r); built-in and LanceDB stores may diverge",
-                    action, target,
+                replace_all = bool((metadata or {}).get("replace_all", False))
+                # target carries the old text for edit/delete; content may
+                # carry it too when target is a namespace keyword.
+                query = (
+                    target
+                    if target and target not in ("user", "agent")
+                    else content
                 )
+                if not query or not query.strip():
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: empty query — skip", action
+                    )
+                    return
+                try:
+                    candidates = self._store.search(
+                        query.strip(), mode="bm25", limit=20
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "lancedb_pro on_memory_write %r search failed: %s", action, e
+                    )
+                    return
+                query_lower = query.strip().lower()
+                exact = [
+                    c for c in candidates
+                    if query_lower in c.get("text", "").lower()
+                ]
+                matches = exact if exact else (candidates[:1] if candidates else [])
+                if not matches:
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: no match for %r — skip",
+                        action, query,
+                    )
+                    return
+                if len(matches) > 1 and not replace_all:
+                    matches = matches[:1]
+                    logger.debug(
+                        "lancedb_pro on_memory_write %r: %d candidates, using top "
+                        "(pass replace_all=True to update all)",
+                        action, len(exact) or len(candidates),
+                    )
+                if action == "edit":
+                    new_text = content.strip()
+                    if not new_text:
+                        return
+                    for m in matches:
+                        try:
+                            self._store.update(m["id"], text=new_text)
+                        except Exception as e:
+                            logger.warning(
+                                "lancedb_pro on_memory_write edit id=%s: %s",
+                                m.get("id"), e,
+                            )
+                else:  # delete
+                    now_ms = int(time.time() * 1000)
+                    for m in matches:
+                        try:
+                            self._store.update(
+                                m["id"],
+                                metadata_extra={
+                                    "state": _ARCHIVED_STATE,
+                                    "invalidated_at": now_ms,
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "lancedb_pro on_memory_write delete id=%s: %s",
+                                m.get("id"), e,
+                            )
                 return
+
             if not content.strip():
                 return
             sess = (metadata or {}).get("session_id") or ""
@@ -1028,7 +1144,7 @@ def _build_provider_class():
             if metadata:
                 # Pass through any provenance the agent supplied
                 extra.update(
-                    {k: v for k, v in metadata.items() if k != "session_id"}
+                    {k: v for k, v in metadata.items() if k not in ("session_id", "replace_all")}
                 )
             try:
                 self._store.store(
