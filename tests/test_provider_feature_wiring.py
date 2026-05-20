@@ -112,6 +112,26 @@ class TestPureHelpers:
         assert "## Invariants" in md
         assert "## Derived" not in md
 
+    def test_first_user_text_returns_first_user_message(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "the objective"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "follow up"},
+        ]
+        assert provider._first_user_text(msgs) == "the objective"
+
+    def test_first_user_text_handles_content_blocks(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "block text"},
+            {"type": "image", "source": {}},
+        ]}]
+        assert provider._first_user_text(msgs) == "block text"
+
+    def test_first_user_text_empty_when_no_user(self):
+        assert provider._first_user_text([{"role": "assistant", "content": "x"}]) == ""
+        assert provider._first_user_text([]) == ""
+
 
 def test_build_reflection_prompt_contains_transcript_and_json_keys():
     from hermes_memory_lancedb_pro.extraction_prompts import build_reflection_prompt
@@ -573,3 +593,233 @@ class TestFormatRecallFreshnessTrend:
     def test_no_decay_no_trend_tag(self):
         out = provider._format_recall([self._make_result("Alice prefers Python")])
         assert "[" not in out.split("(")[1]  # no tag after score bracket
+
+
+# ---------------------------------------------------------------------------
+# system_prompt_block + on_pre_compress — post-compaction greeting-loop defence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestSystemPromptBlockAndCompaction:
+    """The system-prompt hook and the pre-compaction anchor that together
+    stop the model greeting after context compaction.
+
+    `system_prompt_block` is hermes-agent's authoritative per-turn
+    system-prompt hook; `on_pre_compress` fires right before compaction
+    discards old messages. `before_prompt_build` is NOT called by upstream
+    hermes-agent, so the task protocol must travel through these hooks."""
+
+    def _provider(self, provider_cls, store, session="sess-1"):
+        p = provider_cls(store=store, auto_smart_extraction=False)
+        p.initialize(session)
+        return p
+
+    def test_system_prompt_block_includes_protocol(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        block = p.system_prompt_block()
+        assert "NEVER GREET" in block
+        assert "Memory Task Protocol" in block
+
+    def test_system_prompt_block_surfaces_active_task(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="Run the stress suite to completion",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+        )
+        block = p.system_prompt_block()
+        assert "=== ACTIVE TASK STATE ===" in block
+        assert "stress suite" in block
+
+    def test_system_prompt_block_prefers_formal_pin_over_anchor(
+        self, provider_cls, real_store
+    ):
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="auto anchor breadcrumb text",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+        )
+        real_store.store(
+            text="FORMAL PIN control block",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t1", "state_path": "/nonexistent/state.json"},
+        )
+        block = p.system_prompt_block()
+        assert "FORMAL PIN control block" in block
+        assert "auto anchor breadcrumb text" not in block
+
+    def test_on_pre_compress_creates_anchor_and_returns_block(
+        self, provider_cls, real_store
+    ):
+        p = self._provider(provider_cls, real_store)
+        out = p.on_pre_compress([
+            {"role": "user", "content": "Benchmark the retriever end to end"},
+            {"role": "assistant", "content": "starting the benchmark"},
+        ])
+        anchors = real_store.list_memories(limit=20, category="active_task")
+        assert anchors, "on_pre_compress must create a recovery anchor"
+        assert any(
+            "Benchmark the retriever" in (m["text"] or "") for m in anchors
+        )
+        # Return value carries the task block for the compression summary.
+        assert "=== ACTIVE TASK STATE ===" in out
+
+    def test_on_pre_compress_anchor_survives_in_system_prompt(
+        self, provider_cls, real_store
+    ):
+        p = self._provider(provider_cls, real_store)
+        p.on_pre_compress([
+            {"role": "user", "content": "Migrate the schema to v2"},
+        ])
+        # Simulate the post-compaction turn: the system prompt is rebuilt.
+        block = p.system_prompt_block()
+        assert "=== ACTIVE TASK STATE ===" in block
+        assert "Migrate the schema" in block
+        assert "do NOT greet" in block
+
+    def test_reset_session_drops_stale_anchor(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store, session="sess-old")
+        p.on_pre_compress([
+            {"role": "user", "content": "Refactor the auth module"},
+        ])
+        assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
+        # A genuine reset (/new, /reset) starts a fresh conversation.
+        p.on_session_switch("sess-new", parent_session_id="sess-old", reset=True)
+        block = p.system_prompt_block()
+        assert "Refactor the auth module" not in block
+        assert "=== ACTIVE TASK STATE ===" not in block
+
+    def test_non_reset_switch_keeps_anchor(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store, session="sess-old")
+        p.on_pre_compress([
+            {"role": "user", "content": "Refactor the auth module"},
+        ])
+        # /branch or /resume — reset=False — the task continues.
+        p.on_session_switch("sess-branch", parent_session_id="sess-old", reset=False)
+        assert "Refactor the auth module" in p.system_prompt_block()
+
+    def test_active_task_not_duplicated_in_recall_path(
+        self, provider_cls, real_store
+    ):
+        """The active-task block belongs to system_prompt_block; the
+        query-dependent recall path must not inject a second copy."""
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="auto anchor breadcrumb for the session",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+        )
+        assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
+        recall = p.prefetch("anything the user might ask")
+        assert "=== ACTIVE TASK STATE ===" not in recall
+        assert "auto anchor breadcrumb" not in recall
+
+
+@pytest.mark.integration
+class TestRecallHookSeparation:
+    """The durable-task protocol lives only in `system_prompt_block`; the
+    query-dependent recall hooks (`prefetch`, `before_prompt_build`) never
+    duplicate it. `before_prompt_build` is the non-standard
+    `feat/memory-provider-hooks` path — it must coexist with `prefetch`
+    without double-injecting."""
+
+    def _provider(self, provider_cls, store, session="sess-1"):
+        p = provider_cls(store=store, auto_smart_extraction=False)
+        p.initialize(session)
+        return p
+
+    def test_prefetch_empty_query_returns_empty(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        assert p.prefetch("") == ""
+        assert p.prefetch("   ") == ""
+
+    def test_before_prompt_build_empty_query_returns_empty(
+        self, provider_cls, real_store
+    ):
+        p = self._provider(provider_cls, real_store)
+        assert p.before_prompt_build({"query": ""}) == ""
+        assert p.before_prompt_build({}) == ""
+
+    def test_recall_hooks_do_not_duplicate_protocol(self, provider_cls, real_store):
+        p = self._provider(provider_cls, real_store)
+        # The protocol belongs to system_prompt_block...
+        assert "Memory Task Protocol" in p.system_prompt_block()
+        # ...and must NOT also appear in the query-dependent recall hooks.
+        assert "Memory Task Protocol" not in p.prefetch("a real user query")
+        assert "Memory Task Protocol" not in p.before_prompt_build(
+            {"query": "a real user query"}
+        )
+
+
+@pytest.mark.integration
+class TestAutoAnchor:
+    """_auto_anchor_session_if_needed: idempotent, pin-aware, self-cleaning."""
+
+    def test_creates_anchor_when_none_exists(self, real_store):
+        provider._auto_anchor_session_if_needed(
+            "Fix the failing tests", "sess-A", real_store
+        )
+        anchors = real_store.list_memories(limit=20, category="active_task")
+        assert len(anchors) == 1
+        assert "Fix the failing tests" in anchors[0]["text"]
+
+    def test_idempotent_no_duplicate_for_same_session(self, real_store):
+        for _ in range(3):
+            provider._auto_anchor_session_if_needed(
+                "Fix the failing tests", "sess-A", real_store
+            )
+        anchors = real_store.list_memories(limit=20, category="active_task")
+        assert len(anchors) == 1
+
+    def test_skips_when_formal_pin_exists(self, real_store):
+        real_store.store(
+            text="formal control block",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
+        )
+        provider._auto_anchor_session_if_needed(
+            "some objective", "sess-A", real_store
+        )
+        anchors = real_store.list_memories(limit=20, category="active_task")
+        assert len(anchors) == 1  # only the formal pin; no auto-anchor added
+        assert all(
+            not (m.get("metadata") or {}).get("auto_anchor") for m in anchors
+        )
+
+    def test_archives_stale_anchor_from_other_session(self, real_store):
+        provider._auto_anchor_session_if_needed("Old work", "sess-OLD", real_store)
+        provider._auto_anchor_session_if_needed("New work", "sess-NEW", real_store)
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert len(live) == 1
+        assert "New work" in live[0]["text"]
+
+    def test_archive_auto_anchors_clears_all_live_anchors(self, real_store):
+        provider._auto_anchor_session_if_needed("work A", "sess-A", real_store)
+        n = provider._archive_auto_anchors(real_store)
+        assert n == 1
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert live == []
+
+    def test_archive_auto_anchors_leaves_formal_pins(self, real_store):
+        real_store.store(
+            text="auto anchor breadcrumb",
+            category="active_task", scope="agent", importance=0.9,
+            metadata_extra={"auto_anchor": True, "source_session": "sess-A"},
+        )
+        real_store.store(
+            text="FORMAL PIN block",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
+        )
+        n = provider._archive_auto_anchors(real_store)
+        assert n == 1
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert len(live) == 1
+        assert "FORMAL PIN block" in live[0]["text"]

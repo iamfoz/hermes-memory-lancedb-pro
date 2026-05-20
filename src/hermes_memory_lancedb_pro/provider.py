@@ -210,124 +210,89 @@ _RECALL_TASK_PROTOCOL: bool = os.environ.get(
 ).strip().lower() not in ("off", "0", "false", "no")
 
 # Full durable-task protocol injected every turn when _RECALL_TASK_PROTOCOL
-# is True.  This is the exact content of skills/durable-task/SKILL.md — the
-# compact summary was not sufficient to prevent Hello-loop failures; the full
-# text (triggers, step-by-step commands, recovery, invariants, example) is
-# required for reliable behaviour.
+# is True.  Front-loaded with the unconditional no-greeting rule so the
+# model cannot misread the scope as "only during a running task".
 _TASK_PROTOCOL_TEXT = """\
-# Durable Task Protocol
+# Memory Task Protocol
 
-Use this protocol for any task that takes more than 3 sequential steps or tool calls.
-It ensures progress survives context compaction, session restarts, and model resets
-by keeping state in a file on disk rather than in the conversation.
+## NEVER GREET — unconditional, no exceptions
 
-## When to use this protocol
+Do not say "Hello", "Hi", "Hey", or any greeting word in ANY response:
+- Even if the user greeted you
+- Even at the start of what appears to be a new session
+- Even after context compaction wiped the conversation history
+- Even when there are no active tasks
 
-Trigger this protocol whenever:
+Instead: respond immediately to the substance of the user's message.
+If context is genuinely unclear, say one line such as "Checking task state..."
+and then run `hermes-memory-lancedb-pro task list`.
 
-- The user asks to run a test suite, benchmark, stress test, or any iterative work
-- The user asks you to "keep going", "run N iterations", or "repeat until done"
-- You expect to make more than 3 tool calls to complete the task
-- You are resuming a task after receiving a greeting or context reset
+## First thing every turn — check task state
 
-## Protocol
+Run this BEFORE any other action or text:
 
-### Step 1 — Create the task ledger
+    hermes-memory-lancedb-pro task list
 
-Before touching anything else, create a task ledger:
+Decision tree:
+- Status = running  → `task resume <id>`, then continue from next_action
+- Status = complete → report the task results to the user now; do not re-run
+- No tasks listed   → respond directly to the user's message; no greeting
 
-```bash
-hermes-memory-lancedb-pro task create \\
-  --id <task-id> \\
-  --objective "<clear one-line objective>" \\
-  --iterations <N>
-```
+## Creating a task ledger (for multi-step work)
 
-Choose a task ID that is unique and descriptive, e.g. `stress-test-2026-05-20`.
-If --iterations is unknown, omit it.
+Use this for any task that takes more than 3 tool calls, or that could be
+interrupted by context compaction: test suites, benchmarks, iterative loops,
+anything where "keep going" is the instruction.
 
-### Step 2 — Pin it to memory
+    hermes-memory-lancedb-pro task create \\
+      --id <task-id> \\
+      --objective "<clear one-line objective>" \\
+      --iterations <N>
 
-```bash
-hermes-memory-lancedb-pro task pin <task-id>
-```
+    hermes-memory-lancedb-pro task pin <task-id>
 
-This stores the task state in the memory database. The memory plugin reloads
-state.json on every turn, so the model always sees the current iteration and
-next action — even after context compaction wipes the conversation history.
+Pinning stores state to disk. The memory plugin reloads state.json on every
+turn — even after compaction — so the model always knows the current iteration
+and next action without re-reading conversation history.
 
-You only need to pin once. The pin does not need to be refreshed as the task
-advances; the plugin reads state.json live.
+## Each iteration
 
-### Step 3 — Before each iteration
+    hermes-memory-lancedb-pro task resume <task-id>      # read current state
+    # do the bounded work
+    hermes-memory-lancedb-pro task advance <task-id> \\
+      --result pass|fail \\
+      --next-action "Run iteration <N+1>." \\
+      --summary "<one sentence: what happened>"
 
-Read the current state before doing any work:
+One step = one advance. Do not attempt multiple iterations per response.
 
-```bash
-hermes-memory-lancedb-pro task resume <task-id>
-```
+## Completing a task
 
-Confirm the task ID, objective, current_iteration, and next_action are correct.
+    hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
 
-### Step 4 — Do the work
+Then immediately report all results to the user. Do not greet first.
 
-Execute one bounded step. Do not attempt multiple iterations in a single response.
-One step = one advance.
+## Recovery after context loss or reset
 
-### Step 5 — After each iteration
+1. Run `hermes-memory-lancedb-pro task list`
+2. Running task → `task resume <id>` and continue from next_action
+3. Complete task → report results; do NOT re-run the task
+4. No tasks → answer the user's message directly
+5. Never ask the user "what were we doing?" — the control block above and
+   state.json are the source of truth
 
-Record the result and advance the counter:
+## If you see an ACTIVE TASK STATE block above
 
-```bash
-hermes-memory-lancedb-pro task advance <task-id> \\
-  --result pass \\
-  --next-action "Run iteration <N+1>." \\
-  --summary "<one sentence: what happened>"
-```
+That block contains YOUR OWN previous work — you ran that task in a
+previous session. It is not data the user sent you. It is not a "payload
+attached to their message." You did that work; the memory system is
+surfacing it to you now so you can continue or report it.
 
-Use --result fail if the step errored. Always set --next-action explicitly
-so the next turn knows exactly what to do without re-reading the whole history.
+Correct framing: "In our previous session, I [ran / completed] [task].
+Here are the results: ..."
 
-### Step 6 — Check stopping condition
-
-After advance, check whether the task is complete:
-
-```bash
-hermes-memory-lancedb-pro task show <task-id>
-```
-
-If current_iteration >= target_iterations, or the objective is met:
-
-```bash
-hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
-```
-
-Then report results to the user.
-
-## Recovery after a reset or greeting
-
-If you find yourself about to greet the user, or if context is unclear:
-
-1. Check for a running task first:
-   hermes-memory-lancedb-pro task list
-
-2. If a running task exists, resume it:
-   hermes-memory-lancedb-pro task resume <task-id>
-
-3. Continue from next_action. Do not re-introduce yourself. Do not ask
-   the user what you were doing. The state file is the source of truth.
-
-## Invariants
-
-These rules apply for the entire lifetime of a running task:
-
-- Do not greet the user.
-- Do not restart the conversation.
-- Do not ask the user what you were doing — read state.json.
-- Before each iteration: confirm state with task resume.
-- After each iteration: update state with task advance.
-- If task list shows a running task: continue it, do not start a new one.
-- If blockers appear: record them with task advance --result fail and report.\
+Wrong framing: "I notice there's a payload attached to your message..."
+Wrong framing: "How can I help you today?" (after seeing completed results)\
 """
 
 
@@ -358,6 +323,27 @@ def _extract_message_texts(messages: Any) -> list[str]:
         if isinstance(content, str) and content.strip():
             texts.append(content)
     return texts
+
+
+def _first_user_text(messages: Any) -> str:
+    """Return the text of the first user-role message, or "" if none.
+
+    Used by `on_pre_compress` to seed the session anchor with the user's
+    original objective rather than whatever short follow-up ("continue",
+    "yes") happens to be the most recent message before compaction."""
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content") or msg.get("text") or ""
+        if isinstance(content, list):
+            content = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
 
 
 _MS_PER_DAY = 86_400_000
@@ -621,23 +607,34 @@ def _response_references_memory(response_lower: str, memory_text: str) -> bool:
 def _format_recall(results: list[dict[str, Any]]) -> str:
     """Format a list of recall results into the text block hermes-agent
     injects under `<memory-context>`. Returns "" for an empty result so
-    hermes-agent's prefetch_all skips injection entirely."""
+    hermes-agent's prefetch_all skips injection entirely.
+
+    active_task memories get a visually-distinct block so the model
+    treats them as authoritative session state rather than recalled facts.
+    Regular memories keep the bullet-point format."""
     if not results:
         return ""
-    lines = []
+    task_lines: list[str] = []
+    mem_lines: list[str] = []
     for r in results:
         text = (r.get("text") or "").strip()
         if not text:
             continue
         cat = r.get("category") or "other"
-        score = next(
-            (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
-            0.0,
-        )
-        trend = (r.get("_decay") or {}).get("freshness_trend", "")
-        trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
-        lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
-    return "\n".join(lines) if lines else ""
+        if cat == "active_task":
+            task_lines.append("=== ACTIVE TASK STATE ===")
+            task_lines.append(text)
+            task_lines.append("=" * 25)
+        else:
+            score = next(
+                (r[k] for k in ("_final_score", "_rrf_score", "score") if r.get(k) is not None),
+                0.0,
+            )
+            trend = (r.get("_decay") or {}).get("freshness_trend", "")
+            trend_tag = f" [{trend}]" if trend and trend != "stable" else ""
+            mem_lines.append(f"- [{cat}] {text} (score={score:.2f}{trend_tag})")
+    parts = [p for p in ["\n".join(task_lines), "\n".join(mem_lines)] if p]
+    return "\n\n".join(parts) if parts else ""
 
 
 def _apply_recall_guardrails(
@@ -725,10 +722,35 @@ def _refresh_active_task_memories(
                 continue
             with open(expanded, encoding="utf-8") as fh:
                 state = json.load(fh)
-            refreshed.append({**r, "text": _build_task_control_block(state)})
+
+            # Completed tasks get a results-pending notice rather than
+            # the iteration-advance control block.  Without this the model
+            # sees "Status: complete / Next action: (none)" and defaults
+            # to greeting.  The notice also instructs the model on HOW to
+            # present the results — critical because the recall block can
+            # appear as injected context that the model mistakes for
+            # user-provided data ("payload attached to your message").
+            if state.get("status") in ("complete", "completed"):
+                obj = state.get("objective", "unknown task")
+                summary = (state.get("completion_summary") or state.get("recent_summary") or "").strip()
+                control_text = (
+                    f"YOU completed this task in a previous session (not the user):\n"
+                    f"Task: {obj}\n"
+                    + (f"Summary: {summary}\n" if summary else "")
+                    + "\n"
+                    "ACTION: Present these results to the user as your OWN completed work.\n"
+                    "Say something like: \"In our previous session I ran [task]. Here are the results: ...\"\n"
+                    "Do NOT say the results are 'attached to your message' or 'a payload you sent'.\n"
+                    "Do NOT greet. Do NOT re-run the task."
+                )
+            else:
+                control_text = _build_task_control_block(state)
+
+            refreshed.append({**r, "text": control_text})
             logger.debug(
-                "lancedb_pro refreshed active_task memory from %s (iter %s)",
+                "lancedb_pro refreshed active_task memory from %s (status=%s iter=%s)",
                 expanded,
+                state.get("status"),
                 state.get("current_iteration"),
             )
         except Exception as exc:
@@ -772,6 +794,121 @@ def _maybe_auto_purge(store: MemoryStore) -> None:
             )
     except Exception as e:
         logger.warning("Auto-purge failed (will retry next session): %s", e)
+
+
+def _auto_anchor_session_if_needed(
+    user_content: str,
+    session_id: str,
+    store: MemoryStore,
+) -> None:
+    """Auto-create an active_task breadcrumb if no task anchor exists yet.
+
+    Without a pinned task, context compaction silently destroys all session
+    state and the model resets to greeting.  This breadcrumb gives
+    `before_prompt_build` something to return after compaction so the model
+    knows it is mid-session and must not greet.
+
+    Idempotent — skips when a formal task pin (has `state_path` in metadata)
+    or an auto-anchor for this session already exists.  Archives stale
+    auto-anchors from other sessions so only one breadcrumb is live at a time.
+    """
+    try:
+        existing = store.list_memories(
+            limit=10,
+            category="active_task",
+            include_archived=False,
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor check failed: %s", exc)
+        return
+
+    # Formal task pin present — nothing to do
+    if any(
+        isinstance(r.get("metadata"), dict) and r["metadata"].get("state_path")
+        for r in existing
+    ):
+        return
+
+    # Archive stale auto-anchors from other sessions
+    for r in existing:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if meta.get("auto_anchor"):
+            old_session = meta.get("source_session", "")
+            if old_session != (session_id or ""):
+                try:
+                    store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
+                    logger.debug(
+                        "lancedb_pro archived stale auto-anchor %s (session %s)",
+                        r["id"], old_session,
+                    )
+                except Exception as exc:
+                    logger.debug("lancedb_pro archive stale anchor failed: %s", exc)
+
+    # This session already has an auto-anchor — nothing to do
+    if session_id and any(
+        isinstance(r.get("metadata"), dict)
+        and r["metadata"].get("auto_anchor")
+        and r["metadata"].get("source_session") == session_id
+        for r in existing
+    ):
+        return
+
+    snippet = (user_content or "").strip()
+    if len(snippet) > 200:
+        snippet = snippet[:197] + "…"
+
+    anchor_text = (
+        "SESSION IN PROGRESS — do NOT greet.\n"
+        + (f'User started with: "{snippet}"\n' if snippet else "")
+        + "\nContinue from where you left off.\n"
+        "Run `hermes-memory-lancedb-pro task list` to check for pinned tasks.\n"
+        "If mid-task: resume it. Otherwise: answer the user's message directly."
+    )
+
+    meta: dict[str, Any] = {"auto_anchor": True, "priority": "must_include"}
+    if session_id:
+        meta["source_session"] = session_id
+
+    try:
+        store.store(
+            text=anchor_text,
+            category="active_task",
+            scope="agent",
+            importance=0.9,
+            metadata_extra=meta,
+        )
+        logger.debug(
+            "lancedb_pro auto-anchored session %s", session_id or "global"
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor write failed: %s", exc)
+
+
+def _archive_auto_anchors(store: MemoryStore) -> int:
+    """Archive every live auto-anchor active_task memory; returns the count.
+
+    Called on a genuine session reset so a brand-new conversation does not
+    inherit the previous conversation's task breadcrumb on its first turn.
+    Formal `task pin` memories (those carrying a `state_path`) are left
+    untouched — they are explicit durable tasks the user resumes
+    deliberately, not implicit breadcrumbs."""
+    archived = 0
+    try:
+        rows = store.list_memories(
+            limit=20, category="active_task", include_archived=False,
+        )
+    except Exception as exc:
+        logger.debug("lancedb_pro auto-anchor archive scan failed: %s", exc)
+        return 0
+    for r in rows:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if meta.get("auto_anchor") and not meta.get("state_path"):
+            try:
+                store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
+                archived += 1
+            except Exception as exc:
+                logger.debug("lancedb_pro auto-anchor archive failed: %s", exc)
+    return archived
 
 
 def _build_provider_class():
@@ -1009,14 +1146,36 @@ def _build_provider_class():
             corresponding window.  Session anchors bypass this filter so
             task-framing memories are always present."""
             if not query or not query.strip():
-                # No query to recall against — this happens when
-                # before_prompt_build is called to assemble the
-                # query-independent system prompt. The task protocol is
-                # static guidance that does NOT depend on the query, so it
-                # must still be injected here; returning "" would drop it
-                # from the system prompt entirely (the v0.11.20–0.11.22 bug
-                # where the protocol text never reached the model).
-                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+                # No query — before_prompt_build assembling the
+                # query-independent system prompt.  Return the protocol text
+                # PLUS any pinned active-task state from disk.
+                parts: list[str] = []
+                if _RECALL_TASK_PROTOCOL:
+                    parts.append(_TASK_PROTOCOL_TEXT)
+                try:
+                    task_mems = self._store.list_memories(
+                        limit=5,
+                        category="active_task",
+                        include_archived=False,
+                    )
+                    task_mems = _refresh_active_task_memories(task_mems)
+                    # Prefer formal task pins (state_path) over auto-anchors
+                    # when both exist — the pin is always more authoritative.
+                    formal_pins = [
+                        m for m in task_mems
+                        if (m.get("metadata") or {}).get("state_path")
+                    ]
+                    if formal_pins:
+                        task_mems = formal_pins
+                    if task_mems:
+                        task_block = _format_recall(task_mems)
+                        if task_block:
+                            parts.append(task_block)
+                except Exception as _exc:
+                    logger.debug(
+                        "lancedb_pro no-query active task inject failed: %s", _exc
+                    )
+                return "\n\n".join(p for p in parts if p)
             limit, min_score = _effective_recall_config(
                 self._prefetch_limit,
                 self._min_score,
@@ -1094,21 +1253,23 @@ def _build_provider_class():
                 except Exception as e:
                     logger.debug("lancedb_pro session anchor lookup failed: %s", e)
 
-            # Recall guardrails — pin active-task memories first, drop
-            # never-categories, enforce char/token budget.
+            # Drop active_task memories from the query-dependent recall path.
+            # They are owned by `system_prompt_block`, which injects the task
+            # protocol + active-task state into the system prompt every turn.
+            # Without this filter the auto-anchor (a recent session memory)
+            # would also be pulled in here via `recent_for_session`, injecting
+            # a second copy of the same block on every turn.
+            results = [r for r in results if r.get("category") != "active_task"]
+
+            # Recall guardrails — drop never-categories, enforce char/token
+            # budget. (Active-task pinning is a no-op here now that the
+            # category is filtered out above — see `system_prompt_block`.)
             results = _apply_recall_guardrails(
                 results,
                 _RECALL_NEVER_CATEGORIES,
                 _RECALL_CHAR_BUDGET,
                 _RECALL_ACTIVE_TASK_PIN,
             )
-
-            # Reload active_task control blocks from state.json so the injected
-            # text always reflects the current iteration — not a stale snapshot.
-            # This is the primary defence against post-compaction greeting-replay:
-            # even after the conversation history is wiped, the model still sees
-            # the current task objective and next_action in the system prompt.
-            results = _refresh_active_task_memories(results)
 
             logger.debug(
                 "lancedb_pro recall: injecting %d items [%s] for session %s",
@@ -1125,8 +1286,12 @@ def _build_provider_class():
 
             recall_block = _format_recall(results)
             reflection_block = self._reflection_block(session_id)
-            protocol_block = _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
-            parts = [p for p in [protocol_block, reflection_block, recall_block] if p]
+            # The durable-task protocol is NOT injected here — it lives in
+            # `system_prompt_block()`, the authoritative per-turn system-prompt
+            # hook. Injecting it via prefetch too would duplicate ~375 tokens
+            # every turn and bust prompt caching (prefetch text changes turn
+            # to turn; the system prompt is stable and cacheable).
+            parts = [p for p in [reflection_block, recall_block] if p]
             return "\n\n".join(parts)
 
         def _reflection_block(self, session_id: str) -> str:
@@ -1165,32 +1330,118 @@ def _build_provider_class():
             return "\n".join(lines)
 
         def prefetch(self, query: str, session_id: str | None = None) -> str:
-            """User-message memory injection (legacy hermes-agent path).
+            """Query-dependent recall — the standard (`main`-branch) path.
 
-            Returns the formatted recall block. On hermes-agent versions
-            that support `before_prompt_build`, this method is NOT
-            called — the host detects our override and skips prefetch
-            to avoid double-injection. On older hermes-agent, this is
-            the only injection point."""
+            Returns the formatted recall block (relevant memories +
+            reflection) for the user message position. On a host running
+            the `feat/memory-provider-hooks` branch — which adds
+            `before_prompt_build` — the host detects our `before_prompt_build`
+            override and SKIPS this method to avoid double-injecting recall.
+            On a `main`-branch host (no `before_prompt_build`) this is the
+            recall injection point.
+
+            The durable-task protocol and active-task state are NOT returned
+            here — those belong to `system_prompt_block()`, which every host
+            calls. An empty query therefore yields an empty string rather
+            than falling through to the protocol branch of `_do_recall`."""
+            if not query or not query.strip():
+                return ""
             self._flush_pending_write()
             return self._do_recall(query, session_id or self._session_id)
 
-        def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
-            """System-prompt memory injection (new hermes-agent path).
+        def system_prompt_block(self) -> str:
+            """Query-independent text injected into the SYSTEM PROMPT.
 
-            On hosts that support the hook (introduced via the
-            corresponding hermes-agent PR), this places the recall
-            block in the system prompt — a more authoritative position
-            than the user message. The host calls this instead of
-            `prefetch` for providers that override it; we override it,
-            so on a new host we'll always go through here.
+            This is hermes-agent's authoritative memory hook: `MemoryManager.
+            build_system_prompt()` calls it once per turn and concatenates the
+            result into the system prompt itself.
 
-            Older hosts never call this method, so it's dormant for
-            users who haven't picked up the hermes-agent change. The
-            plugin keeps both methods so the SAME wheel works against
-            both old and new hermes-agent."""
+            It is the correct home for the durable-task protocol and the
+            active-task control block because:
+
+              * the system prompt is re-assembled every turn but is NOT
+                discarded by context compaction — so a "you are mid-task,
+                do not greet" directive placed here survives compaction
+                automatically, which `prefetch` context (user-message
+                position) does not;
+              * the model treats system-prompt text as ground truth rather
+                than as recalled data it might mistake for a user payload;
+              * the protocol text is stable, so keeping it here (instead of
+                in the turn-varying `prefetch` block) is a prompt-cache hit.
+
+            Returns the protocol plus the current active-task state, reloaded
+            fresh from state.json on every call via the empty-query branch of
+            `_do_recall`."""
             self._flush_pending_write()
+            try:
+                return self._do_recall("", self._session_id)
+            except Exception as exc:
+                logger.debug("lancedb_pro system_prompt_block failed: %s", exc)
+                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+
+        def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+            """Called by the host right before context compression discards
+            old messages. The return value is merged into the compression
+            summary prompt, so anything returned here survives compaction
+            inside the compressed context itself.
+
+            Two jobs:
+              1. Ensure a session recovery anchor exists — compaction is the
+                 exact failure point for the greeting loop, so this is the
+                 last safe moment to guarantee `system_prompt_block` will
+                 have an active-task breadcrumb to surface afterwards.
+              2. Return the current active-task control block so the host
+                 folds it into the compressed summary as a second, redundant
+                 copy of the task state."""
+            # Join any in-flight sync_turn write first. That thread also
+            # calls `_auto_anchor_session_if_needed`; flushing it here
+            # serialises the two callers so they cannot both pass the
+            # "no anchor exists" check and create duplicate anchors.
+            self._flush_pending_write()
+            try:
+                first_user = _first_user_text(messages)
+                _auto_anchor_session_if_needed(
+                    first_user, self._session_id, self._store,
+                )
+            except Exception as exc:
+                logger.debug("lancedb_pro on_pre_compress anchor failed: %s", exc)
+            try:
+                task_mems = self._store.list_memories(
+                    limit=5, category="active_task", include_archived=False,
+                )
+                task_mems = _refresh_active_task_memories(task_mems)
+                formal_pins = [
+                    m for m in task_mems
+                    if (m.get("metadata") or {}).get("state_path")
+                ]
+                if formal_pins:
+                    task_mems = formal_pins
+                return _format_recall(task_mems) if task_mems else ""
+            except Exception as exc:
+                logger.debug("lancedb_pro on_pre_compress export failed: %s", exc)
+                return ""
+
+        def before_prompt_build(self, turn_state: dict[str, Any]) -> str:
+            """Query-dependent recall — the `feat/memory-provider-hooks` path.
+
+            This is a non-standard hook: it exists on hermes-agent's
+            `feat/memory-provider-hooks` branch, not on `main`. When the host
+            supports it, it is called once per turn after the user message is
+            known and the result is appended to the system prompt; the host
+            then SKIPS this provider's `prefetch` to avoid double-injecting
+            recall. On a `main`-branch host the hook simply never fires — an
+            unused method is harmless, so the same wheel runs unmodified on
+            both branches (recall travels via `prefetch` instead).
+
+            Like `prefetch`, this returns only the query-dependent recall
+            block. The durable-task protocol and active-task state come from
+            `system_prompt_block()`, which both host branches always call —
+            so an empty query yields an empty string here rather than
+            duplicating the protocol the system prompt already carries."""
             query = str(turn_state.get("query") or "")
+            if not query.strip():
+                return ""
+            self._flush_pending_write()
             session_id = str(turn_state.get("session_id") or "") or self._session_id
             return self._do_recall(query, session_id)
 
@@ -1259,6 +1510,18 @@ def _build_provider_class():
                     self._raw_sync_turn(
                         user_content, assistant_content, effective_session_id,
                         _store_override=_store,
+                    )
+
+                # Ensure a recovery anchor exists so before_prompt_build can
+                # return meaningful context after context compaction — even
+                # when the model hasn't explicitly run `task create` + `task pin`.
+                try:
+                    _auto_anchor_session_if_needed(
+                        user_content, effective_session_id, _store,
+                    )
+                except Exception as _anchor_exc:
+                    logger.debug(
+                        "lancedb_pro auto-anchor failed: %s", _anchor_exc
                     )
 
                 # Credit the memories the model saw in its prefetch — bypasses
@@ -1349,6 +1612,9 @@ def _build_provider_class():
             reset: bool = False,
             **_kwargs: Any,
         ) -> None:
+            # Let the previous session's last write land before switching,
+            # so a reset can reliably see (and archive) its auto-anchor.
+            self._flush_pending_write()
             self._session_id = new_session_id
             # Drop any pending used-ids for the old session — we're not
             # going to credit recalls that were never confirmed.
@@ -1357,6 +1623,17 @@ def _build_provider_class():
                     self._pending_used_ids.pop(parent_session_id, None)
                 with self._reflection_lock:
                     self._reflection_cache.pop(parent_session_id, None)
+            # A genuine reset (/new, /reset) begins a fresh conversation.
+            # Archive the previous conversation's auto-anchor now — otherwise
+            # `system_prompt_block` would surface a stale "you are mid-task"
+            # breadcrumb on turn 1 of the new session, before `sync_turn` has
+            # a chance to clean it up. Formal `task pin`s are left intact.
+            if reset:
+                n = _archive_auto_anchors(self._store)
+                if n:
+                    logger.debug(
+                        "lancedb_pro session reset: archived %d auto-anchor(s)", n
+                    )
 
         def on_recall_used(
             self,

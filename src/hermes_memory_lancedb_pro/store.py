@@ -87,7 +87,15 @@ VECTOR_INDEX_MIN_ROWS: int = 256
 # rows into the FTS / vector indexes). Set to 0 to disable auto-compaction.
 AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256"))
 
-MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other", "reflection"]
+# "active_task" backs the durable-task pin: `task pin`, the recall-guardrail
+# active-task pinning, `_format_recall`, `_refresh_active_task_memories` and the
+# session auto-anchor all read/write this category. It MUST be a recognised
+# category — otherwise `store()` silently coerces it to "other" and every
+# `list_memories(category="active_task")` lookup returns nothing, which
+# silently disables task-state recovery across context compaction.
+MEMORY_CATEGORIES = [
+    "preference", "fact", "decision", "entity", "other", "reflection", "active_task",
+]
 MEMORY_TIERS = ["core", "working", "peripheral"]
 MEMORY_STATES = ["pending", "confirmed", "archived"]
 
@@ -128,6 +136,27 @@ CROSS_SESSION_PROMOTION_THRESHOLD: int = int(
 INJECTION_GUARD_MODE: str = os.environ.get(
     "MEMORY_INJECTION_GUARD", "warn",
 ).lower().strip()
+
+
+def _raise_if_fd_exhaustion(exc: Exception) -> None:
+    """Re-raise *exc* as a clear OSError when it signals file-descriptor
+    exhaustion (EMFILE / errno 24 / "too many open files").
+
+    LanceDB + PyTorch each open many file handles; on macOS the default
+    ulimit -n is only 256, which can be exhausted under sustained load
+    (~2 000+ store operations with concurrent reads).
+
+    Callers: wrap LanceDB I/O in try/except and call this before re-raising
+    so users get an actionable message instead of a cryptic LanceError."""
+    msg = str(exc).lower()
+    if "too many open files" in msg or "os error 24" in msg or "emfile" in msg:
+        raise OSError(
+            "MemoryStore: OS file-descriptor limit exhausted — memory operations "
+            "will fail until the limit is raised.  Fix: run  `ulimit -n 4096`  "
+            "in your shell before starting hermes-agent, or add it to "
+            "~/.zshrc / ~/.bashrc.  "
+            f"Original error: {exc}"
+        ) from exc
 
 
 def _check_injection_guard(text: str, *, where: str) -> str:
@@ -370,9 +399,14 @@ class MemoryStore:
 
         Every write path funnels through here so a single counter sees all
         fragment-creating writes. Keeping `self._table.add` out of the
-        individual CRUD methods means the compaction policy lives in exactly
-        one place. See `optimize`."""
-        self._table.add(rows)
+        individual CRUD methods means the compaction policy — and the
+        file-descriptor-exhaustion guard — live in exactly one place.
+        See `optimize`."""
+        try:
+            self._table.add(rows)
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         self._maybe_optimize()
 
     def _maybe_optimize(self) -> None:
@@ -612,7 +646,7 @@ class MemoryStore:
         category: str,
         scope: str,
         importance: float,
-        metadata: str,
+        metadata: str | dict[str, Any],
         timestamp: int | None = None,
     ) -> str:
         """Low-level write: caller supplies the encoded vector AND the
@@ -632,6 +666,10 @@ class MemoryStore:
         if not vector:
             raise ValueError("MemoryStore.store_raw: `vector` must be non-empty")
         text = _check_injection_guard(text, where="store_raw")
+        # Accept a pre-built dict as well as a JSON string so callers don't
+        # have to json.dumps() themselves (and to match store()'s metadata_extra API).
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
 
         mem_id = str(uuid.uuid4())
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
@@ -845,7 +883,10 @@ class MemoryStore:
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
-        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
+        # get_by_id follows the supersede chain; use the resolved live ID so
+        # we delete the actual live row rather than an already-archived predecessor.
+        effective_id = existing["id"]
+        self._table.delete(f"id = '{_escape_sql(effective_id)}'")
         return True
 
     def increment_access_count(
@@ -982,6 +1023,7 @@ class MemoryStore:
         chain until it reaches the current live version, guarding against
         cycles with a depth limit of 32.
         """
+        self._checkout_latest()
         seen: set[str] = set()
         current_id = mem_id
         while True:
@@ -1006,6 +1048,7 @@ class MemoryStore:
     def has_id(self, mem_id: str) -> bool:
         """True if the ID exists and is not archived. Used for BM25 ghost
         protection — see also `check_ids` for batch lookups."""
+        self._checkout_latest()
         results = (
             self._table.search()
             .where(f"id = '{_escape_sql(mem_id)}'")
@@ -1024,6 +1067,7 @@ class MemoryStore:
         default page size, falsely flagging the rest as ghosts."""
         if not mem_ids:
             return []
+        self._checkout_latest()
         # de-dup but keep original input intact so callers aren't surprised
         unique_ids = list(dict.fromkeys(mem_ids))
         in_clause = ",".join(f"'{_escape_sql(mid)}'" for mid in unique_ids)
@@ -1254,7 +1298,11 @@ class MemoryStore:
         # Over-fetch more aggressively when post-filtering by session, since
         # session-matching rows may be sparse in the top-N from LanceDB.
         overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
-        results = search.limit(max(limit * overfetch, limit)).to_list()
+        try:
+            results = search.limit(max(limit * overfetch, limit)).to_list()
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         results = self._post_filter(results, session_id=session_id)
 
         rows = [
@@ -1289,15 +1337,19 @@ class MemoryStore:
         if where:
             search = search.where(where)
         overfetch = SEARCH_OVERFETCH_MULTIPLIER * (3 if session_id is not None else 1)
-        results = search.limit(max(limit * overfetch, limit)).to_list()
+        try:
+            results = search.limit(max(limit * overfetch, limit)).to_list()
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
         results = self._post_filter(results, session_id=session_id)
 
+        if min_score is not None:
+            results = [r for r in results if float(r.get("_score") or 0.0) >= min_score]
         rows = [
             self._row_to_dict(r, score=r.get("_score"), keep_vector=keep_vector)
             for r in results
         ]
-        if min_score is not None:
-            rows = [r for r in rows if float(r.get("_score") or 0.0) >= min_score]
         return rows[:limit]
 
     def _hybrid_search(
@@ -1472,6 +1524,7 @@ class MemoryStore:
         downstream pipelines. Pass `keep_vector=True` (e.g. from MMR) to
         preserve them."""
         meta = row["metadata"]
+        parsed_meta = _parse_metadata(meta) if isinstance(meta, str) else meta
         result: dict[str, Any] = {
             "id": row["id"],
             "text": row["text"],
@@ -1479,7 +1532,11 @@ class MemoryStore:
             "scope": row["scope"],
             "importance": row["importance"],
             "timestamp": row["timestamp"],
-            "metadata": _parse_metadata(meta) if isinstance(meta, str) else meta,
+            "metadata": parsed_meta,
+            # Convenience top-level key so callers don't have to dig into
+            # metadata — mirrors how `category`/`scope`/`importance` are
+            # exposed directly even though tier lives in the metadata JSON.
+            "tier": parsed_meta.get("tier", "working"),
         }
         if keep_vector and "vector" in row:
             result["vector"] = row["vector"]
