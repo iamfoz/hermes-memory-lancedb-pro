@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.11.6"
+version = "0.11.43"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -86,7 +86,7 @@ ignore = [
 "src/hermes_memory_lancedb_pro/store.py" = ["PLC0415"]
 # provider.py imports `agent.memory_provider` from hermes-agent only when
 # hermes-agent is on PYTHONPATH; the lazy import is by design.
-"src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415"]
+"src/hermes_memory_lancedb_pro/provider.py" = ["PLC0415", "PLR0911", "PLR0912"]
 "src/hermes_memory_lancedb_pro/_cli.py" = ["PLR0912", "PLR0915"]
 # smart_extractor's process_candidate is a long dispatch table over the 7
 # dedup decisions — collapsing it via a function-table hurts readability

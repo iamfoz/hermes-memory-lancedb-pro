@@ -7,65 +7,95 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.11.6] — 2026-05-21
+## [0.11.8] — 2026-05-20
 
-### Added
-- jmunch gateway detection (`hermes_memory_lancedb_pro.jmunch`).
-  `is_jmunch_in_use()` reports whether a jmunch gateway is in the LLM
-  path. Detection is two-stage and creates no code dependency on
-  jmunch-mcp: it is confirmed passively from the `X-Jmunch-Gateway`
-  response header that jmunch >= 0.3.0 stamps on every reply (works on
-  any port; latched by `record_response_headers()`), and can also be
-  declared up front via `MEMORY_JMUNCH_MODE=true` so the startup-time
-  tuning is correct before the first response arrives.
-- The memory extractor's LLM calls send `X-Jmunch-Inject: false` and
-  `X-Jmunch-Handleify: false` when jmunch is in use, making the gateway a
-  pure pass-through for those calls — no verb injection, no
-  handle-ification — so the extractor sees full-fidelity tool content.
-  Both headers are inert on any non-jmunch endpoint. A warning is logged
-  if a jmunch gateway older than 0.3.0 (which ignores `X-Jmunch-Handleify`)
-  is observed.
-- In jmunch mode the provider widens memory recall — a higher prefetch
-  limit (`MEMORY_JMUNCH_PREFETCH_LIMIT`, default 12) and a permissive
-  `min_score` (`MEMORY_JMUNCH_MIN_RECALL_SCORE`, default 0.0). A jmunch
-  gateway lossily compresses the agent's conversation history by
-  handle-ifying tool results, so the agent loses task detail mid-run; the
-  memory block this plugin injects is not handle-ified, so widening recall
-  pushes more task context back through that lossless channel. Resolved on
-  every recall, so jmunch confirmed mid-session takes effect from the next
-  turn. Off jmunch the standard `MEMORY_PREFETCH_LIMIT` / `min_score` are
-  untouched, and an explicitly-passed `min_score` is never overridden.
-- In jmunch mode the admission gate defaults to the `high-recall` preset
-  (when `MEMORY_ADMISSION_PRESET` is not explicitly set), so fewer
-  task-relevant candidates — notably progress `events` — are rejected
-  before they reach the store. This is the capture half of the jmunch-mode
-  compensation; the widened recall above is the surfacing half. An
-  explicitly-set preset, including `off`, is always respected.
+### Fixed
+- Task-framing memories from the start of a session are now always injected
+  into recall via **first+recent session anchors**.  Previously only the 2
+  most-recently-written memories were anchored; after 3 subsequent turns the
+  task framing (e.g. "stress test my memory") was no longer in the anchor
+  window.  Relevance search alone cannot recover it when the current query is
+  semantically distant, so the agent appeared to "forget" its goal at turn 4.
+  `_do_recall` now combines the 2 oldest *and* 2 newest session memories as
+  anchors (deduplicated against each other and the relevance results).
+- Added `MemoryStore.first_for_session()` — same shape as `recent_for_session`
+  but returns oldest-first, giving callers direct access to session-start
+  entries.
+- `MemoryStore._load_embedder()` is now guarded by a threading lock (double-
+  checked locking pattern) to prevent two concurrent threads (warmup + first
+  sync_turn write) from each loading the embedding model independently.
+- `_flush_pending_write` default timeout increased from 1 s to 2 s to give
+  the previous turn's write a wider window to complete before recall runs.
 
 ---
 
-## [0.11.5] — 2026-05-21
+## [0.11.7] — 2026-05-20
 
 ### Fixed
-- File-descriptor exhaustion under sustained write load. Every `store()`,
-  `store_many()`, `store_raw()`, and supersede wrote a new on-disk LanceDB
-  fragment, and every read has to open every fragment of the table's
-  current version — so a store that had absorbed thousands of single-row
-  writes opened thousands of files per query, exhausted `ulimit -n`, and
-  degraded catastrophically (inserts and searches slowed to a crawl and
-  timed out). The store now compacts automatically: after every
-  `MEMORY_AUTO_OPTIMIZE_EVERY` fragment-creating writes (default 256) it
-  merges the small fragments into a few large files and refreshes the FTS
-  and vector indexes. A 2,500-insert run at `ulimit -n 256` that previously
-  stalled past ~2,000 rows now completes without degradation.
+- `on_memory_write` now implements `edit` and `delete` actions and supports
+  `replace_all=True` bulk mutation.  Previously both actions were stubs that
+  logged a warning and returned, leaving the LanceDB store out of sync with
+  hermes-agent's built-in memory after any `/memory edit` or `/memory delete`
+  command.
+- `edit`: BM25-searches for memories whose text contains the `target` string,
+  then supersedes each match with `content` (the new text).  Without
+  `replace_all=True` only the single best match is updated; with it every
+  matching entry is superseded.
+- `delete`: same BM25 lookup, then soft-archives each match (marks
+  `state=archived`) so the rows are hidden from future recalls but preserved
+  in the audit trail.
+- `replace_all` key is no longer forwarded into the stored metadata on `add`
+  writes (it was a no-op scalar that polluted the metadata blob).
 
-### Added
-- `MemoryStore.optimize()` — public, best-effort fragment compaction. Safe
-  to call manually (e.g. from a scheduled maintenance job) or concurrently
-  with reads and writes; the write path also calls it automatically.
-- `MEMORY_AUTO_OPTIMIZE_EVERY` environment variable — number of
-  fragment-creating writes between automatic compactions (default 256; set
-  to 0 to disable).
+---
+
+## [0.11.6] — 2026-05-20
+
+### Fixed
+- Cold-start write/read race: `prefetch` and `before_prompt_build` now call
+  `_flush_pending_write()` before querying, joining the previous `sync_turn`
+  background thread (1 s timeout). On a brand-new install the embedding model
+  takes 10–30 s to load on first use; without the flush the recall for the
+  first several turns returned empty because the turn-N write hadn't finished
+  before the turn-N+1 read. Task framing stored in turn 1 is now visible from
+  turn 2 onwards.
+- Recency anchors in `_do_recall`: the 2 most-recently-written session memories
+  are appended to relevance results (deduplicated). Relevance-only retrieval
+  misses earlier task framing when the current query is semantically distant
+  (e.g. "check slot 7" scores low against "stress test my memory"), causing the
+  agent to lose its goal after context compression.
+- `_raw_sync_turn` no longer stores raw assistant responses. They are verbose
+  agent-side text that created a feedback loop: an early greeting stored in the
+  fallback path would survive the retrieval-time noise filter, get re-injected
+  after context compression, and cause the agent to re-greet. Only user-side
+  content is now stored, and only after passing the `is_noise` check.
+
+---
+
+## [0.11.5] — 2026-05-20
+
+### Removed
+- `hermes-memory` console script alias removed. It looked like a generic
+  system-level command and shadowed unrelated tools. Use
+  `hermes-memory-lancedb-pro` instead. If you have a stale system install
+  run `pip uninstall hermes-memory-lancedb-pro` and reinstall via hermes-pip.
+
+### Fixed
+- `plugin.yaml` now declares `kind: memory` so `PluginManager` routes the
+  plugin to the memory manager instead of the generic standalone loader.
+  Without this field the loader called `ctx.register()` on a context that
+  lacked `register_memory_provider()`, crashing with an `AttributeError`.
+- `_resolve_hermes_home()` default corrected from `~/.hermes` to
+  `~/.hermes/hermes-agent/` to match the actual hermes-agent installation
+  layout; `--hermes-home` help strings updated accordingly.
+- `MemoryStore.get_by_id()` now follows the `superseded_by` chain when the
+  requested row is archived, returning the current live version instead of
+  the stale archived one. Callers that explicitly want the archived row can
+  pass `follow_chain=False`. A depth limit of 32 guards against malformed
+  chains.
+- Development branch renamed from `claude/restructure-repo-branches-BiSQH`
+  to `fix/0.11.5` to remove tooling-generated names from the public
+  branch list.
 
 ---
 
@@ -80,8 +110,9 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upgrading from pre-0.11.1 don't need to manually move the directory.
 - `uninstall-plugin` also removes the old `plugins/lancedb_pro/` directory
   when found, as part of the same migration cleanup.
-- Stale remote feature branches that contained outdated commit history
-  were overwritten to point to clean main history.
+- Stale remote branches (`claude/restructure-repo-branches-BiSQH`,
+  `feat/spec-compliance`) that contained old commit messages with AI
+  session URLs were overwritten to point to clean main history.
 
 ---
 

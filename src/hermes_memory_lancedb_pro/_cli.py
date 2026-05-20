@@ -520,13 +520,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
 
 def _resolve_hermes_home(explicit: str | None) -> Path:
-    """Pick the hermes profile dir: explicit arg > $HERMES_HOME > ~/.hermes."""
+    """Pick the hermes profile dir: explicit arg > $HERMES_HOME > ~/.hermes/hermes-agent."""
     if explicit:
         return Path(explicit).expanduser().resolve()
     env = os.environ.get("HERMES_HOME", "").strip()
     if env:
         return Path(env).expanduser().resolve()
-    return Path.home() / ".hermes"
+    return Path.home() / ".hermes" / "hermes-agent"
 
 
 def _packaged_plugin_yaml() -> Path:
@@ -697,7 +697,7 @@ def main() -> int:
         "--hermes-home",
         default=None,
         metavar="PATH",
-        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes)",
+        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes/hermes-agent)",
     )
     p_install.add_argument(
         "--force",
@@ -721,7 +721,7 @@ def main() -> int:
         "--hermes-home",
         default=None,
         metavar="PATH",
-        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes)",
+        help="Hermes profile dir (default: $HERMES_HOME or ~/.hermes/hermes-agent)",
     )
     p_uninstall.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS,
                              help=argparse.SUPPRESS)
