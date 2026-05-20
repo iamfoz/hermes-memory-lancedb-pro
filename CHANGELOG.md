@@ -7,6 +7,58 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.43] — 2026-05-21
+
+Consolidation release. `main` now carries two development lines that had
+diverged: the durable-task and recall-stability fixes (0.11.7–0.11.42) and
+the jmunch gateway integration. Granular detail is in the per-commit
+history; the headline changes are below.
+
+### Added
+- jmunch gateway detection (`hermes_memory_lancedb_pro.jmunch`).
+  `is_jmunch_in_use()` reports whether a jmunch gateway is in the LLM
+  path. Detection is two-stage and creates no code dependency on
+  jmunch-mcp: it is confirmed passively from the `X-Jmunch-Gateway`
+  response header that jmunch >= 0.3.0 stamps on every reply (works on
+  any port; latched by `record_response_headers()`), and can also be
+  declared up front via `MEMORY_JMUNCH_MODE=true` so the startup-time
+  tuning is correct before the first response arrives.
+- The memory extractor's LLM calls send `X-Jmunch-Inject: false` and
+  `X-Jmunch-Handleify: false` when jmunch is in use, making the gateway a
+  pure pass-through for those calls — no verb injection, no
+  handle-ification — so the extractor sees full-fidelity tool content.
+  Both headers are inert on any non-jmunch endpoint. A warning is logged
+  if a jmunch gateway older than 0.3.0 (which ignores `X-Jmunch-Handleify`)
+  is observed.
+- In jmunch mode the provider widens memory recall — a higher prefetch
+  limit (`MEMORY_JMUNCH_PREFETCH_LIMIT`, default 12) and a permissive
+  `min_score` (`MEMORY_JMUNCH_MIN_RECALL_SCORE`, default 0.0) — and the
+  admission gate defaults to the `high-recall` preset. A jmunch gateway
+  handle-ifies tool results, lossily compressing the agent's history; the
+  injected memory block is not handle-ified, so widening recall and
+  loosening admission push task context back through that lossless
+  channel. Recall widening is resolved per recall, so jmunch confirmed
+  mid-session takes effect from the next turn. Off jmunch — and when a
+  preset or `min_score` is set explicitly — nothing changes.
+- `MemoryStore.optimize()` — public, best-effort LanceDB fragment
+  compaction, plus `MEMORY_AUTO_OPTIMIZE_EVERY` (default 256; 0 disables)
+  controlling how often the write path compacts automatically.
+
+### Fixed
+- File-descriptor exhaustion under sustained write load. Every write wrote
+  a new on-disk LanceDB fragment, and every read opens every fragment, so
+  a store with thousands of single-row writes exhausted `ulimit -n` and
+  degraded catastrophically. The write path now funnels through a single
+  helper that compacts small fragments automatically and raises an
+  actionable error if the descriptor limit is still hit.
+- Consolidates the 0.11.7–0.11.42 fixes now on `main`: durable-task
+  protocol delivery, session anchors surviving context compaction, the
+  greeting-replay loop, active-task attribution, plugin discovery-path
+  correction, and a hard per-memory size cap on the recall block. See the
+  commit history for per-fix detail.
+
+---
+
 ## [0.11.23] — 2026-05-21
 
 ### Fixed
