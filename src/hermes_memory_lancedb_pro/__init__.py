@@ -18,19 +18,6 @@ __version__ = "0.11.43"
 # Reflection layer (PR 2). Pure-Python; the storage adapter delegates to
 # MemoryStore but only the orchestrator imports from `..store` lazily.
 from . import reflection  # noqa: F401
-from .task_ledger import (  # noqa: F401
-    TASK_ROOT,
-    advance_iteration,
-    append_jsonl,
-    atomic_write_json,
-    build_control_block,
-    complete_task,
-    create_task,
-    list_tasks,
-    load_state,
-    looks_like_reset,
-    save_state,
-)
 from .batch_dedup import (  # noqa: F401
     BatchDedupResult,
     ExtractionCostStats,
@@ -105,6 +92,19 @@ from .smart_metadata import (  # noqa: F401
     parse_support_info,
     stringify_smart_metadata,
     update_support_stats,
+)
+from .task_ledger import (  # noqa: F401
+    TASK_ROOT,
+    advance_iteration,
+    append_jsonl,
+    atomic_write_json,
+    build_control_block,
+    complete_task,
+    create_task,
+    list_tasks,
+    load_state,
+    looks_like_reset,
+    save_state,
 )
 from .temporal_classifier import (  # noqa: F401
     TemporalType,

@@ -440,6 +440,7 @@ class TestRateLimiter:
         """When the rate limiter is already saturated the extractor must fall
         back to legacy writes without calling the LLM."""
         from unittest.mock import MagicMock
+
         from hermes_memory_lancedb_pro.smart_extractor import SmartExtractor
 
         store = MagicMock()
@@ -466,6 +467,7 @@ class TestRateLimiter:
     def test_rate_limiter_records_on_llm_use(self):
         """Each successful LLM pipeline run must increment the rate limiter."""
         from unittest.mock import MagicMock
+
         from hermes_memory_lancedb_pro.smart_extractor import SmartExtractor
 
         store = MagicMock()

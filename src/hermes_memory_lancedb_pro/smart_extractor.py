@@ -1167,6 +1167,7 @@ class SmartExtractor:
         is swallowed so the audit path never breaks the main pipeline."""
         try:
             from dataclasses import asdict
+
             from .admission_control import (
                 AdmissionRejectionAuditEntry,
                 append_rejection_audit,
