@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import task_ledger as _tl
 from ._sql import parse_metadata as _parse_metadata
 from .store import (
     DEFAULT_DB_PATH,
@@ -460,6 +461,8 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
     cmd = getattr(args, "lancedb_pro_command", None)
     if cmd is None:
         return 0
+    if cmd == "task":
+        return _cmd_task_dispatch(args)
     return {
         "init": _cmd_init,
         "export": _cmd_export,
@@ -559,6 +562,18 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
+
+    p_task = subs.add_parser(
+        "task",
+        help="Manage durable task ledgers for long-running agent work",
+        description=(
+            "Task ledgers keep objective, iteration counter, and next_action in "
+            "state.json outside the LLM context window.  The runner re-reads "
+            "state.json each iteration so context compaction cannot lose progress."
+        ),
+    )
+    _add_task_subparsers(p_task, dest="task_command")
+    p_task.set_defaults(func=_cmd_task_dispatch)
 
     subparser.set_defaults(func=_dispatch_plugin_cli)
 
@@ -862,6 +877,265 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Task ledger subcommands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_task_create(args: argparse.Namespace) -> int:
+    """Create a new task ledger."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: --id is required", file=sys.stderr)
+        return 1
+    objective = getattr(args, "objective", None) or ""
+    iterations = getattr(args, "iterations", None)
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.create_task(task_id, objective, target_iterations=iterations, root=root)
+        if not quiet:
+            state_path = _tl._state_path(task_id, root)
+            print(f"Created task {task_id!r}")
+            print(f"  State: {state_path}")
+            print(f"  Objective: {state['objective']}")
+            if state["target_iterations"] is not None:
+                print(f"  Target iterations: {state['target_iterations']}")
+        return 0
+    except FileExistsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_list(args: argparse.Namespace) -> int:
+    """List all task ledgers."""
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    tasks = _tl.list_tasks(root)
+    if not tasks:
+        print("No tasks found.")
+        return 0
+    for t in tasks:
+        status = t.get("status", "?")
+        current = t.get("current_iteration", 0)
+        target = t.get("target_iterations")
+        iter_str = f"{current}/{target}" if target is not None else str(current)
+        print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}")
+    return 0
+
+
+def _cmd_task_show(args: argparse.Namespace) -> int:
+    """Show detailed task state."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    try:
+        state = _tl.load_state(task_id, root)
+        print(json.dumps(state, indent=2))
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_resume(args: argparse.Namespace) -> int:
+    """Print the ACTIVE TASK CONTROL BLOCK for resuming a task."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    try:
+        state = _tl.load_state(task_id, root)
+        print(_tl.build_control_block(state))
+        results_path = _tl._task_dir(task_id, root) / "results.jsonl"
+        if results_path.exists():
+            lines = results_path.read_text(encoding="utf-8").splitlines()
+            passed = sum(1 for ln in lines if json.loads(ln).get("result") == "pass")
+            failed = len(lines) - passed
+            print(f"Results so far: {len(lines)} (pass={passed}, fail={failed})")
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_complete(args: argparse.Namespace) -> int:
+    """Mark a task as complete."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    summary = getattr(args, "summary", "") or ""
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        _tl.complete_task(task_id, summary=summary, root=root)
+        if not quiet:
+            print(f"Task {task_id!r} marked complete.")
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_pin(args: argparse.Namespace) -> int:
+    """Pin the active task control block as a memory so it is always recalled.
+
+    Stores the current control block text as a memory with category='active_task'.
+    Active-task memories are always prepended to the recall block regardless of
+    relevance score, so the task state survives context compaction.
+    """
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.load_state(task_id, root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+    control_block = _tl.build_control_block(state)
+    state_path = str(_tl._state_path(task_id, root))
+    store = _open_store(args)
+    meta = {"task_id": task_id, "state_path": state_path, "priority": "must_include"}
+    mem_id = store.store(
+        text=control_block,
+        category="active_task",
+        scope="global",
+        importance=1.0,
+        metadata_extra=meta,
+    )
+    if not quiet:
+        print(f"Pinned task {task_id!r} as memory {mem_id}")
+        print("  Category: active_task (always recalled first)")
+    return 0
+
+
+def _cmd_task_advance(args: argparse.Namespace) -> int:
+    """Record one completed iteration and advance the task counter.
+
+    Increments ``current_iteration``, appends a result to ``results.jsonl``,
+    and updates ``next_action`` in ``state.json``.  Because the memory plugin
+    reloads ``state.json`` on every recall, the model will see the updated
+    iteration count and next_action on the very next turn — no re-pin needed.
+    """
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    result = getattr(args, "result", "pass") or "pass"
+    next_action = getattr(args, "next_action", None) or None
+    summary = getattr(args, "summary", None) or None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.advance_iteration(
+            task_id,
+            result=result,
+            next_action=next_action,
+            summary=summary,
+            root=root,
+        )
+        if not quiet:
+            current = state["current_iteration"]
+            target = state.get("target_iterations")
+            iter_str = f"{current}/{target}" if target is not None else str(current)
+            print(f"Task {task_id!r}: iteration advanced to {iter_str}")
+            print(f"  Next action: {state['next_action']}")
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_dispatch(args: argparse.Namespace) -> int:
+    """Dispatch task sub-subcommands."""
+    sub = getattr(args, "task_command", None)
+    if sub is None:
+        print("Usage: ... task <create|list|show|resume|advance|complete|pin>")
+        return 0
+    return {
+        "create": _cmd_task_create,
+        "list": _cmd_task_list,
+        "show": _cmd_task_show,
+        "resume": _cmd_task_resume,
+        "advance": _cmd_task_advance,
+        "complete": _cmd_task_complete,
+        "pin": _cmd_task_pin,
+    }.get(sub, lambda _: 0)(args)
+
+
+def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_command") -> None:
+    """Wire task sub-subcommands onto *parent*. Shared by main() and register_cli()."""
+    tsubs = parent.add_subparsers(dest=dest)
+
+    p_create = tsubs.add_parser("create", help="Create a new task ledger")
+    p_create.add_argument("--id", dest="task_id", required=True, metavar="TASK_ID",
+                          help="Unique task identifier")
+    p_create.add_argument("--objective", default="", metavar="TEXT",
+                          help="One-line task objective")
+    p_create.add_argument("--iterations", type=int, default=None, metavar="N",
+                          help="Target iteration count (optional)")
+    p_create.add_argument("--task-root", default=None, metavar="PATH",
+                          help="Task root dir (default: ~/.hermes/workspace/tasks)")
+    p_create.add_argument("-q", "--quiet", action="store_true")
+
+    tsubs.add_parser("list", help="List all task ledgers").add_argument(
+        "--task-root", default=None, metavar="PATH"
+    )
+
+    p_show = tsubs.add_parser("show", help="Show task state as JSON")
+    p_show.add_argument("task_id", metavar="TASK_ID")
+    p_show.add_argument("--task-root", default=None, metavar="PATH")
+
+    p_resume = tsubs.add_parser("resume", help="Print the task control block for re-orienting")
+    p_resume.add_argument("task_id", metavar="TASK_ID")
+    p_resume.add_argument("--task-root", default=None, metavar="PATH")
+
+    p_advance = tsubs.add_parser(
+        "advance",
+        help="Record a completed iteration and increment the counter",
+    )
+    p_advance.add_argument("task_id", metavar="TASK_ID")
+    p_advance.add_argument("--result", default="pass", choices=["pass", "fail"],
+                           help="Iteration result (default: pass)")
+    p_advance.add_argument("--next-action", dest="next_action", default=None, metavar="TEXT",
+                           help="Override the auto-generated next_action string")
+    p_advance.add_argument("--summary", default=None, metavar="TEXT",
+                           help="Short summary of what happened in this iteration")
+    p_advance.add_argument("--task-root", default=None, metavar="PATH")
+    p_advance.add_argument("-q", "--quiet", action="store_true")
+
+    p_complete = tsubs.add_parser("complete", help="Mark a task as complete")
+    p_complete.add_argument("task_id", metavar="TASK_ID")
+    p_complete.add_argument("--summary", default="", metavar="TEXT",
+                            help="Short completion summary")
+    p_complete.add_argument("--task-root", default=None, metavar="PATH")
+    p_complete.add_argument("-q", "--quiet", action="store_true")
+
+    p_pin = tsubs.add_parser(
+        "pin",
+        help="Store task control block as an always-recalled active_task memory",
+    )
+    p_pin.add_argument("task_id", metavar="TASK_ID")
+    p_pin.add_argument("--path", default=None, metavar="PATH",
+                       help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_pin.add_argument("--task-root", default=None, metavar="PATH")
+    p_pin.add_argument("-q", "--quiet", action="store_true")
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1184,19 @@ def main() -> int:
                          help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
+
+    # ---- task ----
+    p_task = subparsers.add_parser(
+        "task",
+        help="Manage durable task ledgers for long-running agent work",
+        description=(
+            "Task ledgers keep objective, iteration counter, and next_action in "
+            "state.json outside the LLM context window so context compaction "
+            "cannot lose progress."
+        ),
+    )
+    _add_task_subparsers(p_task, dest="task_command")
+    p_task.set_defaults(func=_cmd_task_dispatch)
 
     # ---- doctor ----
     p_doctor = subparsers.add_parser(
@@ -1006,6 +1293,7 @@ def main() -> int:
         return 0
 
     dispatch = {
+        "task": _cmd_task_dispatch,
         "init": _cmd_init,
         "reset": _cmd_reset,
         "doctor": _cmd_doctor,

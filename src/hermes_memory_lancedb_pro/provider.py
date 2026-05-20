@@ -30,6 +30,7 @@ That's all hermes-agent's plugin discovery needs. The provider:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -48,6 +49,7 @@ from .memory_compactor import (
 )
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
 from .store import MemoryStore
+from .task_ledger import build_control_block as _build_task_control_block
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,154 @@ _ADMISSION_PRESET_EXPLICIT: bool = "MEMORY_ADMISSION_PRESET" in os.environ
 _EXTRACTION_RATE_LIMIT: int = int(
     os.environ.get("MEMORY_EXTRACTION_RATE_LIMIT", "0")
 )
+
+# ---------------------------------------------------------------------------
+# Recall guardrails
+# ---------------------------------------------------------------------------
+# Categories that are NEVER injected into the recall block regardless of score.
+# Comma-separated; e.g. MEMORY_NEVER_CATEGORIES=greeting,ephemeral_chat,old_task_state
+_RECALL_NEVER_CATEGORIES: frozenset[str] = frozenset(
+    c.strip()
+    for c in os.environ.get("MEMORY_NEVER_CATEGORIES", "greeting,ephemeral_chat").split(",")
+    if c.strip()
+)
+# Approximate character budget for the full recall block injected each turn.
+# chars / 4 ≈ tokens, so the default 4800 ≈ 1200 tokens.  Set 0 to disable.
+_RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800"))
+# When True, memories with category="active_task" are pinned to the front of
+# the recall block and bypass the never-categories filter and char budget.
+# This ensures long-running task state is always in context.
+_RECALL_ACTIVE_TASK_PIN: bool = os.environ.get(
+    "MEMORY_ACTIVE_TASK_PIN", "on"
+).strip().lower() not in ("off", "0", "false", "no")
+# When True, the full durable-task protocol is prepended to every recall
+# block so the model always knows how to manage multi-step work — without
+# requiring an explicit skill invocation.  Set MEMORY_TASK_PROTOCOL=off to
+# silence (e.g. in automated pipelines that manage the ledger externally).
+_RECALL_TASK_PROTOCOL: bool = os.environ.get(
+    "MEMORY_TASK_PROTOCOL", "on"
+).strip().lower() not in ("off", "0", "false", "no")
+
+# Full durable-task protocol injected every turn when _RECALL_TASK_PROTOCOL
+# is True.  This is the exact content of skills/durable-task/SKILL.md — the
+# compact summary was not sufficient to prevent Hello-loop failures; the full
+# text (triggers, step-by-step commands, recovery, invariants, example) is
+# required for reliable behaviour.
+_TASK_PROTOCOL_TEXT = """\
+# Durable Task Protocol
+
+Use this protocol for any task that takes more than 3 sequential steps or tool calls.
+It ensures progress survives context compaction, session restarts, and model resets
+by keeping state in a file on disk rather than in the conversation.
+
+## When to use this protocol
+
+Trigger this protocol whenever:
+
+- The user asks to run a test suite, benchmark, stress test, or any iterative work
+- The user asks you to "keep going", "run N iterations", or "repeat until done"
+- You expect to make more than 3 tool calls to complete the task
+- You are resuming a task after receiving a greeting or context reset
+
+## Protocol
+
+### Step 1 — Create the task ledger
+
+Before touching anything else, create a task ledger:
+
+```bash
+hermes-memory-lancedb-pro task create \\
+  --id <task-id> \\
+  --objective "<clear one-line objective>" \\
+  --iterations <N>
+```
+
+Choose a task ID that is unique and descriptive, e.g. `stress-test-2026-05-20`.
+If --iterations is unknown, omit it.
+
+### Step 2 — Pin it to memory
+
+```bash
+hermes-memory-lancedb-pro task pin <task-id>
+```
+
+This stores the task state in the memory database. The memory plugin reloads
+state.json on every turn, so the model always sees the current iteration and
+next action — even after context compaction wipes the conversation history.
+
+You only need to pin once. The pin does not need to be refreshed as the task
+advances; the plugin reads state.json live.
+
+### Step 3 — Before each iteration
+
+Read the current state before doing any work:
+
+```bash
+hermes-memory-lancedb-pro task resume <task-id>
+```
+
+Confirm the task ID, objective, current_iteration, and next_action are correct.
+
+### Step 4 — Do the work
+
+Execute one bounded step. Do not attempt multiple iterations in a single response.
+One step = one advance.
+
+### Step 5 — After each iteration
+
+Record the result and advance the counter:
+
+```bash
+hermes-memory-lancedb-pro task advance <task-id> \\
+  --result pass \\
+  --next-action "Run iteration <N+1>." \\
+  --summary "<one sentence: what happened>"
+```
+
+Use --result fail if the step errored. Always set --next-action explicitly
+so the next turn knows exactly what to do without re-reading the whole history.
+
+### Step 6 — Check stopping condition
+
+After advance, check whether the task is complete:
+
+```bash
+hermes-memory-lancedb-pro task show <task-id>
+```
+
+If current_iteration >= target_iterations, or the objective is met:
+
+```bash
+hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
+```
+
+Then report results to the user.
+
+## Recovery after a reset or greeting
+
+If you find yourself about to greet the user, or if context is unclear:
+
+1. Check for a running task first:
+   hermes-memory-lancedb-pro task list
+
+2. If a running task exists, resume it:
+   hermes-memory-lancedb-pro task resume <task-id>
+
+3. Continue from next_action. Do not re-introduce yourself. Do not ask
+   the user what you were doing. The state file is the source of truth.
+
+## Invariants
+
+These rules apply for the entire lifetime of a running task:
+
+- Do not greet the user.
+- Do not restart the conversation.
+- Do not ask the user what you were doing — read state.json.
+- Before each iteration: confirm state with task resume.
+- After each iteration: update state with task advance.
+- If task list shows a running task: continue it, do not start a new one.
+- If blockers appear: record them with task advance --result fail and report.\
+"""
 
 
 def _extract_message_texts(messages: Any) -> list[str]:
@@ -490,6 +640,103 @@ def _format_recall(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else ""
 
 
+def _apply_recall_guardrails(
+    results: list[dict[str, Any]],
+    never_categories: frozenset[str],
+    char_budget: int,
+    pin_active_tasks: bool,
+) -> list[dict[str, Any]]:
+    """Filter and reorder recall results per guardrail configuration.
+
+    Order of operations:
+    1. Split out ``active_task`` pinned memories (immune to all filters).
+    2. Drop memories in ``never_categories`` from the remainder.
+    3. Enforce the char budget (approximate token budget) on the remainder.
+    4. Return pinned first, then budgeted rest.
+
+    Pinned memories always appear at the top of the recall block so an
+    active task control block is never crowded out by unrelated memories.
+    """
+    if pin_active_tasks:
+        pinned = [r for r in results if r.get("category") == "active_task"]
+        rest = [r for r in results if r.get("category") != "active_task"]
+    else:
+        pinned, rest = [], list(results)
+
+    if never_categories:
+        rest = [
+            r for r in rest
+            if (r.get("category") or "other") not in never_categories
+        ]
+
+    if char_budget > 0 and rest:
+        budget = char_budget
+        budgeted: list[dict[str, Any]] = []
+        for r in rest:
+            cost = len(r.get("text") or "") + 60  # ~60 chars overhead per formatted line
+            if budget < cost and budgeted:
+                logger.debug(
+                    "lancedb_pro recall budget exhausted after %d items; %d dropped",
+                    len(budgeted),
+                    len(rest) - len(budgeted),
+                )
+                break
+            budget -= cost
+            budgeted.append(r)
+        rest = budgeted
+
+    return pinned + rest
+
+
+def _refresh_active_task_memories(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """For pinned active_task memories that carry a state_path, reload the control
+    block text from disk on every recall.
+
+    Without this, the pinned text is the snapshot from when ``task pin`` was run.
+    After ``advance_iteration`` increments the counter, the recall block shows a
+    stale iteration number.  More importantly, this makes the active task block
+    survive context compaction: even after compaction wipes the conversation history,
+    ``before_prompt_build`` still injects the *current* control block from
+    ``state.json`` so the model always knows what iteration it is on and what to
+    do next.
+    """
+    refreshed = []
+    for r in results:
+        if r.get("category") != "active_task":
+            refreshed.append(r)
+            continue
+        try:
+            meta_raw = r.get("metadata") or "{}"
+            meta: dict[str, Any] = (
+                json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+            )
+            state_path = meta.get("state_path")
+            if not state_path:
+                refreshed.append(r)
+                continue
+            expanded = os.path.expanduser(str(state_path))
+            if not os.path.exists(expanded):
+                logger.debug(
+                    "lancedb_pro active_task state_path missing: %s", expanded
+                )
+                refreshed.append(r)
+                continue
+            with open(expanded, encoding="utf-8") as fh:
+                state = json.load(fh)
+            refreshed.append({**r, "text": _build_task_control_block(state)})
+            logger.debug(
+                "lancedb_pro refreshed active_task memory from %s (iter %s)",
+                expanded,
+                state.get("current_iteration"),
+            )
+        except Exception as exc:
+            logger.debug("lancedb_pro active_task refresh failed: %s", exc)
+            refreshed.append(r)
+    return refreshed
+
+
 def _maybe_auto_purge(store: MemoryStore) -> None:
     """Run purge_archived() if the cooldown has elapsed since the last run.
 
@@ -762,7 +1009,14 @@ def _build_provider_class():
             corresponding window.  Session anchors bypass this filter so
             task-framing memories are always present."""
             if not query or not query.strip():
-                return ""
+                # No query to recall against — this happens when
+                # before_prompt_build is called to assemble the
+                # query-independent system prompt. The task protocol is
+                # static guidance that does NOT depend on the query, so it
+                # must still be injected here; returning "" would drop it
+                # from the system prompt entirely (the v0.11.20–0.11.22 bug
+                # where the protocol text never reached the model).
+                return _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
             limit, min_score = _effective_recall_config(
                 self._prefetch_limit,
                 self._min_score,
@@ -808,6 +1062,11 @@ def _build_provider_class():
             # recency window after turn 3 and is only recoverable by relevance
             # search, which fails when the current query is semantically
             # distant (e.g. "check slot 7" vs "stress test my memory").
+            #
+            # Anchors are filtered by noise and minimum length so trivial
+            # exchanges ("Hello", "OK", single-word acks) are never re-injected
+            # as session context — the classic cause of the greeting-replay bug
+            # where the model echoes turn-1 "Hello" on every subsequent turn.
             if session_id:
                 try:
                     existing_ids = {r.get("id") for r in results}
@@ -817,12 +1076,46 @@ def _build_provider_class():
                     extra_anchors = []
                     for m in first_anchors + recent_anchors:
                         mid = m.get("id")
-                        if mid not in seen:
-                            extra_anchors.append(m)
+                        if mid in seen:
+                            continue
+                        # Skip noise: too short or flagged by the decay noise filter.
+                        text = (m.get("text") or "").strip()
+                        if len(text) < 20 or _is_noise(text):
+                            logger.debug(
+                                "lancedb_pro: skipping noise/short anchor %s (%d chars)",
+                                mid,
+                                len(text),
+                            )
                             seen.add(mid)
+                            continue
+                        extra_anchors.append(m)
+                        seen.add(mid)
                     results = results + extra_anchors
                 except Exception as e:
                     logger.debug("lancedb_pro session anchor lookup failed: %s", e)
+
+            # Recall guardrails — pin active-task memories first, drop
+            # never-categories, enforce char/token budget.
+            results = _apply_recall_guardrails(
+                results,
+                _RECALL_NEVER_CATEGORIES,
+                _RECALL_CHAR_BUDGET,
+                _RECALL_ACTIVE_TASK_PIN,
+            )
+
+            # Reload active_task control blocks from state.json so the injected
+            # text always reflects the current iteration — not a stale snapshot.
+            # This is the primary defence against post-compaction greeting-replay:
+            # even after the conversation history is wiped, the model still sees
+            # the current task objective and next_action in the system prompt.
+            results = _refresh_active_task_memories(results)
+
+            logger.debug(
+                "lancedb_pro recall: injecting %d items [%s] for session %s",
+                len(results),
+                ", ".join(r.get("category", "?") for r in results),
+                session_id or "global",
+            )
 
             if results and session_id:
                 with self._pending_lock:
@@ -832,9 +1125,9 @@ def _build_provider_class():
 
             recall_block = _format_recall(results)
             reflection_block = self._reflection_block(session_id)
-            if reflection_block and recall_block:
-                return f"{reflection_block}\n{recall_block}"
-            return reflection_block or recall_block
+            protocol_block = _TASK_PROTOCOL_TEXT if _RECALL_TASK_PROTOCOL else ""
+            parts = [p for p in [protocol_block, reflection_block, recall_block] if p]
+            return "\n\n".join(parts)
 
         def _reflection_block(self, session_id: str) -> str:
             """Return the formatted reflection-recall block for this
