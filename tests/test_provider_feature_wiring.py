@@ -132,6 +132,22 @@ class TestPureHelpers:
         assert provider._first_user_text([{"role": "assistant", "content": "x"}]) == ""
         assert provider._first_user_text([]) == ""
 
+    def test_stable_task_block_omits_per_iteration_fields(self):
+        state = {
+            "task_id": "t1", "objective": "Do the thing", "status": "running",
+            "current_iteration": 7, "next_action": "step eight",
+            "recent_summary": "did stuff",
+        }
+        block = provider._stable_task_block(state)
+        assert "Do the thing" in block
+        assert "t1" in block
+        assert "do NOT greet" in block
+        # Per-iteration fields must be absent — including them would mutate
+        # the cached system prompt on every `task advance`.
+        assert "7" not in block
+        assert "step eight" not in block
+        assert "did stuff" not in block
+
 
 def test_build_reflection_prompt_contains_transcript_and_json_keys():
     from hermes_memory_lancedb_pro.extraction_prompts import build_reflection_prompt
@@ -141,6 +157,30 @@ def test_build_reflection_prompt_contains_transcript_and_json_keys():
     assert "invariants" in prompt
     assert "derived" in prompt
     assert "JSON" in prompt
+
+
+def test_refresh_active_task_stable_vs_live(tmp_path):
+    """stable=True omits per-iteration fields; the default keeps the full
+    live control block (current iteration / next action)."""
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    task_root = tmp_path / "tasks"
+    tl.create_task(
+        "t-x", objective="The objective", target_iterations=3, root=task_root
+    )
+    tl.advance_iteration("t-x", next_action="the next action", root=task_root)
+    state_path = str(tl._state_path("t-x", task_root))
+    mem = {
+        "category": "active_task", "text": "pinned snapshot",
+        "metadata": {"task_id": "t-x", "state_path": state_path},
+    }
+    live = provider._refresh_active_task_memories([dict(mem)])[0]["text"]
+    stable = provider._refresh_active_task_memories(
+        [dict(mem)], stable=True
+    )[0]["text"]
+    assert "the next action" in live
+    assert "the next action" not in stable
+    assert "The objective" in stable
 
 
 # ---------------------------------------------------------------------------
@@ -426,75 +466,70 @@ class TestJmunchRecallTuning:
 
 
 # ---------------------------------------------------------------------------
-# on_memory_write — edit / delete / replace_all
+# on_memory_write — mirror built-in memory tool add / replace writes
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-class TestOnMemoryWriteEditDelete:
-    """on_memory_write edit and delete actions must mutate the LanceDB store."""
+class TestOnMemoryWrite:
+    """on_memory_write mirrors built-in memory tool writes. Per the host
+    contract (agent/tool_executor.py) it is called only for `add` and
+    `replace`, with the NEW content and a `memory`/`user` target."""
 
     def _provider(self, provider_cls, store):
         p = provider_cls(store=store, auto_smart_extraction=False)
         p.initialize("sess-1")
         return p
 
-    def test_add_stores_memory(self, provider_cls, real_store):
+    def test_add_user_target_stored_as_preference(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
         p.on_memory_write("add", "user", "The user loves cycling")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert any("cycling" in t for t in texts)
+        assert len(rows) == 1
+        assert "cycling" in rows[0]["text"]
+        assert rows[0]["category"] == "preference"
+        assert rows[0]["scope"] == "user"
 
-    def test_edit_supersedes_matching_memory(self, provider_cls, real_store):
+    def test_add_memory_target_stored_as_agent_scope(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "The user loves cycling")
-        p.on_memory_write("edit", "The user loves cycling", "The user loves running")
+        p.on_memory_write("add", "memory", "The build uses pnpm, not npm")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert any("running" in t for t in texts)
-        assert not any(t == "The user loves cycling" for t in texts), (
-            "old text should be archived, not visible in list_memories"
-        )
+        assert len(rows) == 1
+        assert "pnpm" in rows[0]["text"]
+        assert rows[0]["scope"] == "agent"
 
-    def test_delete_archives_matching_memory(self, provider_cls, real_store):
+    def test_replace_is_mirrored_as_new_content(self, provider_cls, real_store):
+        """The host passes only the NEW content for a `replace` (no old
+        text), so it must be stored — not silently dropped."""
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "agent", "Temporary task context")
-        p.on_memory_write("delete", "Temporary task context", "")
+        p.on_memory_write("replace", "user", "The user now prefers spaces")
         rows = real_store.list_memories(limit=50)
-        texts = [r["text"] for r in rows]
-        assert not any("Temporary task context" in t for t in texts)
+        assert len(rows) == 1
+        assert "spaces" in rows[0]["text"]
 
-    def test_edit_replace_all_updates_multiple(self, provider_cls, real_store):
+    def test_remove_action_is_ignored(self, provider_cls, real_store):
+        # The host never forwards `remove`; if it arrives we ignore it.
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "coffee preference: black")
-        p.on_memory_write("add", "user", "coffee preference: no sugar")
-        p.on_memory_write(
-            "edit",
-            "coffee preference",
-            "coffee preference: oat milk",
-            metadata={"replace_all": True},
-        )
-        rows = real_store.list_memories(limit=50)
-        updated = [r for r in rows if "oat milk" in r["text"]]
-        assert len(updated) >= 2, "both entries should be superseded with the new text"
+        p.on_memory_write("remove", "user", "something")
+        assert real_store.list_memories(limit=50) == []
 
     def test_unknown_action_is_ignored(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("replace", "target", "content")  # unknown — must not raise
+        p.on_memory_write("frobnicate", "user", "content")  # must not raise
         assert real_store.list_memories(limit=50) == []
 
-    def test_edit_empty_query_is_noop(self, provider_cls, real_store):
+    def test_empty_content_is_noop(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("edit", "", "")  # must not raise
+        p.on_memory_write("add", "user", "   ")  # must not raise
         assert real_store.list_memories(limit=50) == []
 
-    def test_add_skips_replace_all_in_metadata(self, provider_cls, real_store):
+    def test_metadata_arg_is_accepted(self, provider_cls, real_store):
+        # The host passes metadata={task_id, tool_call_id}; it must not crash.
         p = self._provider(provider_cls, real_store)
-        p.on_memory_write("add", "user", "test content", metadata={"replace_all": True})
-        rows = real_store.list_memories(limit=50)
-        assert len(rows) == 1
-        meta = rows[0].get("metadata", {})
-        assert "replace_all" not in meta, "replace_all must not be stored in row metadata"
+        p.on_memory_write(
+            "add", "memory", "a fact",
+            metadata={"task_id": "t1", "tool_call_id": "tc1"},
+        )
+        assert len(real_store.list_memories(limit=50)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +629,19 @@ class TestFormatRecallFreshnessTrend:
         out = provider._format_recall([self._make_result("Alice prefers Python")])
         assert "[" not in out.split("(")[1]  # no tag after score bracket
 
+    def test_oversized_memory_is_truncated(self):
+        """A single oversized memory (e.g. a whole source file wrongly stored
+        as a memory) must never flood the recall block."""
+        huge = "X" * 50_000
+        out = provider._format_recall([self._make_result(huge)])
+        assert "[…truncated]" in out
+        assert len(out) < 2_000  # the 50KB blob never reaches the model
+
+    def test_normal_memory_not_truncated(self):
+        out = provider._format_recall([self._make_result("a short normal fact")])
+        assert "[…truncated]" not in out
+        assert "a short normal fact" in out
+
 
 # ---------------------------------------------------------------------------
 # system_prompt_block + on_pre_compress — post-compaction greeting-loop defence
@@ -604,10 +652,10 @@ class TestSystemPromptBlockAndCompaction:
     """The system-prompt hook and the pre-compaction anchor that together
     stop the model greeting after context compaction.
 
-    `system_prompt_block` is hermes-agent's authoritative per-turn
-    system-prompt hook; `on_pre_compress` fires right before compaction
-    discards old messages. `before_prompt_build` is NOT called by upstream
-    hermes-agent, so the task protocol must travel through these hooks."""
+    `system_prompt_block` is hermes-agent's authoritative system-prompt
+    hook (rebuilt at session start and after each compaction);
+    `on_pre_compress` fires right before compaction discards old
+    messages. The task protocol travels through these hooks."""
 
     def _provider(self, provider_cls, store, session="sess-1"):
         p = provider_cls(store=store, auto_smart_extraction=False)
@@ -625,7 +673,11 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="Run the stress suite to completion",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         block = p.system_prompt_block()
         assert "=== ACTIVE TASK STATE ===" in block
@@ -638,7 +690,11 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="auto anchor breadcrumb text",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         real_store.store(
             text="FORMAL PIN control block",
@@ -708,21 +764,72 @@ class TestSystemPromptBlockAndCompaction:
         real_store.store(
             text="auto anchor breadcrumb for the session",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-1"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-1",
+                "conversation_id": "sess-1",
+            },
         )
         assert "=== ACTIVE TASK STATE ===" in p.system_prompt_block()
         recall = p.prefetch("anything the user might ask")
         assert "=== ACTIVE TASK STATE ===" not in recall
         assert "auto anchor breadcrumb" not in recall
 
+    def test_system_prompt_block_stable_across_task_advance(
+        self, provider_cls, real_store, tmp_path
+    ):
+        """system_prompt_block feeds the cached system prompt (cache
+        breakpoint 1). Its output must be byte-identical across a pinned
+        task advancing an iteration — otherwise the cache is busted every
+        task turn."""
+        from hermes_memory_lancedb_pro import task_ledger as tl
+
+        task_root = tmp_path / "tasks"
+        tl.create_task(
+            "t-cache", objective="Cache stability check",
+            target_iterations=5, root=task_root,
+        )
+        state_path = str(tl._state_path("t-cache", task_root))
+        p = self._provider(provider_cls, real_store)
+        real_store.store(
+            text="pinned snapshot",
+            category="active_task", scope="global", importance=1.0,
+            metadata_extra={"task_id": "t-cache", "state_path": state_path},
+        )
+        before = p.system_prompt_block()
+        assert "Cache stability check" in before
+        assert "=== ACTIVE TASK STATE ===" in before
+        # Advance the task — current_iteration / next_action change on disk.
+        tl.advance_iteration("t-cache", next_action="do step 2", root=task_root)
+        after = p.system_prompt_block()
+        assert after == before, (
+            "system_prompt_block must not change when a pinned task advances"
+        )
+
+    def test_system_prompt_block_isolates_conversations(
+        self, provider_cls, real_store
+    ):
+        """A gateway serves many conversations from one shared store. One
+        conversation's auto-anchor must never surface in another's system
+        prompt."""
+        pa = self._provider(provider_cls, real_store, session="conv-A")
+        pa.on_pre_compress([
+            {"role": "user", "content": "Build the conv-A feature"},
+        ])
+        # A second conversation, separate provider instance, same store.
+        pb = provider_cls(store=real_store, auto_smart_extraction=False)
+        pb.initialize("conv-B")
+        block_b = pb.system_prompt_block()
+        assert "Build the conv-A feature" not in block_b
+        assert "=== ACTIVE TASK STATE ===" not in block_b
+        # conv-A still sees its own anchor.
+        assert "Build the conv-A feature" in pa.system_prompt_block()
+
 
 @pytest.mark.integration
 class TestRecallHookSeparation:
     """The durable-task protocol lives only in `system_prompt_block`; the
-    query-dependent recall hooks (`prefetch`, `before_prompt_build`) never
-    duplicate it. `before_prompt_build` is the non-standard
-    `feat/memory-provider-hooks` path — it must coexist with `prefetch`
-    without double-injecting."""
+    query-dependent recall path (`prefetch`) never duplicates it."""
 
     def _provider(self, provider_cls, store, session="sess-1"):
         p = provider_cls(store=store, auto_smart_extraction=False)
@@ -734,40 +841,39 @@ class TestRecallHookSeparation:
         assert p.prefetch("") == ""
         assert p.prefetch("   ") == ""
 
-    def test_before_prompt_build_empty_query_returns_empty(
-        self, provider_cls, real_store
-    ):
-        p = self._provider(provider_cls, real_store)
-        assert p.before_prompt_build({"query": ""}) == ""
-        assert p.before_prompt_build({}) == ""
+    def test_provider_does_not_override_before_prompt_build(self, provider_cls):
+        # Overriding before_prompt_build makes the host's prefetch_all() skip
+        # this provider — and the host never calls before_prompt_build — so
+        # the provider must NOT define it.
+        assert "before_prompt_build" not in vars(provider_cls)
 
-    def test_recall_hooks_do_not_duplicate_protocol(self, provider_cls, real_store):
+    def test_recall_path_does_not_duplicate_protocol(self, provider_cls, real_store):
         p = self._provider(provider_cls, real_store)
         # The protocol belongs to system_prompt_block...
         assert "Memory Task Protocol" in p.system_prompt_block()
-        # ...and must NOT also appear in the query-dependent recall hooks.
+        # ...and must NOT also appear in the query-dependent recall block.
         assert "Memory Task Protocol" not in p.prefetch("a real user query")
-        assert "Memory Task Protocol" not in p.before_prompt_build(
-            {"query": "a real user query"}
-        )
 
 
 @pytest.mark.integration
 class TestAutoAnchor:
-    """_auto_anchor_session_if_needed: idempotent, pin-aware, self-cleaning."""
+    """_auto_anchor_session_if_needed: idempotent, pin-aware, conversation-
+    scoped. The anchor is keyed by conversation id so it survives the
+    session-id rotation that context compression performs, yet stays
+    isolated from other conversations sharing the same store."""
 
     def test_creates_anchor_when_none_exists(self, real_store):
         provider._auto_anchor_session_if_needed(
-            "Fix the failing tests", "sess-A", real_store
+            "Fix the failing tests", "sess-A", "conv-A", real_store
         )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1
         assert "Fix the failing tests" in anchors[0]["text"]
 
-    def test_idempotent_no_duplicate_for_same_session(self, real_store):
+    def test_idempotent_no_duplicate_for_same_conversation(self, real_store):
         for _ in range(3):
             provider._auto_anchor_session_if_needed(
-                "Fix the failing tests", "sess-A", real_store
+                "Fix the failing tests", "sess-A", "conv-A", real_store
             )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1
@@ -779,7 +885,7 @@ class TestAutoAnchor:
             metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
         )
         provider._auto_anchor_session_if_needed(
-            "some objective", "sess-A", real_store
+            "some objective", "sess-A", "conv-A", real_store
         )
         anchors = real_store.list_memories(limit=20, category="active_task")
         assert len(anchors) == 1  # only the formal pin; no auto-anchor added
@@ -787,36 +893,68 @@ class TestAutoAnchor:
             not (m.get("metadata") or {}).get("auto_anchor") for m in anchors
         )
 
-    def test_archives_stale_anchor_from_other_session(self, real_store):
-        provider._auto_anchor_session_if_needed("Old work", "sess-OLD", real_store)
-        provider._auto_anchor_session_if_needed("New work", "sess-NEW", real_store)
+    def test_anchor_survives_session_id_rotation(self, real_store):
+        # Context compression rotates session_id mid-conversation but keeps
+        # the conversation id. The anchor and its original objective must
+        # persist, not churn into the latest turn's text.
+        provider._auto_anchor_session_if_needed(
+            "Original objective", "sess-1", "conv-1", real_store
+        )
+        provider._auto_anchor_session_if_needed(
+            "later turn after a compaction", "sess-2", "conv-1", real_store
+        )
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
         )
         assert len(live) == 1
-        assert "New work" in live[0]["text"]
+        assert "Original objective" in live[0]["text"]
 
-    def test_archive_auto_anchors_clears_all_live_anchors(self, real_store):
-        provider._auto_anchor_session_if_needed("work A", "sess-A", real_store)
-        n = provider._archive_auto_anchors(real_store)
+    def test_anchors_isolated_across_conversations(self, real_store):
+        # Two conversations sharing one store each get their OWN anchor.
+        provider._auto_anchor_session_if_needed(
+            "conv A work", "sA", "conv-A", real_store
+        )
+        provider._auto_anchor_session_if_needed(
+            "conv B work", "sB", "conv-B", real_store
+        )
+        live = real_store.list_memories(
+            limit=20, category="active_task", include_archived=False
+        )
+        assert len(live) == 2
+        by_conv = {
+            (m["metadata"] or {}).get("conversation_id"): m["text"]
+            for m in live
+        }
+        assert "conv A work" in by_conv["conv-A"]
+        assert "conv B work" in by_conv["conv-B"]
+
+    def test_archive_auto_anchors_scoped_to_one_conversation(self, real_store):
+        provider._auto_anchor_session_if_needed("A", "sA", "conv-A", real_store)
+        provider._auto_anchor_session_if_needed("B", "sB", "conv-B", real_store)
+        n = provider._archive_auto_anchors(real_store, "conv-A")
         assert n == 1
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
         )
-        assert live == []
+        assert len(live) == 1
+        assert (live[0]["metadata"] or {}).get("conversation_id") == "conv-B"
 
     def test_archive_auto_anchors_leaves_formal_pins(self, real_store):
         real_store.store(
             text="auto anchor breadcrumb",
             category="active_task", scope="agent", importance=0.9,
-            metadata_extra={"auto_anchor": True, "source_session": "sess-A"},
+            metadata_extra={
+                "auto_anchor": True,
+                "source_session": "sess-A",
+                "conversation_id": "conv-A",
+            },
         )
         real_store.store(
             text="FORMAL PIN block",
             category="active_task", scope="global", importance=1.0,
             metadata_extra={"task_id": "t1", "state_path": "/tmp/state.json"},
         )
-        n = provider._archive_auto_anchors(real_store)
+        n = provider._archive_auto_anchors(real_store, "conv-A")
         assert n == 1
         live = real_store.list_memories(
             limit=20, category="active_task", include_archived=False
