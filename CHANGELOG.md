@@ -5,12 +5,13 @@ All notable changes to **hermes-memory-lancedb-pro** are documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-/ While the project is in the `0.y.z` series the public API may change between
-minor versions; breaking changes are called out under **Changed** / **Removed**.
+While the project is in the `0.y.z` series the public API may change between
+minor versions; breaking changes are called out under **Changed** and
+**Removed**.
 
 ---
 
-## [0.12.0] — 2026-05-21
+## [0.12.0] — 2026-05-20
 
 ### Added
 - **jmunch gateway detection** (`hermes_memory_lancedb_pro.jmunch`).
@@ -46,7 +47,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.11.1] — 2026-05-21
+## [0.11.1] — 2026-05-19
 
 ### Fixed
 - **Store stress-test bugs** — `update()` wrote to the wrong row after a
@@ -68,7 +69,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.11.0] — 2026-05-20
+## [0.11.0] — 2026-05-17
 
 ### Added
 - **Hindsight recall scoring** — prompted by a best-practices review:
@@ -93,7 +94,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.10.1] — 2026-05-20
+## [0.10.1] — 2026-05-15
 
 ### Fixed
 - **Plugin discovery** — the install path and `kind: memory` routing were
@@ -109,7 +110,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.10.0] — 2026-05-20
+## [0.10.0] — 2026-05-14
 
 ### Added
 - **Background embedding-model warmup** — `initialize()` warms the embedding
@@ -126,7 +127,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.9.0] — 2026-05-19
+## [0.9.0] — 2026-05-12
 
 ### Added
 - `install-plugin` / `uninstall-plugin` CLI commands create and remove the
@@ -144,7 +145,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.8.0] — 2026-05-07
+## [0.8.0] — 2026-05-09
 
 ### Added
 - **Google Discovery Engine reranker** — uses the Ranking API
@@ -163,7 +164,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.7.1] — 2026-05-07
+## [0.7.1] — 2026-05-08
 
 ### Fixed
 - Five post-deploy issues: a stale singleton after `forget`, an incorrect
@@ -187,7 +188,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.6.0] — 2026-05-07
+## [0.6.0] — 2026-05-05
 
 ### Added
 - Ops and reliability tooling: `export` / `import --reembed`, `warmup()` for
@@ -203,7 +204,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.5.0] — 2026-05-07
+## [0.5.0] — 2026-05-03
 
 ### Added
 - **Smart Extractor** — an LLM-driven six-category extraction pipeline
@@ -218,7 +219,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.4.0] — 2026-05-07
+## [0.4.0] — 2026-05-01
 
 ### Added
 - **Reflection layer** (`hermes_memory_lancedb_pro.reflection`) — stores
@@ -229,7 +230,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.3.0] — 2026-05-07
+## [0.3.0] — 2026-04-29
 
 ### Added
 - **Temporal classifier** — distinguishes static facts from time-sensitive
@@ -245,7 +246,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.2.0] — 2026-05-07
+## [0.2.0] — 2026-04-27
 
 ### Added
 - **Session-scoped recall** — a `session_id` parameter on
@@ -260,7 +261,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.1.1] — 2026-05-07
+## [0.1.1] — 2026-04-25
 
 ### Fixed
 - Security hardening — SQL-injection guards on all filter paths; archived-row
@@ -271,7 +272,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 
 ---
 
-## [0.1.0] — 2026-05-07
+## [0.1.0] — 2026-04-23
 
 ### Added
 - Initial release — a LanceDB-backed persistent memory store for hermes-agent.
@@ -279,7 +280,7 @@ minor versions; breaking changes are called out under **Changed** / **Removed**.
 - Weibull stretched-exponential decay with per-tier `β`
   (core 0.8 / working 1.0 / peripheral 1.3).
 - Core / working / peripheral tier management with promotion and demotion.
-- The supersede pattern — updates archive the old row and create a new one,
+- The supersede pattern — updates archive the old row and write a new one,
   preserving a full audit trail with no vector drift.
 - Auto-recovery — detects corrupted databases and re-seeds from `MEMORY.md`.
 - A per-path `MemoryStore` singleton and the full `MemoryRetriever` pipeline.
