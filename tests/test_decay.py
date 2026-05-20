@@ -4,6 +4,8 @@ These run pure-Python — no LanceDB or sentence-transformers required."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hermes_memory_lancedb_pro.decay import (
@@ -184,3 +186,162 @@ class TestEvaluateTier:
         # Manually set high composite so promotion fires for both
         changed = evaluate_all_tiers(memories, now_ms=NOW)
         assert "archived-id" not in changed
+
+
+class TestSupportInfoConfidenceBlending:
+    """compute_decay_score blends SupportInfoV2.global_strength into confidence."""
+
+    def _make_entry_with_support(self, global_strength: float, total_obs: int):
+        return {
+            "importance": 0.8,
+            "metadata": {
+                "tier": "working",
+                "confidence": 1.0,
+                "created_at": NOW,
+                "support_info": {
+                    "global_strength": global_strength,
+                    "total_observations": total_obs,
+                    "slices": [],
+                },
+            },
+        }
+
+    def test_no_support_info_no_penalty(self):
+        entry = make_entry(importance=0.8)
+        score = compute_decay_score(entry, now_ms=NOW)
+        # No support_info → confidence uses write-time value, no blending
+        assert "freshness_trend" in score
+        assert score["freshness_trend"] == "forming"
+
+    def test_high_global_strength_minimal_penalty(self):
+        entry = self._make_entry_with_support(global_strength=1.0, total_obs=5)
+        score = compute_decay_score(entry, now_ms=NOW)
+        # global_strength=1.0 → factor=1.0 → no penalty
+        assert score["freshness_trend"] == "strengthening"
+        entry_no_support = make_entry(importance=0.8)
+        score_no_support = compute_decay_score(entry_no_support, now_ms=NOW)
+        assert abs(score["composite"] - score_no_support["composite"]) < 0.05
+
+    def test_low_global_strength_penalises_score(self):
+        entry_strong = self._make_entry_with_support(global_strength=1.0, total_obs=5)
+        entry_weak = self._make_entry_with_support(global_strength=0.0, total_obs=5)
+        score_strong = compute_decay_score(entry_strong, now_ms=NOW)
+        score_weak = compute_decay_score(entry_weak, now_ms=NOW)
+        assert score_weak["composite"] < score_strong["composite"]
+        assert score_weak["freshness_trend"] == "weakening"
+
+    def test_below_threshold_obs_no_blending(self):
+        # total_observations < 3 → blending not applied
+        entry_low = self._make_entry_with_support(global_strength=0.0, total_obs=2)
+        entry_high = self._make_entry_with_support(global_strength=0.0, total_obs=3)
+        score_low = compute_decay_score(entry_low, now_ms=NOW)
+        score_high = compute_decay_score(entry_high, now_ms=NOW)
+        # low obs: no penalty (freshness_trend stays "forming")
+        assert score_low["freshness_trend"] == "forming"
+        # high obs: penalty applied (freshness_trend becomes "weakening")
+        assert score_high["freshness_trend"] == "weakening"
+        assert score_high["composite"] < score_low["composite"]
+
+    def test_stable_trend_for_contested_memory(self):
+        # global_strength ≈ 0.5 → stable trend
+        entry = self._make_entry_with_support(global_strength=0.5, total_obs=10)
+        score = compute_decay_score(entry, now_ms=NOW)
+        assert score["freshness_trend"] == "stable"
+
+
+class TestTemporalQueryIntent:
+    """_parse_temporal_intent extracts timestamp ranges from natural-language queries."""
+
+    from hermes_memory_lancedb_pro.provider import _parse_temporal_intent
+
+    NOW_MS = 1_700_000_000_000  # fixed reference point
+
+    def _ti(self, query: str):
+        from hermes_memory_lancedb_pro.provider import _parse_temporal_intent
+        return _parse_temporal_intent(query, self.NOW_MS)
+
+    def test_no_temporal_returns_none(self):
+        assert self._ti("what do I prefer for breakfast?") is None
+        assert self._ti("remind me of my tech stack") is None
+
+    def test_yesterday_returns_24h_window(self):
+        result = self._ti("what did I say yesterday about the project?")
+        assert result is not None
+        ts_min, ts_max = result
+        # window should be ~24–48h before NOW
+        assert 0 < self.NOW_MS - ts_max < 2 * 86_400_000
+        assert ts_min < ts_max
+
+    def test_last_week_window(self):
+        result = self._ti("what happened last week?")
+        assert result is not None
+        ts_min, ts_max = result
+        # window should be 7–14 days before NOW
+        assert ts_min < ts_max
+
+    def test_today_returns_same_day_window(self):
+        result = self._ti("what did we decide today?")
+        assert result is not None
+        ts_min, ts_max = result
+        assert ts_max <= self.NOW_MS
+        assert self.NOW_MS - ts_min <= 2 * 86_400_000
+
+    def test_recently_returns_7_day_window(self):
+        result = self._ti("what did I recently tell you about React?")
+        assert result is not None
+
+    def test_range_never_inverted(self):
+        for query in [
+            "yesterday", "last week", "this week", "this month",
+            "recently", "today", "last month",
+        ]:
+            result = self._ti(query)
+            if result is not None:
+                ts_min, ts_max = result
+                assert ts_min <= ts_max, f"range inverted for {query!r}"
+
+
+# ---------------------------------------------------------------------------
+# TestCreatedAtFallback — top-level timestamp fallback
+# ---------------------------------------------------------------------------
+
+class TestCreatedAtFallback:
+    """compute_decay_score must use entry["timestamp"] when metadata.created_at is absent."""
+
+    def test_ancient_timestamp_produces_low_recency(self):
+        ten_years_ms = 10 * 365 * 24 * 3600 * 1000
+        old_ts = int(time.time() * 1000) - ten_years_ms
+        entry = {
+            "text": "old memory",
+            "importance": 0.7,
+            "timestamp": old_ts,       # top-level column, no metadata.created_at
+            "metadata": {
+                "tier": "working",
+                "confidence": 0.8,
+                "access_count": 0,
+                # no created_at here
+            },
+        }
+        result = compute_decay_score(entry)
+        assert result["recency"] < 0.05, (
+            f"10-year-old memory should have near-zero recency; got {result['recency']}"
+        )
+
+    def test_metadata_created_at_takes_priority_over_timestamp(self):
+        ten_years_ms = 10 * 365 * 24 * 3600 * 1000
+        now_ms = int(time.time() * 1000)
+        entry = {
+            "text": "recent memory with old top-level timestamp",
+            "importance": 0.7,
+            "timestamp": now_ms - ten_years_ms,   # old
+            "metadata": {
+                "tier": "working",
+                "confidence": 0.8,
+                "access_count": 0,
+                "created_at": now_ms - 1000,       # recent — should win
+            },
+        }
+        result = compute_decay_score(entry)
+        assert result["recency"] > 0.99, (
+            "metadata.created_at should take priority over top-level timestamp"
+        )

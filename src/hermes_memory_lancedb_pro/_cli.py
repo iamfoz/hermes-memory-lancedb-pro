@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -40,10 +41,10 @@ __all__ = ["register"]
 PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
-Exposes register_cli() so hermes-agent can wire the lancedb-pro
-subcommands (export, import, doctor) into `hermes lancedb-pro`.
+Exposes register_cli() so hermes-agent can wire the lancedb_pro commands
+(init, doctor, export, import, reset) into `hermes lancedb_pro`.
 
-Regenerate with: hermes-memory install-plugin
+Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
 from hermes_memory_lancedb_pro._cli import register_cli
 
@@ -450,24 +451,65 @@ def _cmd_doctor(
 
 
 # ---------------------------------------------------------------------------
-# Plugin CLI — register_cli() wires hermes lancedb-pro <subcommand>
+# Plugin CLI — register_cli() wires hermes lancedb_pro <subcommand>
 # ---------------------------------------------------------------------------
 
 
 def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
+    """Dispatch hermes lancedb_pro <subcommand> to the correct handler."""
     cmd = getattr(args, "lancedb_pro_command", None)
     if cmd is None:
         return 0
-    return {"export": _cmd_export, "import": _cmd_import, "doctor": _cmd_doctor}[cmd](args)
+    return {
+        "init": _cmd_init,
+        "export": _cmd_export,
+        "import": _cmd_import,
+        "doctor": _cmd_doctor,
+        "reset": _cmd_reset,
+    }.get(cmd, lambda _: 0)(args)
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
-    """Register hermes lancedb-pro subcommands with the hermes CLI.
+    """Register lancedb-pro subcommands with the hermes-agent CLI.
 
-    hermes-agent calls this with the ArgumentParser for the provider's
-    top-level slot so commands appear as `hermes lancedb-pro <subcommand>`.
+    hermes-agent discovers ``cli.py`` via ``discover_plugin_cli_commands()``
+    and calls this with a **fresh** ArgumentParser for the provider's own
+    namespace.  Commands appear as:
+
+        hermes lancedb_pro init|doctor|export|import|reset
+
+    Follows the hermes memory plugin CLI spec exactly:
+    ``add_subparsers`` on the fresh parser + ``set_defaults(func=dispatcher)``
+    at the top level for ``args.func(args)`` dispatch.
     """
     subs = subparser.add_subparsers(dest="lancedb_pro_command")
+
+    p_init = subs.add_parser(
+        "init",
+        help="Initialise the memory store (seed from MEMORY.md if empty)",
+        description=(
+            "Open or create the memory database and optionally seed entries from "
+            "MEMORY.md when the store is empty."
+        ),
+    )
+    p_init.add_argument("--path", default=None, metavar="PATH",
+                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_init.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompt")
+    p_init.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress non-essential output")
+
+    p_doctor = subs.add_parser(
+        "doctor",
+        help="Print a diagnostic report for the memory store",
+        description="Scan the store and report counts, anomalies, and recommendations.",
+    )
+    p_doctor.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_doctor.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
 
     p_export = subs.add_parser(
         "export",
@@ -483,7 +525,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_export.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
+                          help="Suppress non-essential output")
 
     p_import = subs.add_parser(
         "import",
@@ -499,17 +541,24 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_import.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_import.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
+                          help="Suppress non-essential output")
 
-    p_doctor = subs.add_parser(
-        "doctor",
-        help="Print a diagnostic report",
-        description="Scan the store and report counts, anomalies, and recommendations.",
+    p_reset = subs.add_parser(
+        "reset",
+        help="Wipe and reinitialise the LanceDB memory database",
+        description=(
+            "Delete the LanceDB database directory and re-run init, "
+            "seeding fresh entries from MEMORY.md."
+        ),
     )
-    p_doctor.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
-    p_doctor.add_argument("-q", "--quiet", action="store_true",
-                          help="Suppress non-essential stderr output")
+    p_reset.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-y", "--yes", action="store_true",
+                         help="Skip confirmation prompt")
+    p_reset.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
 
     subparser.set_defaults(func=_dispatch_plugin_cli)
 
@@ -662,26 +711,250 @@ def _cmd_uninstall_plugin(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Init / reset commands (Python equivalents of memory_init.sh / memory_reset.sh)
+# ---------------------------------------------------------------------------
+
+
+def _parse_memory_md(path: str) -> list[dict]:
+    """Parse MEMORY.md into seeding entries.  Best-effort heuristic classification."""
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    sections = re.split(r"^§\s*$", content, flags=re.MULTILINE)
+    for raw_section in sections:
+        section = raw_section.strip()
+        if not section:
+            continue
+        if section.startswith("*This is the persistent") or section.startswith("---"):
+            continue
+        if section.startswith("User:") and "UK English" in section:
+            continue
+        for para in (p.strip() for p in section.split("\n\n")):
+            if len(para) < 20:
+                continue
+            tl = para.lower()
+            if any(k in tl for k in ("prefer", "always", "never", "formatting")):
+                category = "preference"
+            elif any(k in tl for k in ("decision", "chosen", "selected")):
+                category = "decision"
+            elif any(k in tl for k in ("deadline", "due", "date")):
+                category = "fact"
+            elif any(k in tl for k in ("project", "active", "cron", "system")):
+                category = "other"
+            else:
+                category = "fact"
+            entries.append({
+                "text": para,
+                "category": category,
+                "scope": "global",
+                "importance": 0.7,
+            })
+    return entries
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Initialise the memory store and optionally seed from MEMORY.md.
+
+    Equivalent to ``scripts/memory_init.sh`` but runs in-process.
+    """
+    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    memory_md = getattr(args, "memory_md", None) or os.path.expanduser(
+        os.environ.get("MEMORY_MD", "~/.hermes/memory/MEMORY.md")
+    )
+    quiet = bool(getattr(args, "quiet", False))
+
+    if not getattr(args, "yes", False):
+        print(f"This will initialise the memory store at: {db_path}")
+        answer = input('Type "yes" to proceed: ').strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return 1
+
+    if not quiet:
+        print("=== LanceDB Memory Initialisation ===")
+        print(f"DB Path:  {db_path}")
+        print(f"Memory:   {memory_md}")
+
+    store = MemoryStore(db_path=db_path)
+    try:
+        store._initialise()
+        store.stats()
+        if not quiet:
+            print("  ✓ Connection established")
+    except Exception as e:
+        if not quiet:
+            print(f"  ⚠ DB corrupted ({e}) — auto-recovering...")
+        shutil.rmtree(db_path, ignore_errors=True)
+        store = MemoryStore(db_path=db_path)
+        store._initialise()
+        if not quiet:
+            print("  ✓ Recovered (fresh DB created)")
+
+    existing = store.list_memories(limit=1)
+    if existing:
+        total = store.stats().get("total_memories", 0)
+        if not quiet:
+            print(f"  ⚠ Database already has {total} entries")
+            print("  Skipping seed. Run `hermes-memory-lancedb-pro reset` to start fresh.")
+        return 0
+
+    if not os.path.exists(memory_md):
+        if not quiet:
+            print(f"  ℹ No seed file at {memory_md}")
+        return 0
+
+    entries = _parse_memory_md(memory_md)
+    if not entries:
+        if not quiet:
+            print("  ⚠ No entries found in MEMORY.md")
+        return 0
+
+    if not quiet:
+        print(f"  Seeding {len(entries)} entries from MEMORY.md...")
+    ids = store.store_many(entries)
+    if not quiet:
+        print(f"    {len(ids)}/{len(entries)} entries stored")
+
+    if store.maybe_create_vector_index():
+        if not quiet:
+            print("  ✓ Vector index created")
+    elif not quiet:
+        print(f"  ℹ Vector index pending (need 256+ rows, have {len(ids)})")
+
+    stats = store.stats()
+    if not quiet:
+        print(f"\n  ✓ Seeded {stats['total_memories']} memories")
+        print(f"  Categories: {stats['categories']}")
+        print("\n=== Memory system ready ===")
+    return 0
+
+
+def _cmd_reset(args: argparse.Namespace) -> int:
+    """Wipe the memory database and reinitialise from MEMORY.md.
+
+    Equivalent to ``scripts/memory_reset.sh`` but runs in-process.
+    """
+    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    quiet = bool(getattr(args, "quiet", False))
+
+    if not getattr(args, "yes", False):
+        print(f"This will WIPE ALL MEMORIES at: {db_path}")
+        answer = input('Type "yes" to proceed: ').strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return 1
+
+    if not quiet:
+        print("=== LanceDB Memory Reset ===")
+
+    if os.path.isdir(db_path):
+        if not quiet:
+            print(f"  Wiping: {db_path}")
+        shutil.rmtree(db_path)
+        if not quiet:
+            print("  ✓ Database cleared")
+    elif not quiet:
+        print("  (No existing database found)")
+
+    args.yes = True  # user already confirmed; don't prompt again in _cmd_init
+    return _cmd_init(args)
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
 
 def main() -> int:
-    """Entry point for the ``hermes-memory`` bootstrap CLI.
-
-    Handles plugin lifecycle only (install / uninstall).  Memory admin
-    commands (export, import, doctor) are available after installation via
-    ``hermes lancedb-pro <subcommand>``.
-    """
+    """Entry point for the ``hermes-memory-lancedb-pro`` CLI."""
     parser = argparse.ArgumentParser(
         prog="hermes-memory-lancedb-pro",
-        description=(
-            "Hermes lancedb-pro bootstrap CLI — install and remove the lancedb_pro plugin.\n"
-            "After installation, use: hermes lancedb-pro export|import|doctor"
-        ),
+        description="Hermes LanceDB memory CLI — manage the lancedb_pro plugin and memory store.",
     )
 
     subparsers = parser.add_subparsers(dest="subcommand", title="subcommands")
+
+    # ---- init ----
+    p_init = subparsers.add_parser(
+        "init",
+        help="Initialise the memory store (seed from MEMORY.md if empty)",
+        description=(
+            "Open or create the memory database and optionally seed entries from "
+            "MEMORY.md when the store is empty."
+        ),
+    )
+    p_init.add_argument("--path", default=None, metavar="PATH",
+                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_init.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompt")
+    p_init.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress non-essential output")
+
+    # ---- reset ----
+    p_reset = subparsers.add_parser(
+        "reset",
+        help="Wipe the memory database and reinitialise from MEMORY.md",
+        description=(
+            "Delete the existing LanceDB database directory and run init, "
+            "seeding fresh entries from MEMORY.md."
+        ),
+    )
+    p_reset.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
+                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+    p_reset.add_argument("-y", "--yes", action="store_true",
+                         help="Skip confirmation prompt")
+    p_reset.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
+
+    # ---- doctor ----
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="Print a diagnostic report for the memory store",
+        description="Scan the store and report counts, anomalies, and recommendations.",
+    )
+    p_doctor.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_doctor.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+
+    # ---- export ----
+    p_export = subparsers.add_parser(
+        "export",
+        help="Export memories to JSONL",
+        description="Stream memory rows to JSONL (one JSON object per line).",
+    )
+    p_export.add_argument("--out", "-o", default="-", metavar="PATH",
+                          help="Output file path (default: stdout)")
+    p_export.add_argument("--include-archived", action="store_true",
+                          help="Include archived rows (excluded by default)")
+    p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
+                          help="Maximum rows to export (default: 100000)")
+    p_export.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_export.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+
+    # ---- import ----
+    p_import = subparsers.add_parser(
+        "import",
+        help="Import memories from JSONL",
+        description="Read a JSONL file produced by 'export' and write rows into the store.",
+    )
+    p_import.add_argument("--in", dest="input", default="-", metavar="PATH",
+                          help="Input file path (default: stdin)")
+    p_import.add_argument("--reembed", action="store_true",
+                          help="Re-encode text with the current embedder instead of stored vectors")
+    p_import.add_argument("--allow-existing", action="store_true",
+                          help="Skip rows whose id already exists rather than aborting")
+    p_import.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_import.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
 
     # ---- install-plugin ----
     p_install = subparsers.add_parser(
@@ -733,6 +1006,11 @@ def main() -> int:
         return 0
 
     dispatch = {
+        "init": _cmd_init,
+        "reset": _cmd_reset,
+        "doctor": _cmd_doctor,
+        "export": _cmd_export,
+        "import": _cmd_import,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }

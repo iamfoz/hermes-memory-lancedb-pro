@@ -116,6 +116,7 @@ DECISION_INDICATORS: list[re.Pattern[str]] = [
 GREETING_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r"^(hi|hello|hey|howdy|yo|hiya|sup|hola|greetings|good\s+(morning|afternoon|evening|day))"
+        r"(\s+there)?"   # allow "Hi there", "Hello there"
         r"[\s.!,]*$",
         re.IGNORECASE,
     ),
