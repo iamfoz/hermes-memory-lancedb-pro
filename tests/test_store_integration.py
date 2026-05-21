@@ -137,6 +137,12 @@ class TestCrud:
         assert store.get_by_id(mid) is None
         assert store.forget(mid) is False  # already gone
 
+    def test_delete(self, store):
+        mid = store.store(text="removed via the delete alias")
+        assert store.delete(mid) is True
+        assert store.get_by_id(mid) is None
+        assert store.delete(mid) is False  # already gone
+
     def test_increment_access_count(self, store):
         mid = store.store(text="counts accesses correctly")
         # First access always lands (count was 0).

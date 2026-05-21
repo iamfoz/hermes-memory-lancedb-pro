@@ -889,6 +889,14 @@ class MemoryStore:
         self._table.delete(f"id = '{_escape_sql(effective_id)}'")
         return True
 
+    def delete(self, mem_id: str) -> bool:
+        """Delete a memory by ID — alias for `forget()`.
+
+        Provided because `delete` is the conventional name to reach for;
+        the behaviour is identical to `forget()` — a hard delete of the
+        live row, following the supersede chain to the current version."""
+        return self.forget(mem_id)
+
     def increment_access_count(
         self,
         mem_id: str,
