@@ -15,6 +15,7 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 | `MEMORY_DB_DIR` | `~/.hermes/memory-lancedb` | Database directory. |
 | `MEMORY_MAX_SCAN_ROWS` | `100000` | Upper bound on full-table scans (`stats`, `purge_archived`). |
 | `MEMORY_AUTO_OPTIMIZE_EVERY` | `256` | Fragment-creating writes between automatic on-disk compactions. Each write creates a LanceDB fragment; compaction merges them so a high-volume store never exhausts the file-descriptor limit. `0` disables. |
+| `MEMORY_MAX_TEXT_CHARS` | `8000` | Upper bound on a single memory's `text`, in characters. `store()` and `store_many()` reject oversized text rather than passing it to the embedder (where very large inputs can exhaust GPU / MPS memory). |
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300` | Minimum seconds between `access_count` increments for one memory. Breaks the recall-frequency feedback loop that produces "sticky" memories. |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3` | A memory recalled across this many distinct sessions is auto-promoted to `cross_session=True`. `0` disables. |
 | `MEMORY_INJECTION_GUARD` | `warn` | Prompt-injection guard at write time: `off` / `warn` / `reject` / `sanitize`. |

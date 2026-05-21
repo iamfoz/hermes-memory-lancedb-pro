@@ -87,6 +87,15 @@ VECTOR_INDEX_MIN_ROWS: int = 256
 # rows into the FTS / vector indexes). Set to 0 to disable auto-compaction.
 AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256"))
 
+# Hard upper bound on a single memory's `text`, in characters. A memory entry
+# is meant to be a distilled fact, not a document: beyond this size the
+# embedding model cannot represent the text in one vector anyway, and very
+# large inputs can exhaust GPU / MPS memory. `store()` and `store_many()`
+# reject oversized text rather than letting it reach the embedder. Raise this
+# if you genuinely need larger entries — though the smart extractor is the
+# better place to summarise long content.
+MAX_TEXT_CHARS: int = int(os.environ.get("MEMORY_MAX_TEXT_CHARS", "8000"))
+
 # "active_task" backs the durable-task pin: `task pin`, the recall-guardrail
 # active-task pinning, `_format_recall`, `_refresh_active_task_memories` and the
 # session auto-anchor all read/write this category. It MUST be a recognised
@@ -559,6 +568,13 @@ class MemoryStore:
         """Store a new memory entry. Returns the new memory ID."""
         if not text or not text.strip():
             raise ValueError("MemoryStore.store: `text` must be non-empty")
+        if len(text) > MAX_TEXT_CHARS:
+            raise ValueError(
+                f"MemoryStore.store: `text` is {len(text)} chars, exceeding the "
+                f"{MAX_TEXT_CHARS}-char limit (MEMORY_MAX_TEXT_CHARS). A memory "
+                f"entry should be a distilled fact, not a document — summarise "
+                f"or split it before storing."
+            )
         text = _check_injection_guard(text, where="store")
 
         category, tier, importance, confidence = self._normalise_inputs(
@@ -600,6 +616,13 @@ class MemoryStore:
         prepared: list[MemorySchema] = []
         ids: list[str] = []
         texts = [str(e["text"]) for e in entries]
+        for idx, txt in enumerate(texts):
+            if len(txt) > MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"store_many: entry {idx} `text` is {len(txt)} chars, "
+                    f"exceeding the {MAX_TEXT_CHARS}-char limit "
+                    f"(MEMORY_MAX_TEXT_CHARS) — summarise or split it."
+                )
         vectors = self.encode_batch(texts)
 
         now_ms = int(time.time() * 1000)
