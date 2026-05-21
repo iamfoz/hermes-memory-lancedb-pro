@@ -11,6 +11,23 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.14.0] — 2026-05-21
+
+### Added
+- **`task to-skill` candidate discovery.** `task to-skill --list` (and
+  `--search "<keywords>"`) lists completed tasks — live *and* archived — that
+  could be turned into a skill, so an older task can be found and selected
+  without knowing its id. `task to-skill <id>` now resolves a task whether it
+  is live or archived (including GC's collision-suffixed archive names).
+- **`task-to-skill` skill** (`skills/task-to-skill/`) — teaches the agent the
+  full user-initiated flow: scaffold a recent task directly, or surface
+  candidate tasks for the user to choose (as client option-buttons where the
+  client supports them, otherwise a numbered list, with a keyword-search
+  escape hatch), then author a polished `SKILL.md` from the draft. The
+  synthesis is done by the agent itself, not a plugin-side LLM call.
+
+---
+
 ## [0.13.0] — 2026-05-21
 
 ### Added
@@ -359,6 +376,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.14.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.3...v0.13.0
 [0.12.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.1...v0.12.2

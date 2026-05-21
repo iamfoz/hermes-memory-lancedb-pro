@@ -1,13 +1,17 @@
-"""Scaffold a reusable skill from a task ledger.
+"""Scaffold a reusable skill from a task ledger, and list skill candidates.
 
 ``task to-skill`` takes a task that did something useful and writes a *draft*
 skill — ``SKILL.md`` + ``AGENTS.md`` in the format used under ``skills/`` —
-that the author then refines. The task's objective and invariants transfer
-directly; the Protocol section is a skeleton seeded with the task's iteration
-history for the author to rewrite into reusable steps.
+that the agent then refines into a polished, reusable skill. The task's
+objective and invariants transfer directly; the Protocol section is a skeleton
+seeded with the task's iteration history.
 
-Pure-Python — no LLM and no heavy dependencies. The output is explicitly a
-draft, not a finished skill.
+``list_skill_candidates`` surfaces completed tasks — live and archived — so an
+older task can be found and turned into a skill without knowing its id.
+
+Pure-Python — no LLM and no heavy dependencies. The scaffold is explicitly a
+draft; the polish comes from the agent rewriting it (see the ``task-to-skill``
+skill under ``skills/``).
 """
 
 from __future__ import annotations
@@ -15,19 +19,47 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .task_ledger import _task_dir, _validate_task_id, load_state
+from .task_ledger import TASK_ROOT, _validate_task_id
 
-__all__ = ["scaffold_skill_from_task"]
+__all__ = ["list_skill_candidates", "scaffold_skill_from_task"]
 
 _LOG_EXCERPT_LIMIT = 4000
+_ARCHIVE_DIRNAME = "archive"
 
 
-def _count_results(task_id: str, root: Path | None) -> tuple[int, int, int]:
+def _resolve_task_dir(task_id: str, root: Path | None = None) -> Path | None:
+    """Find a task's directory — live under the root, or under ``archive/``.
+
+    Returns the directory Path, or None when no such task exists. Handles GC's
+    collision-suffixed archive names (``<id>__<epoch>``) by matching the
+    ``task_id`` field inside ``state.json``.
+    """
+    base = root or TASK_ROOT
+    live = base / task_id
+    if (live / "state.json").is_file():
+        return live
+    archive_dir = base / _ARCHIVE_DIRNAME
+    exact = archive_dir / task_id
+    if (exact / "state.json").is_file():
+        return exact
+    if archive_dir.is_dir():
+        for d in sorted(archive_dir.iterdir()):
+            sp = d / "state.json"
+            if not sp.is_file():
+                continue
+            try:
+                if json.loads(sp.read_text(encoding="utf-8")).get("task_id") == task_id:
+                    return d
+            except (json.JSONDecodeError, OSError):
+                continue
+    return None
+
+
+def _count_results(task_dir: Path) -> tuple[int, int, int]:
     """Return (total, passed, failed) iteration results from results.jsonl."""
-    path = _task_dir(task_id, root) / "results.jsonl"
     total = passed = failed = 0
     try:
-        with path.open(encoding="utf-8") as f:
+        with (task_dir / "results.jsonl").open(encoding="utf-8") as f:
             for raw in f:
                 line = raw.strip()
                 if not line:
@@ -46,10 +78,10 @@ def _count_results(task_id: str, root: Path | None) -> tuple[int, int, int]:
     return total, passed, failed
 
 
-def _read_log(task_id: str, root: Path | None) -> str:
+def _read_log(task_dir: Path) -> str:
     """Return the task's log.md content, truncated, or '' when absent/empty."""
     try:
-        text = (_task_dir(task_id, root) / "log.md").read_text(encoding="utf-8").strip()
+        text = (task_dir / "log.md").read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError):
         return ""
     if len(text) > _LOG_EXCERPT_LIMIT:
@@ -178,17 +210,23 @@ def scaffold_skill_from_task(
 ) -> Path:
     """Scaffold a draft skill (``SKILL.md`` + ``AGENTS.md``) from a task.
 
-    Reads the task's ``state.json``, ``results.jsonl`` and ``log.md`` and
-    writes a draft skill into *out_dir* (default ``~/.hermes/skills/<task_id>/``).
-    The objective and invariants transfer directly; the Protocol is a skeleton
-    seeded with the iteration history. Returns the skill directory.
+    Resolves *task_id* whether the task is live or archived, reads its
+    ``state.json`` / ``results.jsonl`` / ``log.md``, and writes a draft skill
+    into *out_dir* (default ``~/.hermes/skills/<task_id>/``). Returns the skill
+    directory.
 
-    Raises ``FileNotFoundError`` if the task does not exist, ``ValueError`` for
-    an invalid *task_id*, and ``FileExistsError`` if *out_dir* already contains
+    Raises ``ValueError`` for an invalid *task_id*, ``FileNotFoundError`` when
+    no such task exists, and ``FileExistsError`` if *out_dir* already contains
     files and *force* is not set.
     """
     slug = _validate_task_id(task_id)
-    state = load_state(task_id, root)  # FileNotFoundError if the task is unknown
+    task_dir = _resolve_task_dir(task_id, root)
+    if task_dir is None:
+        raise FileNotFoundError(f"task {task_id!r} not found (live or archived)")
+    try:
+        state = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise FileNotFoundError(f"task {task_id!r}: unreadable state.json: {e}") from e
 
     dest = out_dir or (Path.home() / ".hermes" / "skills" / slug)
     if dest.exists() and any(dest.iterdir()) and not force:
@@ -197,8 +235,70 @@ def scaffold_skill_from_task(
         )
     dest.mkdir(parents=True, exist_ok=True)
 
-    results = _count_results(task_id, root)
-    log_text = _read_log(task_id, root)
-    (dest / "SKILL.md").write_text(_skill_md(state, slug, results, log_text), encoding="utf-8")
+    results = _count_results(task_dir)
+    log_text = _read_log(task_dir)
+    (dest / "SKILL.md").write_text(
+        _skill_md(state, slug, results, log_text), encoding="utf-8"
+    )
     (dest / "AGENTS.md").write_text(_agents_md(state, slug), encoding="utf-8")
     return dest
+
+
+def _candidate(task_dir: Path, location: str) -> dict | None:
+    """Build a candidate dict for a completed task, or None if not eligible."""
+    try:
+        state = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "complete":
+        return None
+    return {
+        "task_id": state.get("task_id", task_dir.name),
+        "objective": state.get("objective", "") or "",
+        "completed_at": state.get("completed_at") or state.get("updated_at") or "",
+        "summary": state.get("recent_summary", "") or "",
+        "location": location,
+        "held": bool(state.get("gc_hold")),
+    }
+
+
+def list_skill_candidates(
+    root: Path | None = None, *, search: str | None = None
+) -> list[dict]:
+    """List completed tasks — live and archived — that could become a skill.
+
+    Each entry is a dict with ``task_id``, ``objective``, ``completed_at``,
+    ``summary``, ``location`` (``"live"`` / ``"archived"``) and ``held``,
+    ordered newest-completion-first. When *search* is given, only candidates
+    where every whitespace-separated term (case-insensitive) appears in the
+    task id, objective or summary are returned.
+    """
+    base = root or TASK_ROOT
+    candidates: list[dict] = []
+    if base.is_dir():
+        for d in sorted(base.iterdir()):
+            if d.is_dir() and d.name != _ARCHIVE_DIRNAME:
+                c = _candidate(d, "live")
+                if c:
+                    candidates.append(c)
+        archive_dir = base / _ARCHIVE_DIRNAME
+        if archive_dir.is_dir():
+            for d in sorted(archive_dir.iterdir()):
+                if d.is_dir():
+                    c = _candidate(d, "archived")
+                    if c:
+                        candidates.append(c)
+
+    if search:
+        terms = search.lower().split()
+        candidates = [
+            c
+            for c in candidates
+            if all(
+                term in f"{c['task_id']} {c['objective']} {c['summary']}".lower()
+                for term in terms
+            )
+        ]
+
+    candidates.sort(key=lambda c: c["completed_at"], reverse=True)
+    return candidates
