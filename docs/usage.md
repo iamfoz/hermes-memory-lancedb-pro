@@ -61,7 +61,9 @@ hermes-memory-lancedb-pro task pin TASK_ID             # store as an always-reca
 hermes-memory-lancedb-pro task hold TASK_ID            # exempt from garbage collection
 hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
 hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
-hermes-memory-lancedb-pro task to-skill TASK_ID        # scaffold a reusable skill draft
+hermes-memory-lancedb-pro task to-skill [TASK_ID]      # scaffold a skill draft from a task
+hermes-memory-lancedb-pro task to-skill --list         # list tasks that could become a skill
+hermes-memory-lancedb-pro task to-skill --search "kw"  # find candidate tasks by keyword
 ```
 
 `task pin` stores the control block as an `active_task` memory, which the

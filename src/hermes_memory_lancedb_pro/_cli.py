@@ -1253,19 +1253,38 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_to_skill(args: argparse.Namespace) -> int:
-    """Scaffold a draft reusable skill from a task ledger."""
+    """Scaffold a draft skill from a task, or list candidate tasks."""
     from . import task_skill as _tsk
 
     task_id = getattr(args, "task_id", None)
-    if not task_id:
-        print("error: task_id is required", file=sys.stderr)
-        return 1
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    search = getattr(args, "search", None)
+    list_mode = bool(getattr(args, "list", False)) or search is not None or not task_id
+
+    if list_mode:
+        candidates = _tsk.list_skill_candidates(root, search=search)
+        if not candidates:
+            if search:
+                print(f"No completed tasks match {search!r}.")
+            else:
+                print("No completed tasks available to turn into a skill.")
+            return 0
+        if not quiet:
+            suffix = f" matching {search!r}" if search else ""
+            print(f"Completed tasks that could become a skill{suffix}:")
+        for i, c in enumerate(candidates, 1):
+            loc = "" if c["location"] == "live" else "  (archived)"
+            held = "  [held]" if c["held"] else ""
+            when = (c["completed_at"] or "")[:10]
+            objective = c["objective"] or "(no objective)"
+            print(f"  {i}. {c['task_id']}  —  {objective}  ({when}){loc}{held}")
+        return 0
+
     out_str = getattr(args, "out", None)
     out_dir = Path(out_str).expanduser() if out_str else None
     force = bool(getattr(args, "force", False))
-    quiet = bool(getattr(args, "quiet", False))
     try:
         dest = _tsk.scaffold_skill_from_task(
             task_id, root=root, out_dir=out_dir, force=force
@@ -1394,9 +1413,15 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_unhold.add_argument("-q", "--quiet", action="store_true")
 
     p_skill = tsubs.add_parser(
-        "to-skill", help="Scaffold a draft reusable skill from a task"
+        "to-skill",
+        help="Scaffold a reusable skill from a task, or list candidate tasks",
     )
-    p_skill.add_argument("task_id", metavar="TASK_ID")
+    p_skill.add_argument("task_id", metavar="TASK_ID", nargs="?", default=None,
+                         help="Task to scaffold; omit to list candidate tasks")
+    p_skill.add_argument("--list", action="store_true",
+                         help="List completed tasks (live + archived) as candidates")
+    p_skill.add_argument("--search", default=None, metavar="KEYWORDS",
+                         help="List only candidate tasks matching these keywords")
     p_skill.add_argument("--out", default=None, metavar="DIR",
                          help="Output dir (default: ~/.hermes/skills/<task-id>/)")
     p_skill.add_argument("--force", action="store_true",
