@@ -11,22 +11,28 @@ through untouched.
 
 Detection is two-stage, and creates no code dependency on jmunch-mcp:
 
-  * Passive confirmation — jmunch >= 0.3.0 stamps every response with an
-    `X-Jmunch-Gateway: <version>` header. `record_response_headers()`,
-    called by the LLM client after each call, latches that observation.
-    It is authoritative and works on any port — but only from the first
-    response onward.
+  * Passive confirmation — a pass-through-capable jmunch gateway stamps
+    every response with an `X-Jmunch-Gateway` header.
+    `record_response_headers()`, called by the LLM client after each call,
+    latches that observation the first time the header is seen. It is
+    authoritative and works on any port — but only from the first response
+    onward.
   * Startup declaration — because the passive signal isn't available
     before the first call, the operator can set `MEMORY_JMUNCH_MODE=true`
     to declare jmunch up front, so the startup-time tuning (admission
     preset, and recall from turn one) is correct immediately.
 
 `is_jmunch_in_use()` is true when either signal has fired.
+
+The gateway-side support this module relies on — stamping `X-Jmunch-Gateway`
+and honouring the `X-Jmunch-Inject` / `X-Jmunch-Handleify` request headers —
+currently lives in a fork of jmunch-mcp and is not yet part of an upstream
+release. Detection therefore keys on the *presence* of the `X-Jmunch-Gateway`
+header, not on any version string it might carry.
 """
 
 from __future__ import annotations
 
-import logging
 import threading
 from os import environ
 from typing import Any
@@ -36,28 +42,22 @@ __all__ = [
     "is_jmunch_in_use",
     "jmunch_mode_configured",
     "jmunch_request_headers",
-    "jmunch_supports_passthrough",
-    "observed_jmunch_version",
     "record_response_headers",
 ]
-
-logger = logging.getLogger(__name__)
 
 # Env var by which an operator declares, at startup, that jmunch is in the
 # LLM path — see the module docstring.
 JMUNCH_MODE_ENV = "MEMORY_JMUNCH_MODE"
 
-# Response header jmunch >= 0.3.0 stamps on every response (lower-cased
-# here; lookups are case-insensitive).
+# Response header a pass-through-capable jmunch gateway stamps on every
+# response (lower-cased here; lookups are case-insensitive). Its presence is
+# the detection signal — any value it carries is not interpreted.
 _GATEWAY_HEADER = "x-jmunch-gateway"
-
-# First jmunch version that honours `X-Jmunch-Handleify: false`. Older
-# gateways silently ignore it — sending it is still harmless.
-_MIN_PASSTHROUGH_VERSION = (0, 3, 0)
 
 # Request headers that make jmunch a pure pass-through for a call: no verb
 # injection, no handle-ification, so the memory extractor sees the raw
-# tool content. Both are inert on any non-jmunch endpoint.
+# tool content. Both are inert on any non-jmunch endpoint, and a jmunch
+# gateway that does not recognise them simply ignores them.
 _PASSTHROUGH_HEADERS: dict[str, str] = {
     "X-Jmunch-Inject": "false",
     "X-Jmunch-Handleify": "false",
@@ -65,17 +65,13 @@ _PASSTHROUGH_HEADERS: dict[str, str] = {
 
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 
-# Latched observation of a jmunch gateway seen on the wire. A mutable
-# holder (rather than rebound module scalars) so the latching helper needs
-# no `global`. Written from the LLM-call thread, read from the recall path
-# — guarded by `_lock`. The fields are monotonic latches, so the worst a
-# race could do is delay an observation by one turn.
+# Latched observation of a jmunch gateway seen on the wire. A mutable holder
+# (rather than a rebound module scalar) so the latching helper needs no
+# `global`. Written from the LLM-call thread, read from the recall path —
+# guarded by `_lock`. `observed` is a monotonic latch, so the worst a race
+# could do is delay an observation by one turn.
 _lock = threading.Lock()
-_state: dict[str, Any] = {
-    "observed": False,    # an X-Jmunch-Gateway header has been seen
-    "version": None,      # parsed gateway version tuple, or None
-    "warned_old": False,  # whether the "upgrade jmunch" warning has fired
-}
+_state: dict[str, bool] = {"observed": False}
 
 
 def jmunch_mode_configured() -> bool:
@@ -94,20 +90,6 @@ def is_jmunch_in_use() -> bool:
         return _state["observed"]
 
 
-def observed_jmunch_version() -> tuple[int, ...] | None:
-    """The jmunch gateway version parsed from an observed `X-Jmunch-Gateway`
-    header, or None when none has been seen (or it was unparseable)."""
-    with _lock:
-        return _state["version"]
-
-
-def jmunch_supports_passthrough() -> bool:
-    """True when the observed jmunch version honours `X-Jmunch-Handleify`
-    (>= 0.3.0). False when no version has been observed yet."""
-    version = observed_jmunch_version()
-    return version is not None and version >= _MIN_PASSTHROUGH_VERSION
-
-
 def jmunch_request_headers() -> dict[str, str]:
     """Headers to attach to an LLM call when jmunch is in use: they tell
     the gateway to pass the request through verbatim — no verb injection,
@@ -121,26 +103,12 @@ def record_response_headers(headers: Any) -> None:
     """Inspect an LLM response's headers for `X-Jmunch-Gateway` and latch
     the observation. Call it after every LLM call with any headers mapping
     (a dict or an httpx.Headers); a no-op when the header is absent, so it
-    is safe and transparent on non-jmunch endpoints."""
-    raw = _lookup_header(headers, _GATEWAY_HEADER)
-    if raw is None:
+    is safe and transparent on non-jmunch endpoints. The header's presence
+    is the signal — its value is not interpreted."""
+    if _lookup_header(headers, _GATEWAY_HEADER) is None:
         return
-    version = _parse_version(str(raw))
-    old_version_str: str | None = None
     with _lock:
         _state["observed"] = True
-        if version is not None:
-            _state["version"] = version
-            if version < _MIN_PASSTHROUGH_VERSION and not _state["warned_old"]:
-                _state["warned_old"] = True
-                old_version_str = ".".join(str(p) for p in version)
-    if old_version_str is not None:
-        logger.warning(
-            "hermes-memory: jmunch gateway %s is older than 0.3.0 and "
-            "ignores X-Jmunch-Handleify — memory-extraction calls will be "
-            "handle-ified. Upgrade jmunch for full-fidelity extraction.",
-            old_version_str,
-        )
 
 
 def _lookup_header(headers: Any, name: str) -> Any:
@@ -157,20 +125,3 @@ def _lookup_header(headers: Any, name: str) -> Any:
         if str(key).lower() == lname:
             return value
     return None
-
-
-def _parse_version(text: str) -> tuple[int, ...] | None:
-    """Parse a dotted version (e.g. ``0.3.0`` or ``0.3.0-rc1``) into a
-    tuple of ints. Returns None when nothing numeric can be read."""
-    nums: list[int] = []
-    for part in text.strip().split("."):
-        digits = ""
-        for ch in part:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        if not digits:
-            break
-        nums.append(int(digits))
-    return tuple(nums) if nums else None

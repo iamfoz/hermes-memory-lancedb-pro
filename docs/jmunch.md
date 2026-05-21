@@ -10,6 +10,13 @@ pure standard library; the two projects are completely orthogonal and can be
 installed together or separately. If you do not use jmunch, nothing in this
 document applies and nothing changes.
 
+> **Gateway-side support.** The pieces jmunch itself must provide — stamping
+> the `X-Jmunch-Gateway` header and honouring the `X-Jmunch-Inject` /
+> `X-Jmunch-Handleify` request headers — currently live in a fork of jmunch-mcp
+> and are not yet part of an upstream release. Against a stock jmunch that
+> lacks them, this plugin simply never detects a gateway and behaves exactly as
+> it does without jmunch.
+
 ## Why the plugin cares
 
 Handle-ification is lossy: it compresses the agent's conversation history, so
@@ -42,11 +49,12 @@ Detection is two-stage and needs no configuration:
    is worth setting if you know a gateway is in the path: it makes turn-one
    tuning correct.
 
-2. **Passive confirmation (automatic).** jmunch >= 0.3.0 stamps an
-   `X-Jmunch-Gateway` header on every response. The plugin inspects response
-   headers and latches the observation the first time it sees one. This works on
-   any port and needs no setup — but, by nature, only takes effect from the
-   first response onward.
+2. **Passive confirmation (automatic).** A pass-through-capable jmunch gateway
+   stamps an `X-Jmunch-Gateway` header on every response. The plugin inspects
+   response headers and latches the observation the first time it sees one,
+   keying on the header's *presence* rather than any value it carries. This
+   works on any port and needs no setup, but only takes effect from the first
+   response onward.
 
 `is_jmunch_in_use()` is true once **either** signal has fired.
 
@@ -54,13 +62,12 @@ Detection is two-stage and needs no configuration:
 
 | Header | Direction | Meaning |
 |---|---|---|
-| `X-Jmunch-Gateway: <version>` | response | Stamped by jmunch >= 0.3.0. The passive detection signal. |
+| `X-Jmunch-Gateway` | response | Stamped by a pass-through-capable jmunch gateway. Its presence is the passive detection signal; the value is not interpreted. |
 | `X-Jmunch-Inject: false` | request | Asks the gateway not to inject verbs into this call. |
 | `X-Jmunch-Handleify: false` | request | Asks the gateway not to handle-ify tool content, so the extractor sees raw payloads. |
 
-The two request headers are inert on any non-jmunch endpoint. They are honoured
-only by jmunch >= 0.3.0; against an older gateway they are silently ignored and
-the plugin logs a one-time upgrade warning.
+The two request headers are inert on any non-jmunch endpoint, and a jmunch
+gateway that does not recognise them simply ignores them.
 
 ## Configuration
 

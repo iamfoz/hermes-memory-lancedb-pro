@@ -10,8 +10,6 @@ from hermes_memory_lancedb_pro.jmunch import (
     is_jmunch_in_use,
     jmunch_mode_configured,
     jmunch_request_headers,
-    jmunch_supports_passthrough,
-    observed_jmunch_version,
     record_response_headers,
 )
 
@@ -20,11 +18,7 @@ from hermes_memory_lancedb_pro.jmunch import (
 def _reset_jmunch_state(monkeypatch):
     """Every test starts with no declaration and no observed gateway."""
     monkeypatch.delenv(JMUNCH_MODE_ENV, raising=False)
-    monkeypatch.setattr(
-        jmunch,
-        "_state",
-        {"observed": False, "version": None, "warned_old": False},
-    )
+    monkeypatch.setattr(jmunch, "_state", {"observed": False})
 
 
 class TestModeConfigured:
@@ -51,24 +45,27 @@ class TestIsJmunchInUse:
         assert is_jmunch_in_use() is True
 
     def test_true_when_observed(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        record_response_headers({"X-Jmunch-Gateway": "fork"})
         assert is_jmunch_in_use() is True
 
 
 class TestRecordResponseHeaders:
     def test_latches_on_gateway_header(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        record_response_headers({"X-Jmunch-Gateway": "fork"})
         assert is_jmunch_in_use() is True
-        assert observed_jmunch_version() == (0, 3, 0)
 
     def test_case_insensitive_header_name(self):
-        record_response_headers({"x-jmunch-gateway": "0.3.1"})
-        assert observed_jmunch_version() == (0, 3, 1)
+        record_response_headers({"x-jmunch-gateway": "fork"})
+        assert is_jmunch_in_use() is True
+
+    def test_detects_regardless_of_header_value(self):
+        # Detection keys on the header's presence, not its content.
+        record_response_headers({"X-Jmunch-Gateway": "anything at all"})
+        assert is_jmunch_in_use() is True
 
     def test_noop_when_header_absent(self):
         record_response_headers({"content-type": "application/json"})
         assert is_jmunch_in_use() is False
-        assert observed_jmunch_version() is None
 
     @pytest.mark.parametrize("headers", [None, "not a mapping", 42])
     def test_safe_on_non_mapping(self, headers):
@@ -76,36 +73,9 @@ class TestRecordResponseHeaders:
         assert is_jmunch_in_use() is False
 
     def test_observation_latches_permanently(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
+        record_response_headers({"X-Jmunch-Gateway": "fork"})
         # A later non-jmunch response must not un-latch the observation.
         record_response_headers({"content-type": "application/json"})
-        assert is_jmunch_in_use() is True
-
-    def test_prerelease_version_parsed(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.3.0-rc1"})
-        assert observed_jmunch_version() == (0, 3, 0)
-
-    def test_unparseable_version_still_detects(self):
-        record_response_headers({"X-Jmunch-Gateway": "weird"})
-        assert is_jmunch_in_use() is True
-        assert observed_jmunch_version() is None
-
-
-class TestSupportsPassthrough:
-    def test_false_when_nothing_observed(self):
-        assert jmunch_supports_passthrough() is False
-
-    def test_true_for_0_3_0(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.3.0"})
-        assert jmunch_supports_passthrough() is True
-
-    def test_true_for_newer(self):
-        record_response_headers({"X-Jmunch-Gateway": "1.2.0"})
-        assert jmunch_supports_passthrough() is True
-
-    def test_false_for_older_but_still_detected(self):
-        record_response_headers({"X-Jmunch-Gateway": "0.2.1"})
-        assert jmunch_supports_passthrough() is False
         assert is_jmunch_in_use() is True
 
 
