@@ -143,6 +143,16 @@ class TestCrud:
         assert store.get_by_id(mid) is None
         assert store.delete(mid) is False  # already gone
 
+    def test_store_rejects_oversized_text(self, store):
+        from hermes_memory_lancedb_pro.store import MAX_TEXT_CHARS
+        with pytest.raises(ValueError, match="MEMORY_MAX_TEXT_CHARS"):
+            store.store(text="x" * (MAX_TEXT_CHARS + 1))
+
+    def test_store_many_rejects_oversized_text(self, store):
+        from hermes_memory_lancedb_pro.store import MAX_TEXT_CHARS
+        with pytest.raises(ValueError, match="MEMORY_MAX_TEXT_CHARS"):
+            store.store_many([{"text": "x" * (MAX_TEXT_CHARS + 1)}])
+
     def test_increment_access_count(self, store):
         mid = store.store(text="counts accesses correctly")
         # First access always lands (count was 0).

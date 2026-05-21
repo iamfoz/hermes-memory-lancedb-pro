@@ -11,6 +11,18 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.12.2] — 2026-05-21
+
+### Added
+- `MEMORY_MAX_TEXT_CHARS` (default 8000) — an upper bound on a single
+  memory's `text`. `store()` and `store_many()` now reject oversized text
+  with a clear error instead of passing it to the embedder, where very large
+  inputs could exhaust GPU / MPS memory. A memory entry is meant to be a
+  distilled fact; long content should be summarised — the smart extractor's
+  job — before it is stored.
+
+---
+
 ## [0.12.1] — 2026-05-21
 
 ### Added
@@ -298,6 +310,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.12.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.0...v0.11.1
