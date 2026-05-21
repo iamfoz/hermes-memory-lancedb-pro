@@ -11,6 +11,23 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.12.3] — 2026-05-21
+
+### Changed
+- jmunch detection no longer version-gates on a jmunch release number. The
+  gateway-side support it relies on — the `X-Jmunch-Gateway` header and the
+  `X-Jmunch-Inject` / `X-Jmunch-Handleify` pass-through headers — currently
+  lives in a fork of jmunch-mcp rather than a versioned upstream release, so
+  detection now keys purely on the presence of the `X-Jmunch-Gateway` header.
+
+### Removed
+- The internal jmunch version parsing and minimum-version check, the
+  "upgrade jmunch" log warning, and the `jmunch_supports_passthrough()` /
+  `observed_jmunch_version()` helpers — all tied to a release-version model
+  that does not apply to an unversioned fork.
+
+---
+
 ## [0.12.2] — 2026-05-21
 
 ### Added
@@ -39,10 +56,10 @@ minor versions; breaking changes are called out under **Changed** and
   `is_jmunch_in_use()` reports whether a [jmunch](https://github.com/) gateway
   sits in the LLM path. Detection is two-stage and adds no code dependency on
   jmunch-mcp: it is confirmed passively from the `X-Jmunch-Gateway` response
-  header that jmunch >= 0.3.0 stamps on every reply (any port; latched by
-  `record_response_headers()`), and can be declared up front with
-  `MEMORY_JMUNCH_MODE=true` so startup-time tuning is correct before the first
-  response arrives.
+  header that a pass-through-capable jmunch gateway stamps on every reply (any
+  port; latched by `record_response_headers()`), and can be declared up front
+  with `MEMORY_JMUNCH_MODE=true` so startup-time tuning is correct before the
+  first response arrives.
 - **Extractor pass-through in jmunch mode** — the memory extractor's LLM calls
   send `X-Jmunch-Inject: false` and `X-Jmunch-Handleify: false` when jmunch is
   in use, so the gateway relays those calls verbatim and the extractor sees
@@ -310,6 +327,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.12.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.12.0

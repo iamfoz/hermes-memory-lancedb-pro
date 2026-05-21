@@ -172,7 +172,9 @@ memory-extraction calls verbatim so the extractor sees full-fidelity content.
 
 This is entirely optional and has **no code dependency** on jmunch — the two
 projects are orthogonal. Detection is automatic (via the `X-Jmunch-Gateway`
-response header), and can be declared up front with `MEMORY_JMUNCH_MODE=true`.
+response header) and can be declared up front with `MEMORY_JMUNCH_MODE=true`.
+The gateway-side support it relies on currently lives in a fork of jmunch-mcp,
+not yet an upstream release.
 
 See [docs/jmunch.md](docs/jmunch.md) for the full integration guide.
 
