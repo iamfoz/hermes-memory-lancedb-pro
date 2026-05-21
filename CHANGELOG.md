@@ -11,6 +11,15 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.12.1] — 2026-05-21
+
+### Added
+- `MemoryStore.delete(mem_id)` — an alias for `forget()`, added because
+  `delete` is the conventional method name to reach for. Behaviour is
+  identical: a hard delete of the memory's live row.
+
+---
+
 ## [0.12.0] — 2026-05-20
 
 ### Added
@@ -289,6 +298,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.12.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.10.1...v0.11.0

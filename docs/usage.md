@@ -101,7 +101,7 @@ ids = store.store_many([
 # Update — supersede pattern: archives the old row, writes a new one.
 new_id = store.update(mem_id=mem_id, text="Updated text.", tier="core")
 
-store.forget(mem_id=new_id)                 # soft-delete
+store.delete(mem_id=new_id)                 # delete by id (alias: forget())
 store.stats()                               # totals, tier/category breakdown
 store.purge_archived(grace_period_days=30)  # GC superseded rows
 ```
