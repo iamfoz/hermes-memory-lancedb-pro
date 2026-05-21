@@ -11,6 +11,38 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.13.0] — 2026-05-21
+
+### Added
+- **Task-ledger garbage collection.** Completed task directories no longer
+  accumulate without bound. A cooldown-gated GC runs at session end, and is
+  available manually as `hermes-memory-lancedb-pro task gc` (with `--dry-run`):
+  completed tasks older than `MEMORY_TASK_RETENTION_DAYS` (default 30) are
+  archived under `<task-root>/archive/`, preserving their `results.jsonl` /
+  `events.jsonl` audit trail; archived directories are hard-deleted after a
+  further `MEMORY_TASK_ARCHIVE_GRACE_DAYS` (default 90).
+  `MEMORY_TASK_GC_MODE=delete` hard-deletes outright instead. Every action is
+  recorded to an append-only `<task-root>/.task-gc-log.jsonl`. Running tasks
+  are never touched (only reported when long-idle), and the matching
+  `active_task` pin memory is removed so its `state_path` cannot dangle.
+  Auto-GC is gated by `MEMORY_TASK_GC_COOLDOWN_HOURS` (default 168; `0`
+  disables).
+- **Per-task GC holds** — `task hold <id>` exempts a task from garbage
+  collection entirely; `task unhold <id>` releases it. `task list` shows a
+  `[held]` marker.
+- **`task to-skill <id>`** — scaffold a draft reusable skill (`SKILL.md` +
+  `AGENTS.md`) from a task. The objective and invariants transfer directly and
+  the Protocol section is seeded with the task's iteration history, ready for
+  the author to refine.
+- `complete_task` records an explicit `completed_at` timestamp.
+
+### Security
+- Task ids are now validated — `create_task` rejects ids containing a path
+  separator or `.` / `..`, closing a directory-traversal vector now that GC
+  performs filesystem operations on task directories.
+
+---
+
 ## [0.12.3] — 2026-05-21
 
 ### Changed
@@ -327,6 +359,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.13.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.3...v0.13.0
 [0.12.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.0...v0.12.1

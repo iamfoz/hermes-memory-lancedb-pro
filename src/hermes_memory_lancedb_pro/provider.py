@@ -142,6 +142,26 @@ _AUTO_COMPACT_COOLDOWN_HOURS: int = int(
 _COMPACT_STATE_FILENAME = ".compact-state.json"
 
 # ---------------------------------------------------------------------------
+# Task-ledger garbage-collection configuration
+# ---------------------------------------------------------------------------
+# Hours between automatic task-ledger GC runs. GC archives (or deletes)
+# completed task directories past the retention window. Defaults to weekly;
+# set 0 to disable auto-GC entirely.
+_AUTO_TASK_GC_COOLDOWN_HOURS: int = int(
+    os.environ.get("MEMORY_TASK_GC_COOLDOWN_HOURS", "168")
+)
+# Completed tasks older than this many days are archived (or deleted).
+_TASK_RETENTION_DAYS: int = int(os.environ.get("MEMORY_TASK_RETENTION_DAYS", "30"))
+# "archive" — move the dir under <task-root>/archive/, keeping the audit
+# trail — or "delete" — hard-delete the dir outright.
+_TASK_GC_MODE: str = os.environ.get("MEMORY_TASK_GC_MODE", "archive").strip().lower()
+# Archived task dirs older than retention + this are hard-deleted; 0 disables
+# that second stage.
+_TASK_ARCHIVE_GRACE_DAYS: int = int(
+    os.environ.get("MEMORY_TASK_ARCHIVE_GRACE_DAYS", "90")
+)
+
+# ---------------------------------------------------------------------------
 # Reflection configuration
 # ---------------------------------------------------------------------------
 # Reflection captures durable "invariants" and short-lived "derived" insights
@@ -832,6 +852,93 @@ def _maybe_auto_purge(store: MemoryStore) -> None:
             )
     except Exception as e:
         logger.warning("Auto-purge failed (will retry next session): %s", e)
+
+
+def _soft_delete_task_pin(store: MemoryStore, task_id: str) -> None:
+    """Remove the `active_task` pin memory for a garbage-collected task.
+
+    Called after a completed task's ledger has been archived or deleted, so
+    the pin's `state_path` can never dangle. Best-effort: a stale pin is also
+    tolerated by `_refresh_active_task_memories` (a missing `state_path`
+    degrades gracefully), so a failure here is harmless.
+    """
+    try:
+        pins = store.list_memories(
+            limit=500, category="active_task", include_archived=False
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("task-pin cleanup for %s: list failed: %s", task_id, e)
+        return
+    for row in pins:
+        meta = row.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (ValueError, TypeError):
+                continue
+        if meta.get("task_id") == task_id:
+            try:
+                store.forget(row["id"])
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("task-pin cleanup for %s: forget failed: %s", task_id, e)
+
+
+def _maybe_auto_task_gc(store: MemoryStore) -> None:
+    """Run task-ledger GC if the cooldown has elapsed since the last run.
+
+    Archives (default) or deletes completed task directories past
+    ``MEMORY_TASK_RETENTION_DAYS``, then soft-deletes the matching
+    ``active_task`` pin memory so its ``state_path`` cannot dangle.
+
+    Set ``MEMORY_TASK_GC_COOLDOWN_HOURS=0`` to disable entirely.
+    """
+    if _AUTO_TASK_GC_COOLDOWN_HOURS <= 0:
+        return
+
+    from .task_gc import (
+        TASK_GC_STATE_FILENAME,
+        TaskGCConfig,
+        record_task_gc_run,
+        run_task_gc,
+        should_run_task_gc,
+    )
+    from .task_ledger import TASK_ROOT
+
+    state_file = os.path.join(str(TASK_ROOT), TASK_GC_STATE_FILENAME)
+    if not should_run_task_gc(state_file, cooldown_hours=_AUTO_TASK_GC_COOLDOWN_HOURS):
+        return
+
+    try:
+        result = run_task_gc(
+            config=TaskGCConfig(
+                retention_days=_TASK_RETENTION_DAYS,
+                mode=_TASK_GC_MODE,
+                archive_grace_days=_TASK_ARCHIVE_GRACE_DAYS,
+            )
+        )
+        record_task_gc_run(state_file)
+        for task_id in (*result.archived, *result.deleted):
+            _soft_delete_task_pin(store, task_id)
+        gc_count = len(result.archived) + len(result.deleted)
+        if gc_count or result.purged_archive:
+            logger.info(
+                "Auto-task-GC: %d ledger(s) %sd, %d archive dir(s) purged. "
+                "Next run in ~%dh.",
+                gc_count,
+                _TASK_GC_MODE,
+                len(result.purged_archive),
+                _AUTO_TASK_GC_COOLDOWN_HOURS,
+            )
+        else:
+            logger.debug("Auto-task-GC: nothing to collect.")
+        if result.abandoned_running:
+            logger.info(
+                "Auto-task-GC: %d long-idle running task(s), left in place: %s",
+                len(result.abandoned_running),
+                ", ".join(result.abandoned_running),
+            )
+    except Exception as e:
+        logger.warning("Auto-task-GC failed (will retry next session): %s", e)
 
 
 def _anchor_belongs(metadata: dict[str, Any], conversation_id: str) -> bool:
@@ -1857,6 +1964,7 @@ def _build_provider_class():
                 self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
             _maybe_auto_compact(self._store)
+            _maybe_auto_task_gc(self._store)
 
         def _maybe_write_reflection(self, texts: list[str]) -> None:
             """Generate a session reflection via the extractor's LLM and
@@ -1959,6 +2067,7 @@ def _build_provider_class():
                 self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
             _maybe_auto_compact(self._store)
+            _maybe_auto_task_gc(self._store)
 
     return LanceDBProMemoryProvider
 

@@ -48,6 +48,18 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 | `MEMORY_PURGE_GRACE_DAYS` | `30` | Archived rows younger than this are spared during a purge. |
 | `MEMORY_AUTO_COMPACT_COOLDOWN_HOURS` | `168` | Hours between automatic memory-compaction runs (weekly). `0` disables. |
 
+## Task-ledger garbage collection
+
+Completed task directories under the task root are archived (or deleted) once
+past the retention window. See [usage.md](usage.md) for the `task gc` command.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMORY_TASK_GC_COOLDOWN_HOURS` | `168` | Hours between automatic task-GC runs at session end. `0` disables auto-GC. |
+| `MEMORY_TASK_RETENTION_DAYS` | `30` | Completed tasks older than this are archived (or deleted). |
+| `MEMORY_TASK_GC_MODE` | `archive` | `archive` moves the task dir under `<task-root>/archive/`, keeping its audit trail; `delete` hard-deletes it. |
+| `MEMORY_TASK_ARCHIVE_GRACE_DAYS` | `90` | Archived task dirs older than `retention + this` are hard-deleted; `0` disables that second stage. |
+
 ## Reflection
 
 | Variable | Default | Purpose |

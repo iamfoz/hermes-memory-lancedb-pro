@@ -1017,7 +1017,8 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
         current = t.get("current_iteration", 0)
         target = t.get("target_iterations")
         iter_str = f"{current}/{target}" if target is not None else str(current)
-        print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}")
+        held = "  [held]" if t.get("gc_hold") else ""
+        print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}{held}")
     return 0
 
 
@@ -1156,11 +1157,141 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_task_gc(args: argparse.Namespace) -> int:
+    """Garbage-collect completed task ledgers past the retention window."""
+    from . import task_gc as _tgc
+
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    dry_run = bool(getattr(args, "dry_run", False))
+    quiet = bool(getattr(args, "quiet", False))
+
+    def _arg_or_env_int(val: int | None, env_name: str, default: int) -> int:
+        if val is not None:
+            return val
+        raw = os.environ.get(env_name, "").strip()
+        try:
+            return int(raw) if raw else default
+        except ValueError:
+            return default
+
+    cfg = _tgc.TaskGCConfig(
+        dry_run=dry_run,
+        mode=(getattr(args, "mode", None)
+              or os.environ.get("MEMORY_TASK_GC_MODE", "archive").strip().lower()
+              or "archive"),
+        retention_days=_arg_or_env_int(
+            getattr(args, "retention_days", None), "MEMORY_TASK_RETENTION_DAYS", 30),
+        archive_grace_days=_arg_or_env_int(
+            getattr(args, "archive_grace_days", None),
+            "MEMORY_TASK_ARCHIVE_GRACE_DAYS", 90),
+    )
+
+    result = _tgc.run_task_gc(root=root, config=cfg)
+
+    if not quiet:
+        hdr = f"Task GC — {cfg.mode} mode"
+        if dry_run:
+            hdr += " — DRY RUN (no changes made)"
+        print(hdr)
+        print(f"  Scanned:           {result.scanned}")
+        if result.archived:
+            print(f"  Archived ({len(result.archived)}): {', '.join(result.archived)}")
+        if result.deleted:
+            print(f"  Deleted ({len(result.deleted)}): {', '.join(result.deleted)}")
+        if result.purged_archive:
+            print(f"  Purged from archive ({len(result.purged_archive)}): "
+                  f"{', '.join(result.purged_archive)}")
+        if result.held:
+            print(f"  Held, skipped ({len(result.held)}): {', '.join(result.held)}")
+        if result.abandoned_running:
+            print(f"  Abandoned running, left in place "
+                  f"({len(result.abandoned_running)}): "
+                  f"{', '.join(result.abandoned_running)}")
+        print(f"  Skipped — still running: {result.skipped_running}")
+        print(f"  Skipped — too recent:    {result.skipped_recent}")
+        if result.skipped_unparseable:
+            print(f"  Skipped — unreadable:    {result.skipped_unparseable}")
+        for err in result.errors:
+            print(f"  error: {err}", file=sys.stderr)
+
+    gc_ids = [*result.archived, *result.deleted]
+    if gc_ids and not dry_run:
+        try:
+            from .provider import _soft_delete_task_pin
+            store = _open_store(args)
+            for tid in gc_ids:
+                _soft_delete_task_pin(store, tid)
+            if not quiet:
+                print(f"  Cleaned up active_task pins for {len(gc_ids)} task(s).")
+        except Exception as e:
+            print(f"  warning: pin cleanup skipped ({e})", file=sys.stderr)
+    return 0
+
+
+def _cmd_task_hold(args: argparse.Namespace) -> int:
+    """Set or clear the GC-hold flag on a task (hold / unhold)."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    hold = getattr(args, "task_command", "hold") != "unhold"
+    try:
+        _tl.set_task_hold(task_id, hold, root=root)
+        if not quiet:
+            if hold:
+                print(f"Task {task_id!r} held — exempt from garbage collection.")
+            else:
+                print(f"Task {task_id!r} released — eligible for garbage collection.")
+        return 0
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+
+
+def _cmd_task_to_skill(args: argparse.Namespace) -> int:
+    """Scaffold a draft reusable skill from a task ledger."""
+    from . import task_skill as _tsk
+
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    out_str = getattr(args, "out", None)
+    out_dir = Path(out_str).expanduser() if out_str else None
+    force = bool(getattr(args, "force", False))
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        dest = _tsk.scaffold_skill_from_task(
+            task_id, root=root, out_dir=out_dir, force=force
+        )
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+    except (FileExistsError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not quiet:
+        print(f"Scaffolded a draft skill from task {task_id!r}:")
+        print(f"  {dest / 'SKILL.md'}")
+        print(f"  {dest / 'AGENTS.md'}")
+        print("  DRAFT — review and rewrite the Protocol section before use.")
+    return 0
+
+
 def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     """Dispatch task sub-subcommands."""
     sub = getattr(args, "task_command", None)
     if sub is None:
-        print("Usage: ... task <create|list|show|resume|advance|complete|pin>")
+        print(
+            "Usage: ... task <create|list|show|resume|advance|complete|pin|"
+            "gc|hold|unhold|to-skill>"
+        )
         return 0
     return {
         "create": _cmd_task_create,
@@ -1170,6 +1301,10 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "advance": _cmd_task_advance,
         "complete": _cmd_task_complete,
         "pin": _cmd_task_pin,
+        "gc": _cmd_task_gc,
+        "hold": _cmd_task_hold,
+        "unhold": _cmd_task_hold,
+        "to-skill": _cmd_task_to_skill,
     }.get(sub, lambda _: 0)(args)
 
 
@@ -1230,6 +1365,44 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
                        help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_pin.add_argument("--task-root", default=None, metavar="PATH")
     p_pin.add_argument("-q", "--quiet", action="store_true")
+
+    p_gc = tsubs.add_parser(
+        "gc", help="Garbage-collect completed task ledgers past the retention window"
+    )
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="Report what would be collected without changing anything")
+    p_gc.add_argument("--mode", default=None, choices=["archive", "delete"],
+                      help="archive (default) keeps an audit trail; delete removes outright")
+    p_gc.add_argument("--retention-days", dest="retention_days", type=int, default=None,
+                      metavar="N", help="Completed tasks older than N days are collected")
+    p_gc.add_argument("--archive-grace-days", dest="archive_grace_days", type=int,
+                      default=None, metavar="N",
+                      help="Hard-delete archived dirs older than retention+N; 0 disables")
+    p_gc.add_argument("--task-root", default=None, metavar="PATH")
+    p_gc.add_argument("--path", default=None, metavar="PATH",
+                      help="Memory DB dir, for active_task pin cleanup")
+    p_gc.add_argument("-q", "--quiet", action="store_true")
+
+    p_hold = tsubs.add_parser("hold", help="Exempt a task from garbage collection")
+    p_hold.add_argument("task_id", metavar="TASK_ID")
+    p_hold.add_argument("--task-root", default=None, metavar="PATH")
+    p_hold.add_argument("-q", "--quiet", action="store_true")
+
+    p_unhold = tsubs.add_parser("unhold", help="Release a GC hold on a task")
+    p_unhold.add_argument("task_id", metavar="TASK_ID")
+    p_unhold.add_argument("--task-root", default=None, metavar="PATH")
+    p_unhold.add_argument("-q", "--quiet", action="store_true")
+
+    p_skill = tsubs.add_parser(
+        "to-skill", help="Scaffold a draft reusable skill from a task"
+    )
+    p_skill.add_argument("task_id", metavar="TASK_ID")
+    p_skill.add_argument("--out", default=None, metavar="DIR",
+                         help="Output dir (default: ~/.hermes/skills/<task-id>/)")
+    p_skill.add_argument("--force", action="store_true",
+                         help="Overwrite an existing non-empty output dir")
+    p_skill.add_argument("--task-root", default=None, metavar="PATH")
+    p_skill.add_argument("-q", "--quiet", action="store_true")
 
 
 # ---------------------------------------------------------------------------
