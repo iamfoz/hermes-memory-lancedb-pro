@@ -10,6 +10,7 @@ import pytest
 
 from hermes_memory_lancedb_pro.task_ledger import (
     _resolve_task_root,
+    _validate_task_id,
     advance_iteration,
     append_jsonl,
     atomic_write_json,
@@ -20,6 +21,7 @@ from hermes_memory_lancedb_pro.task_ledger import (
     load_state,
     looks_like_reset,
     save_state,
+    set_task_hold,
 )
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,11 @@ class TestCompleteTask:
         state = load_state("test-task-001", root=task_root)
         assert state["status"] == "complete"
 
+    def test_writes_completed_at(self, task_root, simple_task):
+        state = complete_task("test-task-001", root=task_root)
+        assert "completed_at" in state
+        assert load_state("test-task-001", root=task_root).get("completed_at")
+
 
 # ---------------------------------------------------------------------------
 # append_jsonl
@@ -415,3 +422,33 @@ class TestResolveTaskRoot:
         monkeypatch.delenv("HERMES_TASK_ROOT", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert _resolve_task_root() == Path.home() / ".hermes" / "workspace" / "tasks"
+
+
+class TestValidateTaskId:
+    """task_id becomes a directory name — reject anything that could escape."""
+
+    def test_accepts_normal_ids(self):
+        for tid in ("task1", "stress-test-2026-05-20", "a.b_c-1"):
+            assert _validate_task_id(tid) == tid
+
+    @pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "../evil", "x\\y", "a b"])
+    def test_rejects_unsafe_ids(self, bad):
+        with pytest.raises(ValueError):
+            _validate_task_id(bad)
+
+    def test_create_task_rejects_traversal_id(self, task_root):
+        with pytest.raises(ValueError):
+            create_task("../escape", "obj", root=task_root)
+
+
+class TestSetTaskHold:
+    def test_hold_roundtrip(self, task_root):
+        create_task("h1", "obj", root=task_root)
+        set_task_hold("h1", True, root=task_root)
+        assert load_state("h1", root=task_root)["gc_hold"] is True
+        set_task_hold("h1", False, root=task_root)
+        assert load_state("h1", root=task_root)["gc_hold"] is False
+
+    def test_hold_missing_task_raises(self, task_root):
+        with pytest.raises(FileNotFoundError):
+            set_task_hold("nope", True, root=task_root)

@@ -58,10 +58,21 @@ hermes-memory-lancedb-pro task resume TASK_ID          # prints the control bloc
 hermes-memory-lancedb-pro task advance TASK_ID --result pass --next-action "..."
 hermes-memory-lancedb-pro task complete TASK_ID [--summary TEXT]
 hermes-memory-lancedb-pro task pin TASK_ID             # store as an always-recalled memory
+hermes-memory-lancedb-pro task hold TASK_ID            # exempt from garbage collection
+hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
+hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
+hermes-memory-lancedb-pro task to-skill TASK_ID        # scaffold a reusable skill draft
 ```
 
 `task pin` stores the control block as an `active_task` memory, which the
 recall path always surfaces first.
+
+Completed task ledgers are garbage-collected automatically — archived under
+`<task-root>/archive/`, then hard-deleted after a grace period. Run
+`task gc --dry-run` to preview, or `task gc` to collect now; `task hold`
+protects a task from collection. `task to-skill` turns a useful task into a
+draft reusable skill. Retention is tunable — see
+[configuration.md](configuration.md#task-ledger-garbage-collection).
 
 ### Smoke test
 

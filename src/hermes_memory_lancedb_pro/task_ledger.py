@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -125,6 +126,22 @@ def _state_path(task_id: str, root: Path | None = None) -> Path:
     return _task_dir(task_id, root) / "state.json"
 
 
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_task_id(task_id: str) -> str:
+    """Reject task ids that could escape the task root.
+
+    A task id becomes a directory name, so anything containing a path
+    separator — or ``.`` / ``..`` — would let a write, or a GC ``shutil``
+    call, operate outside the task root. Allows alphanumerics, dot,
+    underscore and hyphen. Returns *task_id* unchanged when valid.
+    """
+    if not task_id or task_id in (".", "..") or not _TASK_ID_RE.match(task_id):
+        raise ValueError(f"invalid task_id: {task_id!r}")
+    return task_id
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -158,6 +175,7 @@ def create_task(
     Raises ``FileExistsError`` if a task with this *task_id* already exists.
     Returns the initial state dict.
     """
+    _validate_task_id(task_id)
     sp = _state_path(task_id, root)
     if sp.exists():
         raise FileExistsError(f"Task {task_id!r} already exists at {sp}")
@@ -253,11 +271,27 @@ def complete_task(
     """Mark task as complete and write a completion event."""
     state = load_state(task_id, root)
     state["status"] = "complete"
+    state["completed_at"] = _now_iso()
     state["next_action"] = "Task complete."
     if summary:
         state["recent_summary"] = summary
     save_state(task_id, state, root)
     append_jsonl(task_id, "events.jsonl", {"event": "complete"}, root=root)
+    return state
+
+
+def set_task_hold(
+    task_id: str, hold: bool, root: Path | None = None
+) -> dict[str, Any]:
+    """Set or clear the GC-hold flag on a task.
+
+    A held task (``gc_hold`` true) is exempt from all garbage collection —
+    never archived, deleted, or reported as abandoned, regardless of age or
+    status. Returns the updated state.
+    """
+    state = load_state(task_id, root)
+    state["gc_hold"] = bool(hold)
+    save_state(task_id, state, root)
     return state
 
 
