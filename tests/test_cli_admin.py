@@ -243,6 +243,22 @@ class TestExport:
                 assert field in record, f"missing field: {field}"
             assert len(record["vector"]) == VECTOR_DIM
 
+    def test_export_creates_missing_parent_directories(self, store, tmp_path):
+        """export -o into a not-yet-existing directory creates the path."""
+        store.store(text="memory written to a freshly created backup directory")
+        out_path = tmp_path / "rescue" / "nested" / "memory-backup.jsonl"
+        args = _Args(
+            path=store.db_path,
+            quiet=True,
+            out=str(out_path),
+            limit=100_000,
+            include_archived=False,
+        )
+        rc = _cmd_export(args, _store=store)
+        assert rc == 0
+        assert out_path.exists()
+        assert out_path.read_text(encoding="utf-8").strip()
+
 
 # ---------------------------------------------------------------------------
 # TestDoctor

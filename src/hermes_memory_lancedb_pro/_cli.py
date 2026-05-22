@@ -118,6 +118,9 @@ def _cmd_export(
     limit = getattr(args, "limit", 100_000)
     include_archived = getattr(args, "include_archived", False)
 
+    if out_path != "-":
+        parent = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(parent, exist_ok=True)
     out_file = sys.stdout if out_path == "-" else open(out_path, "w", encoding="utf-8")  # noqa: SIM115
 
     try:
