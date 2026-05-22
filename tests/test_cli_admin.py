@@ -259,6 +259,46 @@ class TestExport:
         assert out_path.exists()
         assert out_path.read_text(encoding="utf-8").strip()
 
+    def test_export_fails_loudly_when_scan_errors(self, store, tmp_path):
+        """A failed table scan exits non-zero instead of writing an empty file."""
+        def _boom(*_a, **_kw):
+            raise RuntimeError("simulated missing fragment")
+
+        store._scan_all = _boom
+        out_path = tmp_path / "should-not-be-created.jsonl"
+        args = _Args(
+            path=store.db_path,
+            quiet=True,
+            out=str(out_path),
+            limit=100_000,
+            include_archived=False,
+            salvage=False,
+        )
+        rc = _cmd_export(args, _store=store)
+        assert rc == 1
+        assert not out_path.exists()
+
+    def test_export_salvage_recovers_rows_from_healthy_store(self, store, tmp_path):
+        """--salvage exports every row when the dataset is intact."""
+        for i in range(5):
+            store.store(text=f"salvageable memory number {i} with ample text")
+        out_path = tmp_path / "salvage.jsonl"
+        args = _Args(
+            path=store.db_path,
+            quiet=True,
+            out=str(out_path),
+            limit=100_000,
+            include_archived=False,
+            salvage=True,
+        )
+        rc = _cmd_export(args, _store=store)
+        assert rc == 0
+        lines = [
+            ln for ln in out_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert len(lines) == 5
+
 
 # ---------------------------------------------------------------------------
 # TestDoctor

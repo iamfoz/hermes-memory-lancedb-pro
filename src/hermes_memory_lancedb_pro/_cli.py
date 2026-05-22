@@ -99,6 +99,29 @@ def _stderr(msg: str, quiet: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _format_salvage_report(report: dict[str, Any]) -> str:
+    """Render a one-line human summary of a ``MemoryStore.salvage_scan`` report."""
+    rows = report.get("rows", 0)
+    mode = report.get("mode")
+    if mode == "version":
+        failed = len(report.get("failed_versions") or [])
+        suffix = f" ({failed} newer version(s) unreadable)" if failed else ""
+        return (
+            f"salvage: recovered {rows} rows from dataset "
+            f"version {report.get('version')}{suffix}"
+        )
+    if mode == "fragment":
+        skipped = report.get("skipped_fragments") or []
+        return (
+            f"salvage: recovered {rows} rows fragment-by-fragment; "
+            f"{len(skipped)} fragment(s) unrecoverable"
+        )
+    note = report.get("note")
+    if note:
+        return f"salvage: no dataset version scanned cleanly — {note}"
+    return f"salvage: recovered {rows} rows"
+
+
 def _cmd_export(
     args: argparse.Namespace,
     _store: MemoryStore | None = None,
@@ -109,6 +132,10 @@ def _cmd_export(
     ``scope``, ``importance``, ``timestamp``, ``vector`` (list of floats),
     and ``metadata`` (JSON string).
 
+    With ``--salvage`` a best-effort recovery scan is used instead of the
+    normal full scan — it tolerates a corrupted dataset (missing fragment
+    files); see ``MemoryStore.salvage_scan``.
+
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
@@ -117,6 +144,27 @@ def _cmd_export(
     out_path = getattr(args, "out", "-")
     limit = getattr(args, "limit", 100_000)
     include_archived = getattr(args, "include_archived", False)
+    salvage = getattr(args, "salvage", False)
+
+    # Scan BEFORE opening the output file: a scan failure must never truncate
+    # an existing file or leave behind a misleading empty export.
+    if salvage:
+        try:
+            rows, report = store.salvage_scan(limit=limit)
+        except Exception as e:
+            _stderr(f"export --salvage failed: {e}")
+            return 1
+        _stderr(_format_salvage_report(report), quiet)
+    else:
+        try:
+            rows = store._scan_all(limit=limit, strict=True)
+        except Exception as e:
+            _stderr(
+                "export failed: the full table scan errored — the store may "
+                f"be corrupt ({e}). Re-run with --salvage to recover whatever "
+                "is still readable."
+            )
+            return 1
 
     if out_path != "-":
         parent = os.path.dirname(os.path.abspath(out_path))
@@ -125,7 +173,7 @@ def _cmd_export(
 
     try:
         count = 0
-        for row in store._scan_all(limit=limit):
+        for row in rows:
             meta_str = row.get("metadata", "{}")
             meta = _parse_metadata(meta_str)
             if not include_archived and meta.get("state") == "archived":
@@ -540,6 +588,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
+    p_export.add_argument("--salvage", action="store_true",
+                          help="Best-effort recovery scan for a corrupt store; "
+                               "skips unreadable fragments")
 
     p_import = subs.add_parser(
         "import",
@@ -1523,6 +1574,9 @@ def main() -> int:
                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
+    p_export.add_argument("--salvage", action="store_true",
+                          help="Best-effort recovery scan for a corrupt store; "
+                               "skips unreadable fragments")
 
     # ---- import ----
     p_import = subparsers.add_parser(

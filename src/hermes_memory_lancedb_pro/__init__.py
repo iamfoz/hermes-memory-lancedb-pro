@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 
 # Pure-Python re-exports (safe — no heavy deps)
 # Reflection layer (PR 2). Pure-Python; the storage adapter delegates to
