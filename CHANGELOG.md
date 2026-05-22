@@ -11,6 +11,19 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.14.1] — 2026-05-21
+
+### Added
+- `MEMORY_FD_LIMIT` (default 4096) — on construction, `MemoryStore` raises its
+  process's soft open-file limit toward the hard ceiling. LanceDB opens a
+  descriptor per on-disk fragment, so a process started with a low soft limit
+  (macOS shells default to 256) could exhaust descriptors under sustained
+  concurrent load. The store now lifts the limit itself — no privileges, no
+  shell or launchd configuration required. Best-effort and capped at the hard
+  limit; set `0` to disable.
+
+---
+
 ## [0.14.0] — 2026-05-21
 
 ### Added
@@ -376,6 +389,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[0.14.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.3...v0.13.0
 [0.12.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.2...v0.12.3

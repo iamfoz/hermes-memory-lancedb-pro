@@ -96,6 +96,13 @@ AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256
 # better place to summarise long content.
 MAX_TEXT_CHARS: int = int(os.environ.get("MEMORY_MAX_TEXT_CHARS", "8000"))
 
+# Soft open-file (file-descriptor) limit the store ensures for its process.
+# LanceDB opens a descriptor per on-disk fragment, so under sustained write
+# load a process started with a low soft limit (macOS shells default to 256)
+# can exhaust descriptors. `MemoryStore` raises the soft limit toward the hard
+# ceiling on construction — no privileges needed. Set 0 to disable.
+MEMORY_FD_LIMIT: int = int(os.environ.get("MEMORY_FD_LIMIT", "4096"))
+
 # "active_task" backs the durable-task pin: `task pin`, the recall-guardrail
 # active-task pinning, `_format_recall`, `_refresh_active_task_memories` and the
 # session auto-anchor all read/write this category. It MUST be a recognised
@@ -263,6 +270,47 @@ class MemorySchema(LanceModel):
 
 
 # ---------------------------------------------------------------------------
+# File-descriptor limit
+# ---------------------------------------------------------------------------
+
+
+def _raise_fd_limit() -> None:
+    """Best-effort raise of this process's soft open-file limit.
+
+    LanceDB opens a descriptor per on-disk fragment, so under sustained write
+    load a process started with a low soft limit (macOS shells default to 256)
+    can exhaust descriptors. Raising the soft limit toward the hard ceiling
+    needs no privileges. Controlled by ``MEMORY_FD_LIMIT`` (default 4096; set
+    ``0`` to disable). Best-effort: any failure is logged at debug and ignored.
+    """
+    if MEMORY_FD_LIMIT <= 0:
+        return
+    try:
+        import resource
+    except ImportError:  # non-Unix platform — no rlimits
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    target = MEMORY_FD_LIMIT
+    if hard != resource.RLIM_INFINITY and hard > 0:
+        target = min(target, hard)
+    if target <= soft:
+        return  # already sufficient
+    # Some platforms (notably macOS) reject an unlimited hard value here, so
+    # retry with the hard limit clamped to the target as a fallback.
+    for new_hard in (hard, target):
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, new_hard))
+            logger.info("Raised open-file soft limit %d -> %d", soft, target)
+            return
+        except (ValueError, OSError):
+            continue
+    logger.debug("Could not raise the open-file limit above %d", soft)
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -280,6 +328,7 @@ class MemoryStore:
         db_path: str = DEFAULT_DB_PATH,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ):
+        _raise_fd_limit()
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.embedding_model_name = embedding_model
         self._embedder: SentenceTransformer | None = None
