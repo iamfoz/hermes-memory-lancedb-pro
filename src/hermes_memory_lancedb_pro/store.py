@@ -1574,14 +1574,104 @@ class MemoryStore:
         except Exception:
             pass
 
-    def _scan_all(self, limit: int = MAX_SCAN_ROWS) -> Iterable[dict[str, Any]]:
-        """Iterate every row in the table up to `limit`. Yields raw rows."""
+    def _scan_all(
+        self, limit: int = MAX_SCAN_ROWS, *, strict: bool = False
+    ) -> Iterable[dict[str, Any]]:
+        """Iterate every row in the table up to `limit`. Yields raw rows.
+
+        Fail-soft by default — a scan error is logged and an empty iterator
+        returned, so `stats` / `purge_archived` degrade gracefully. Pass
+        `strict=True` to re-raise instead: callers that must not mistake a
+        corrupt store (a missing fragment file) for an empty one — `export` —
+        need the failure surfaced rather than swallowed."""
         try:
             results = self._table.search().limit(limit).to_list()
         except Exception as e:
             logger.error("Full table scan failed: %s", e)
+            if strict:
+                raise
             return iter(())
         return iter(results)
+
+    def salvage_scan(
+        self, limit: int = MAX_SCAN_ROWS
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Best-effort recovery scan for a corrupted dataset.
+
+        A normal scan aborts entirely the moment one fragment file is
+        missing. This walks the table's version history newest-first and
+        returns the first version that scans cleanly. If no version is
+        intact and the optional `pylance` package is available, it falls
+        back to reading the dataset fragment-by-fragment, skipping the
+        unreadable ones. Read-only — the table handle is restored to the
+        latest version before returning.
+
+        Returns `(rows, report)`. `report` keys: `mode` (`version`,
+        `fragment` or `none`), `version`, `rows`, `skipped_fragments`,
+        `failed_versions`, `note`."""
+        report: dict[str, Any] = {
+            "mode": "none", "version": None, "rows": 0,
+            "skipped_fragments": [], "failed_versions": [], "note": "",
+        }
+        try:
+            versions = [v["version"] for v in self._table.list_versions()]
+        except Exception as e:
+            logger.warning("salvage: could not list table versions: %s", e)
+            versions = []
+
+        # Strategy 1 — newest table version that scans cleanly.
+        try:
+            for ver in sorted(versions, reverse=True):
+                try:
+                    self._table.checkout(ver)
+                    rows = self._table.search().limit(limit).to_list()
+                except Exception as e:
+                    logger.warning("salvage: version %s unreadable: %s", ver, e)
+                    report["failed_versions"].append(ver)
+                    continue
+                report.update(mode="version", version=ver, rows=len(rows))
+                return rows, report
+        finally:
+            import contextlib
+            with contextlib.suppress(Exception):
+                self._table.checkout_latest()
+
+        # Strategy 2 — fragment-by-fragment (needs the optional pylance pkg).
+        return self._salvage_fragments(limit, report), report
+
+    def _salvage_fragments(
+        self, limit: int, report: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Read the dataset fragment-by-fragment, skipping unreadable ones.
+
+        Used by `salvage_scan` when no whole version scans cleanly. Needs
+        the optional `pylance` package; without it, records a note in
+        `report` and returns an empty list."""
+        try:
+            dataset = self._table.to_lance()
+        except Exception as e:
+            report["note"] = (
+                "fragment-level salvage unavailable — install the optional "
+                f"'pylance' package (pip install pylance) to enable it ({e})"
+            )
+            logger.warning("salvage: fragment scan unavailable: %s", e)
+            return []
+        rows: list[dict[str, Any]] = []
+        for frag in dataset.get_fragments():
+            try:
+                frag_rows = frag.to_table().to_pylist()
+            except Exception as e:
+                logger.warning(
+                    "salvage: fragment %s unreadable: %s", frag.fragment_id, e
+                )
+                report["skipped_fragments"].append(str(frag.fragment_id))
+                continue
+            rows.extend(frag_rows)
+            if len(rows) >= limit:
+                rows = rows[:limit]
+                break
+        report.update(mode="fragment", rows=len(rows))
+        return rows
 
     # ----- formatters -----
 

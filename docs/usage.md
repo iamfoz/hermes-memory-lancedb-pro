@@ -33,7 +33,7 @@ hermes-memory-lancedb-pro reset [-y]
 hermes-memory-lancedb-pro doctor
 
 # Export rows to JSONL (one object per line)
-hermes-memory-lancedb-pro export -o backup.jsonl [--include-archived] [--limit N]
+hermes-memory-lancedb-pro export -o backup.jsonl [--include-archived] [--limit N] [--salvage]
 
 # Import rows from JSONL
 hermes-memory-lancedb-pro import --in backup.jsonl [--reembed] [--allow-existing]
@@ -42,6 +42,10 @@ hermes-memory-lancedb-pro import --in backup.jsonl [--reembed] [--allow-existing
 `init` and `reset` prompt for confirmation before changing data; pass
 `-y` / `--yes` to skip the prompt in scripts. `import --reembed` re-encodes each
 row's text with the current embedding model instead of trusting stored vectors.
+`export` exits non-zero if the table scan fails (a corrupt store is never
+silently reported as empty); `export --salvage` then performs a best-effort
+recovery scan — walking the dataset's version history and, if needed, reading
+it fragment-by-fragment — to rescue whatever rows are still readable.
 
 ### Durable task ledger
 

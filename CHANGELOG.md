@@ -11,6 +11,28 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.14.2] — 2026-05-22
+
+### Added
+- **`export --salvage`** — a best-effort recovery scan for a corrupted store.
+  A normal export aborts the moment one on-disk fragment file is missing;
+  with `--salvage` the exporter walks the dataset's version history
+  newest-first, and falls back to reading it fragment-by-fragment — skipping
+  the unreadable ones — so as many memories as possible can still be rescued
+  to JSONL.
+
+### Fixed
+- **`export` no longer reports a corrupt store as an empty one.** A failed
+  full-table scan was swallowed (`_scan_all` returned an empty iterator), so
+  `export` wrote an empty file and exited `0` — indistinguishable from a
+  genuinely empty store. It now exits non-zero with a clear error and points
+  to `--salvage`.
+- **`export -o` creates missing parent directories.** Exporting to a path
+  whose parent directory did not exist raised `FileNotFoundError`; the parent
+  directory is now created automatically.
+
+---
+
 ## [0.14.1] — 2026-05-22
 
 ### Added
