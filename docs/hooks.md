@@ -45,9 +45,9 @@ summary — this is what lets a long task survive compaction.
 
 ### `on_memory_write`
 
-Mirrors the host's built-in memory tool. When the user runs a built-in
-`/memory add` or `/memory replace`, the same write is reflected into this store
-so built-in memory and recall stay in sync. (`remove` is not mirrored.)
+Mirrors the host's built-in `memory` tool. When the agent invokes that tool
+with `action=add` or `action=replace`, the same write is reflected into this
+store so built-in memory and recall stay in sync. (`remove` is not mirrored.)
 
 ### `on_session_switch`
 
