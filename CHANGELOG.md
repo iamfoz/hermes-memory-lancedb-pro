@@ -11,7 +11,7 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-## [0.14.1] — 2026-05-21
+## [0.14.1] — 2026-05-22
 
 ### Added
 - `MEMORY_FD_LIMIT` (default 4096) — on construction, `MemoryStore` raises its
