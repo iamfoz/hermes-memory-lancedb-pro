@@ -11,6 +11,25 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.14.3] — 2026-05-22
+
+### Added
+- **`hermes lancedb_pro …` host-level subcommand restored.** The provider's
+  `register(ctx)` now also calls `ctx.register_cli_command(...)` (when the
+  host exposes that API), re-attaching `init / doctor / export / import /
+  reset / task` as host-level subcommands of `hermes`. Falls back silently
+  on hosts without the API; the standalone `hermes-memory-lancedb-pro`
+  script keeps working either way.
+
+### Fixed
+- **Entry-point group renamed to `hermes_agent.plugins`** to match the
+  current hermes-agent plugin loader, so entry-point-based discovery works
+  again without depending on the `~/.hermes/plugins/lancedb_pro/` shim.
+  The old `hermes.plugins` group is also kept for compatibility with
+  older hermes-agent versions.
+
+---
+
 ## [0.14.2] — 2026-05-22
 
 ### Added
