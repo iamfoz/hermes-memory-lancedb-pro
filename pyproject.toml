@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-lancedb-pro"
-version = "0.14.2"
+version = "0.14.3"
 description = "LanceDB-backed persistent memory for Hermes Agent — hybrid BM25+vector search with Weibull decay"
 readme = "README.md"
 license = {text = "MIT"}
@@ -47,7 +47,12 @@ hermes-memory = "hermes_memory_lancedb_pro._cli:main"
 # Plugin entry point — hermes-agent versions that support entry-point
 # discovery (via importlib.metadata) can find the provider without a shim.
 # Older versions still use the ~/.hermes/plugins/lancedb_pro/ shim that
-# `hermes-memory install-plugin` creates.
+# `hermes-memory install-plugin` creates. Current hermes-agent reads
+# `hermes_agent.plugins`; the older `hermes.plugins` group is kept for
+# back-compatibility.
+[project.entry-points."hermes_agent.plugins"]
+lancedb_pro = "hermes_memory_lancedb_pro.provider:register"
+
 [project.entry-points."hermes.plugins"]
 lancedb_pro = "hermes_memory_lancedb_pro.provider:register"
 

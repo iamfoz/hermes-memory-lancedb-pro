@@ -2100,6 +2100,29 @@ def register(ctx: Any) -> None:
         )
     ctx.register_memory_provider(LanceDBProMemoryProvider())
 
+    # Restore the `hermes lancedb_pro …` top-level subcommand on hosts whose
+    # plugin context exposes a CLI-registration API. The standalone
+    # `hermes-memory-lancedb-pro` script in the venv bin keeps working
+    # regardless; this re-attaches it as a host-level subcommand.
+    if hasattr(ctx, "register_cli_command"):
+        try:
+            from ._cli import _dispatch_plugin_cli, register_cli
+            ctx.register_cli_command(
+                name="lancedb_pro",
+                help="LanceDB-Pro memory provider admin & task commands",
+                setup_fn=register_cli,
+                handler_fn=_dispatch_plugin_cli,
+                description=(
+                    "init / doctor / export / import / reset and task "
+                    "subcommands for the lancedb_pro memory provider."
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "lancedb_pro CLI registration failed: %s; the standalone "
+                "`hermes-memory-lancedb-pro` script is unaffected", exc,
+            )
+
 
 def register_memory_provider(_ctx: Any = None) -> Any:
     """Backwards-compatible alias; prefer ``register(ctx)`` for new installs.
