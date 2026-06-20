@@ -253,13 +253,13 @@ Do not say "Hello", "Hi", "Hey", or any greeting word in ANY response:
 
 Instead: respond immediately to the substance of the user's message.
 If context is genuinely unclear, say one line such as "Checking task state..."
-and then run `hermes-memory-lancedb-pro task list`.
+and then run `hermes lancedb_pro task list`.
 
 ## First thing every turn — check task state
 
 Run this BEFORE any other action or text:
 
-    hermes-memory-lancedb-pro task list
+    hermes lancedb_pro task list
 
 Decision tree:
 - Status = running  → `task resume <id>`, then continue from next_action
@@ -272,12 +272,12 @@ Use this for any task that takes more than 3 tool calls, or that could be
 interrupted by context compaction: test suites, benchmarks, iterative loops,
 anything where "keep going" is the instruction.
 
-    hermes-memory-lancedb-pro task create \\
+    hermes lancedb_pro task create \\
       --id <task-id> \\
       --objective "<clear one-line objective>" \\
       --iterations <N>
 
-    hermes-memory-lancedb-pro task pin <task-id>
+    hermes lancedb_pro task pin <task-id>
 
 Pinning stores state to disk. The memory plugin reloads state.json on every
 turn — even after compaction — so the model always knows the current iteration
@@ -285,9 +285,9 @@ and next action without re-reading conversation history.
 
 ## Each iteration
 
-    hermes-memory-lancedb-pro task resume <task-id>      # read current state
+    hermes lancedb_pro task resume <task-id>      # read current state
     # do the bounded work
-    hermes-memory-lancedb-pro task advance <task-id> \\
+    hermes lancedb_pro task advance <task-id> \\
       --result pass|fail \\
       --next-action "Run iteration <N+1>." \\
       --summary "<one sentence: what happened>"
@@ -296,13 +296,13 @@ One step = one advance. Do not attempt multiple iterations per response.
 
 ## Completing a task
 
-    hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
+    hermes lancedb_pro task complete <task-id> --summary "<what was done>"
 
 Then immediately report all results to the user. Do not greet first.
 
 ## Recovery after context loss or reset
 
-1. Run `hermes-memory-lancedb-pro task list`
+1. Run `hermes lancedb_pro task list`
 2. Running task → `task resume <id>` and continue from next_action
 3. Complete task → report results; do NOT re-run the task
 4. No tasks → answer the user's message directly
@@ -731,7 +731,7 @@ def _stable_task_block(state: dict[str, Any]) -> str:
         f"Objective: {objective}\n"
         "Status:    running (you started this task in this conversation).\n"
         "For the current iteration and next action, run:\n"
-        f"  hermes-memory-lancedb-pro task resume {task_id}\n"
+        f"  hermes lancedb_pro task resume {task_id}\n"
         "Then continue the task — do NOT greet, do NOT restart it."
     )
 
@@ -1014,7 +1014,7 @@ def _auto_anchor_session_if_needed(
         "SESSION IN PROGRESS — do NOT greet.\n"
         + (f'User started with: "{snippet}"\n' if snippet else "")
         + "\nContinue from where you left off.\n"
-        "Run `hermes-memory-lancedb-pro task list` to check for pinned tasks.\n"
+        "Run `hermes lancedb_pro task list` to check for pinned tasks.\n"
         "If mid-task: resume it. Otherwise: answer the user's message directly."
     )
 

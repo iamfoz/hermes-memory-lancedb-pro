@@ -116,7 +116,7 @@ def _skill_md(state: dict, slug: str, results: tuple[int, int, int], log_text: s
 **Install location**: `~/.hermes/skills/{slug}/SKILL.md`
 
 > **DRAFT** — scaffolded from task `{state.get("task_id", slug)}` by
-> `hermes-memory-lancedb-pro task to-skill`. The objective and invariants
+> `hermes lancedb_pro task to-skill`. The objective and invariants
 > below transferred directly from the task; the **Protocol** section is a
 > skeleton seeded with the task's iteration history. Review and rewrite it
 > into a clean, reusable procedure before relying on this skill.

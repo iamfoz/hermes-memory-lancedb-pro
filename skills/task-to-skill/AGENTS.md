@@ -6,14 +6,14 @@ skill. It is user-initiated. See `SKILL.md` for the full procedure.
 ### A recent task
 
 ```bash
-hermes-memory-lancedb-pro task to-skill <task-id>
+hermes lancedb_pro task to-skill <task-id>
 ```
 Then rewrite the draft's Protocol into a clean, reusable procedure.
 
 ### An older task — let the user pick
 
 ```bash
-hermes-memory-lancedb-pro task to-skill --list            # or --search "<kw>"
+hermes lancedb_pro task to-skill --list            # or --search "<kw>"
 ```
 Present the candidates as selectable options — client option buttons where
 available (as with model selection / operation approval), otherwise a numbered
