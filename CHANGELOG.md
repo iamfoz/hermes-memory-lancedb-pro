@@ -11,6 +11,23 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Agent-facing task commands now use the in-host `hermes lancedb_pro task …`
+  form.** The durable-task protocol injected by the provider every turn, the
+  `durable-task` / `task-to-skill` skills, and the `task to-skill` scaffold
+  breadcrumb previously told the agent to run the bare `hermes-memory-lancedb-pro
+  task …` console script. When Hermes shells out with a PATH that excludes its
+  own venv `bin/`, that script is not found and the command fails with exit 127.
+  The in-host form is dispatched in-process by the host (wired via
+  `register_cli` / `register_cli_command`), so it needs no PATH lookup and works
+  regardless of how the host spawns subprocesses. The standalone
+  `hermes-memory-lancedb-pro` console script is unchanged and remains the
+  documented invocation for using the plugin outside Hermes.
+
+---
+
 ## [0.14.3] — 2026-05-22
 
 ### Added

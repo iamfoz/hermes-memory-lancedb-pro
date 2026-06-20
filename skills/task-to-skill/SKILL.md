@@ -29,7 +29,7 @@ You ran it, so you know its task ID (or `task list` shows it).
 
 1. Scaffold the draft:
    ```bash
-   hermes-memory-lancedb-pro task to-skill <task-id>
+   hermes lancedb_pro task to-skill <task-id>
    ```
    This writes a draft `SKILL.md` + `AGENTS.md` under
    `~/.hermes/skills/<task-id>/`.
@@ -43,7 +43,7 @@ The user has not named a specific task. Surface candidates and let them pick.
 
 1. List candidate tasks (completed tasks, live and archived):
    ```bash
-   hermes-memory-lancedb-pro task to-skill --list
+   hermes lancedb_pro task to-skill --list
    ```
 2. **Present the list to the user as selectable options.** If the client
    supports option buttons — the same UI used for model selection and
@@ -56,12 +56,12 @@ The user has not named a specific task. Surface candidates and let them pick.
    - A candidate → go to step 4.
    - `0` → ask for keywords, then list the narrowed set:
      ```bash
-     hermes-memory-lancedb-pro task to-skill --search "<keywords>"
+     hermes lancedb_pro task to-skill --search "<keywords>"
      ```
      Re-present the result (step 2). If the user wants to stop, stop.
 4. Scaffold the chosen task:
    ```bash
-   hermes-memory-lancedb-pro task to-skill <task-id>
+   hermes lancedb_pro task to-skill <task-id>
    ```
 5. Author the real skill — see **Authoring** below.
 

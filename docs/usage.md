@@ -70,6 +70,12 @@ hermes-memory-lancedb-pro task to-skill --list         # list tasks that could b
 hermes-memory-lancedb-pro task to-skill --search "kw"  # find candidate tasks by keyword
 ```
 
+Inside a running Hermes session, prefer the in-host form `hermes lancedb_pro
+task …`, which the host dispatches in-process — no PATH lookup, so it works
+even when the agent's shell PATH does not include the plugin's console script.
+The `hermes-memory-lancedb-pro task …` script shown above is the standalone
+equivalent for use outside Hermes.
+
 `task pin` stores the control block as an `active_task` memory, which the
 recall path always surfaces first.
 

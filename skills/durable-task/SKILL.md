@@ -21,12 +21,17 @@ Trigger this protocol whenever:
 
 ## Protocol
 
+> **Invocation.** Inside a Hermes session the commands below run in-process as
+> `hermes lancedb_pro task …` — no PATH lookup, so they work regardless of how
+> the host shells out. Running the plugin standalone (outside Hermes), the
+> equivalent console script is `hermes-memory-lancedb-pro task …`.
+
 ### Step 1 — Create the task ledger
 
 Before touching anything else, create a task ledger:
 
 ```bash
-hermes-memory-lancedb-pro task create \
+hermes lancedb_pro task create \
   --id <task-id> \
   --objective "<clear one-line objective>" \
   --iterations <N>
@@ -38,7 +43,7 @@ If `--iterations` is unknown, omit it.
 ### Step 2 — Pin it to memory
 
 ```bash
-hermes-memory-lancedb-pro task pin <task-id>
+hermes lancedb_pro task pin <task-id>
 ```
 
 This stores the task state in the memory database. The memory plugin reloads
@@ -53,7 +58,7 @@ advances; the plugin reads `state.json` live.
 Read the current state before doing any work:
 
 ```bash
-hermes-memory-lancedb-pro task resume <task-id>
+hermes lancedb_pro task resume <task-id>
 ```
 
 Confirm:
@@ -71,7 +76,7 @@ One step = one `advance`.
 Record the result and advance the counter:
 
 ```bash
-hermes-memory-lancedb-pro task advance <task-id> \
+hermes lancedb_pro task advance <task-id> \
   --result pass \
   --next-action "Run iteration <N+1>." \
   --summary "<one sentence: what happened>"
@@ -85,13 +90,13 @@ so the next turn knows exactly what to do without re-reading the whole history.
 After `advance`, check whether the task is complete:
 
 ```bash
-hermes-memory-lancedb-pro task show <task-id>
+hermes lancedb_pro task show <task-id>
 ```
 
 If `current_iteration >= target_iterations`, or the objective is met:
 
 ```bash
-hermes-memory-lancedb-pro task complete <task-id> --summary "<what was done>"
+hermes lancedb_pro task complete <task-id> --summary "<what was done>"
 ```
 
 Then report results to the user.
@@ -104,12 +109,12 @@ If you find yourself about to greet the user, or if context is unclear:
 
 1. **Check for a running task first:**
    ```bash
-   hermes-memory-lancedb-pro task list
+   hermes lancedb_pro task list
    ```
 
 2. **If a running task exists, resume it:**
    ```bash
-   hermes-memory-lancedb-pro task resume <task-id>
+   hermes lancedb_pro task resume <task-id>
    ```
 
 3. **Continue from `next_action`.** Do not re-introduce yourself. Do not ask
@@ -138,22 +143,22 @@ These rules apply for the entire lifetime of a running task:
 
 ```bash
 # Setup (once)
-hermes-memory-lancedb-pro task create \
+hermes lancedb_pro task create \
   --id stress-test-$(date +%Y%m%d-%H%M) \
   --objective "Run 50 stress-test iterations against hermes-memory-lancedb-pro" \
   --iterations 50
 
-hermes-memory-lancedb-pro task pin stress-test-<id>
+hermes lancedb_pro task pin stress-test-<id>
 
 # Each iteration
-hermes-memory-lancedb-pro task resume stress-test-<id>
+hermes lancedb_pro task resume stress-test-<id>
 # ... do the work ...
-hermes-memory-lancedb-pro task advance stress-test-<id> \
+hermes lancedb_pro task advance stress-test-<id> \
   --result pass \
   --summary "Iteration N: retrieval latency 42ms, 0 failures"
 
 # Completion
-hermes-memory-lancedb-pro task complete stress-test-<id> \
+hermes lancedb_pro task complete stress-test-<id> \
   --summary "All 50 iterations passed. Mean latency 44ms, 0 failures."
 ```
 
