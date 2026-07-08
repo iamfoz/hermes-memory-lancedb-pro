@@ -13,6 +13,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,14 @@ lancedb = pytest.importorskip("lancedb")
 pytest.importorskip("lancedb.pydantic")
 
 from hermes_memory_lancedb_pro._cli import (
+    _cmd_compact,
     _cmd_doctor,
     _cmd_export,
     _cmd_import,
     _cmd_install_plugin,
+    _cmd_purge,
+    _cmd_search,
+    _cmd_stats,
     _cmd_uninstall_plugin,
     _resolve_hermes_home,
     main,
@@ -591,3 +596,216 @@ class TestRegisterCli:
         args = parser.parse_args(["reset"])
         assert args.lancedb_pro_command == "reset"
         assert callable(getattr(args, "func", None))
+
+
+# ---------------------------------------------------------------------------
+# stats / search / purge / compact subcommands
+# ---------------------------------------------------------------------------
+
+
+def _archived_metadata(days_ago: int) -> str:
+    """Metadata JSON for a row archived *days_ago* days in the past."""
+    invalidated = int(time.time() * 1000) - days_ago * 86_400_000
+    return json.dumps(
+        {"state": "archived", "invalidated_at": invalidated, "tier": "working"}
+    )
+
+
+class TestStatsCommand:
+    def test_stats_human_output(self, store, capsys):
+        store.store(text="stats smoke entry", category="fact", scope="global",
+                    importance=0.5)
+        rc = _cmd_stats(_Args(json=False, quiet=True), _store=store)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "total_memories:    1" in out
+        assert "categories:" in out
+
+    def test_stats_json_output(self, store, capsys):
+        store.store(text="stats json entry", category="fact", scope="global",
+                    importance=0.5)
+        rc = _cmd_stats(_Args(json=True, quiet=True), _store=store)
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["total_memories"] == 1
+        assert "db_path" in payload
+
+
+class TestSearchCommand:
+    def _search_args(self, query: str, **overrides) -> _Args:
+        defaults = dict(
+            query=query, mode="vector", limit=5, category=None, scope=None,
+            session_id=None, min_score=None, json=False, quiet=True,
+        )
+        defaults.update(overrides)
+        return _Args(**defaults)
+
+    def test_search_vector_finds_row(self, store, capsys):
+        store.store(text="the quick brown fox jumps", category="fact",
+                    scope="global", importance=0.5)
+        rc = _cmd_search(self._search_args("the quick brown fox jumps"),
+                         _store=store)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "the quick brown fox jumps" in out
+
+    def test_search_json_strips_vectors(self, store, capsys):
+        store.store(text="json search entry", category="fact", scope="global",
+                    importance=0.5)
+        rc = _cmd_search(self._search_args("json search entry", json=True),
+                         _store=store)
+        rows = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert rows, "expected at least one search result"
+        assert all("vector" not in r for r in rows)
+        assert rows[0]["text"] == "json search entry"
+
+    def test_search_empty_store_is_success(self, store, capsys):
+        rc = _cmd_search(self._search_args("nothing here", quiet=False),
+                         _store=store)
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "no results" in captured.err
+
+
+class TestPurgeCommand:
+    def _seed_archived(self, store, days_ago: int) -> None:
+        store.store_raw(
+            text=f"archived row from {days_ago} days ago",
+            vector=store.encode(f"archived row from {days_ago} days ago"),
+            category="fact",
+            scope="global",
+            importance=0.4,
+            metadata=_archived_metadata(days_ago),
+        )
+
+    def test_purge_deletes_old_archived(self, store):
+        self._seed_archived(store, days_ago=40)
+        store.store(text="active row must survive", category="fact",
+                    scope="global", importance=0.5)
+        rc = _cmd_purge(
+            _Args(grace_days=30, dry_run=False, yes=True, quiet=True,
+                  path=store.db_path),
+            _store=store,
+        )
+        assert rc == 0
+        stats = store.stats()
+        assert stats["archived_memories"] == 0
+        assert stats["active_memories"] == 1
+
+    def test_purge_dry_run_deletes_nothing(self, store, capsys):
+        self._seed_archived(store, days_ago=40)
+        rc = _cmd_purge(
+            _Args(grace_days=30, dry_run=True, yes=False, quiet=False,
+                  path=store.db_path),
+            _store=store,
+        )
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "[dry-run] would purge 1" in captured.err
+        assert store.stats()["archived_memories"] == 1
+
+    def test_purge_respects_grace_window(self, store):
+        self._seed_archived(store, days_ago=10)
+        rc = _cmd_purge(
+            _Args(grace_days=30, dry_run=False, yes=True, quiet=True,
+                  path=store.db_path),
+            _store=store,
+        )
+        assert rc == 0
+        assert store.stats()["archived_memories"] == 1
+
+
+class TestCompactCommand:
+    def _seed_near_duplicates(self, store) -> None:
+        """Two active rows sharing one vector — a guaranteed cluster."""
+        vec = store.encode("shared duplicate topic")
+        old_ts = int(time.time() * 1000) - 86_400_000  # 1 day old
+        for i in range(2):
+            store.store_raw(
+                text=f"shared duplicate topic variant {i}",
+                vector=vec,
+                category="fact",
+                scope="global",
+                importance=0.5,
+                metadata=json.dumps({"tier": "working", "state": "confirmed"}),
+                timestamp=old_ts,
+            )
+
+    def _compact_args(self, **overrides) -> _Args:
+        defaults = dict(
+            dry_run=False, scope=None, min_age_days=0, similarity=0.88,
+            max_scan=200, quiet=True,
+        )
+        defaults.update(overrides)
+        return _Args(**defaults)
+
+    def test_compact_dry_run_reports_clusters_and_changes_nothing(
+        self, store, capsys
+    ):
+        self._seed_near_duplicates(store)
+        rc = _cmd_compact(self._compact_args(dry_run=True, quiet=False),
+                          _store=store)
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "1 mergeable cluster(s)" in captured.err
+        assert "cluster 1: 2 rows" in captured.out
+        assert store.stats()["active_memories"] == 2
+
+    def test_compact_merges_clusters(self, store):
+        self._seed_near_duplicates(store)
+        rc = _cmd_compact(self._compact_args(), _store=store)
+        assert rc == 0
+        # The two sources collapse into a single active merged row.
+        assert store.stats()["active_memories"] == 1
+
+
+class TestVersionFlag:
+    def test_version_flag_prints_package_version(self, monkeypatch, capsys):
+        from hermes_memory_lancedb_pro import __version__
+
+        monkeypatch.setattr(sys, "argv", ["hermes-memory-lancedb-pro", "--version"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+        assert __version__ in capsys.readouterr().out
+
+
+class TestStoreAdminParity:
+    """stats/search/purge/compact must exist in the in-host CLI too."""
+
+    def test_register_cli_includes_store_admin_commands(self):
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        register_cli(parser)
+        for argv, expected in (
+            (["stats", "--json"], "stats"),
+            (["search", "fox", "--mode", "vector", "--limit", "3"], "search"),
+            (["purge", "--grace-days", "10", "--dry-run"], "purge"),
+            (["compact", "--dry-run", "--scope", "global"], "compact"),
+        ):
+            args = parser.parse_args(argv)
+            assert args.lancedb_pro_command == expected, (
+                f"'{expected}' should be a valid lancedb_pro_command"
+            )
+            assert callable(getattr(args, "func", None))
+
+    def test_search_flags_round_trip(self):
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        register_cli(parser)
+        args = parser.parse_args(
+            ["search", "user prefers dark mode", "--mode", "bm25",
+             "--limit", "7", "--category", "preference", "--scope", "global",
+             "--session-id", "s-1", "--min-score", "0.2", "--json"]
+        )
+        assert args.query == "user prefers dark mode"
+        assert args.mode == "bm25"
+        assert args.limit == 7
+        assert args.category == "preference"
+        assert args.scope == "global"
+        assert args.session_id == "s-1"
+        assert args.min_score == 0.2
+        assert args.json is True

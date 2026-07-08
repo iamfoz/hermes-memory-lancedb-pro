@@ -13,6 +13,36 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Added
+- **`stats` subcommand** — store statistics (counts, categories, tiers)
+  without the doctor's full anomaly scan; `--json` emits the raw
+  `MemoryStore.stats()` dict for scripting.
+- **`search` subcommand** — recall debugging from the terminal. Runs the same
+  `MemoryStore.search` the provider uses (`--mode hybrid|vector|bm25`,
+  `--category`, `--scope`, `--session-id`, `--min-score`); `--json` emits raw
+  result rows with vectors stripped.
+- **`purge` subcommand** — permanently delete archived rows past
+  `--grace-days` (default 30). Prompts for confirmation unless `-y`;
+  `--dry-run` reports the count without deleting.
+  `MemoryStore.purge_archived` gained a matching `dry_run` keyword.
+- **`compact` subcommand** — run the near-duplicate merge pass
+  (`memory_compactor.run_compaction`) on demand with explicit knobs
+  (`--min-age-days`, `--similarity`, `--max-scan`, `--scope`); `--dry-run`
+  prints the merge plan without writing.
+- **`--version` flag** on the standalone CLI.
+- All four new subcommands are registered in both the standalone CLI and the
+  in-host `hermes lancedb_pro …` form, via a shared parser helper so the two
+  surfaces cannot drift.
+- **`docs/PRD.md`** — product requirements document: goals, personas,
+  functional/non-functional requirements, current-state inventory, gap
+  analysis, and roadmap.
+
+### Fixed
+- **`doctor` no longer recommends commands that don't exist.** It used to
+  suggest `hermes-memory purge --grace-days 30` (which was not a subcommand)
+  and calling `run_compaction()` (Python-only). Both recommendations now point
+  at the real `purge` / `compact` subcommands.
+
 ### Changed
 - **Agent-facing task commands now use the in-host `hermes lancedb_pro task …`
   form.** The durable-task protocol injected by the provider every turn, the
