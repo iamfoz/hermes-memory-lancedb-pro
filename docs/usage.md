@@ -27,7 +27,7 @@ defaults to `MEMORY_DB_DIR`) and `-q` / `--quiet`.
 hermes-memory-lancedb-pro init [--memory-md PATH] [-y]
 
 # Wipe the database directory and re-run init
-hermes-memory-lancedb-pro reset [-y]
+hermes-memory-lancedb-pro reset [--memory-md PATH] [-y]
 
 # Diagnostic report: counts, tier/category breakdown, anomalies, advice
 hermes-memory-lancedb-pro doctor
@@ -67,7 +67,22 @@ older than `--grace-days` (default 30) — active memories are never deleted.
 automatically on a cooldown; `--dry-run` prints the merge plan without writing.
 `search` is a recall-debugging tool: what it prints is what the agent can
 recall, including `--session-id` scoping. `stats --json` and `search --json`
-emit machine-readable output (search strips vectors).
+emit machine-readable output (search strips vectors). `doctor`, `stats`, and
+`--version` all report the package version for bug reports.
+
+### Plugin installation
+
+```bash
+# Create the discovery shim under <hermes_home>/plugins/lancedb_pro/
+hermes-memory-lancedb-pro install-plugin [--hermes-home PATH] [--force]
+
+# Remove the shim (only deletes files the installer wrote)
+hermes-memory-lancedb-pro uninstall-plugin [--hermes-home PATH]
+```
+
+These two commands exist only on the standalone CLI (not in-host — the plugin
+cannot install itself from inside hermes-agent). See
+[hermes-integration.md](hermes-integration.md) for the full install flow.
 
 ### Durable task ledger
 

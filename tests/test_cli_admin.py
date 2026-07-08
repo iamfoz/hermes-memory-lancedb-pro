@@ -615,20 +615,33 @@ class TestStatsCommand:
     def test_stats_human_output(self, store, capsys):
         store.store(text="stats smoke entry", category="fact", scope="global",
                     importance=0.5)
-        rc = _cmd_stats(_Args(json=False, quiet=True), _store=store)
+        rc = _cmd_stats(_Args(json=False), _store=store)
         out = capsys.readouterr().out
         assert rc == 0
         assert "total_memories:    1" in out
         assert "categories:" in out
+        assert "package_version:" in out
 
     def test_stats_json_output(self, store, capsys):
+        from hermes_memory_lancedb_pro import __version__
+
         store.store(text="stats json entry", category="fact", scope="global",
                     importance=0.5)
-        rc = _cmd_stats(_Args(json=True, quiet=True), _store=store)
+        rc = _cmd_stats(_Args(json=True), _store=store)
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0
         assert payload["total_memories"] == 1
         assert "db_path" in payload
+        # CONTRIBUTING/SECURITY tell users to report the version from here.
+        assert payload["package_version"] == __version__
+
+
+class TestDoctorReportsVersion:
+    def test_doctor_header_includes_package_version(self, store):
+        from hermes_memory_lancedb_pro import __version__
+
+        out = _doctor_output(store)
+        assert f"package_version:   {__version__}" in out
 
 
 class TestSearchCommand:

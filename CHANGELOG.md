@@ -29,7 +29,10 @@ minor versions; breaking changes are called out under **Changed** and
   (`memory_compactor.run_compaction`) on demand with explicit knobs
   (`--min-age-days`, `--similarity`, `--max-scan`, `--scope`); `--dry-run`
   prints the merge plan without writing.
-- **`--version` flag** on the standalone CLI.
+- **`--version` flag** on the standalone CLI, and a `package_version` line in
+  the `doctor` header and `stats` output (JSON included) — CONTRIBUTING,
+  SECURITY, and the bug-report template have always told users `doctor`
+  reports the version; now it actually does.
 - All four new subcommands are registered in both the standalone CLI and the
   in-host `hermes lancedb_pro …` form, via a shared parser helper so the two
   surfaces cannot drift.
@@ -42,6 +45,8 @@ minor versions; breaking changes are called out under **Changed** and
   suggest `hermes-memory purge --grace-days 30` (which was not a subcommand)
   and calling `run_compaction()` (Python-only). Both recommendations now point
   at the real `purge` / `compact` subcommands.
+- **Changelog compare links** — `[Unreleased]`, `[0.14.3]`, and `[0.14.2]`
+  had no link definitions, so their section headers rendered as dead links.
 
 ### Changed
 - **Agent-facing task commands now use the in-host `hermes lancedb_pro task …`
@@ -477,6 +482,9 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...HEAD
+[0.14.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.2...v0.14.3
+[0.14.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.12.3...v0.13.0
