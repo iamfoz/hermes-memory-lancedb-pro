@@ -113,8 +113,12 @@ The provider exposes an admin CLI for inspecting and maintaining the store:
 
 ```bash
 hermes-memory-lancedb-pro doctor          # health report + recommendations
+hermes-memory-lancedb-pro stats --json    # counts / categories / tiers
+hermes-memory-lancedb-pro search "dark mode"   # what would the agent recall?
 hermes-memory-lancedb-pro export -o backup.jsonl
 hermes-memory-lancedb-pro import --in backup.jsonl --reembed
+hermes-memory-lancedb-pro purge --dry-run # reclaim space from archived rows
+hermes-memory-lancedb-pro compact --dry-run    # preview near-duplicate merges
 ```
 
 When the plugin is active, the same commands are also reachable through

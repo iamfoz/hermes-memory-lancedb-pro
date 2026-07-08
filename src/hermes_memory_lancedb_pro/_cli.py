@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from . import task_ledger as _tl
 from ._sql import parse_metadata as _parse_metadata
 from .store import (
@@ -51,7 +52,8 @@ PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
 Exposes register_cli() so hermes-agent can wire the lancedb_pro commands
-(init, doctor, export, import, reset) into `hermes lancedb_pro`.
+(init, doctor, export, import, reset, stats, search, purge, compact, task)
+into `hermes lancedb_pro`.
 
 Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
@@ -364,7 +366,7 @@ def _cmd_doctor(
     if archived_ratio > 30.0:
         print(
             "  → run 'hermes-memory purge --grace-days 30' to reclaim space "
-            "(or call MemoryStore.purge_archived(grace_period_days=30))"
+            "(preview with --dry-run)"
         )
     print()
 
@@ -491,14 +493,14 @@ def _cmd_doctor(
     if archived_older_than_grace > 0:
         any_rec = True
         print(
-            f"Run `purge_archived(grace_period_days=30)` — "
+            f"Run `hermes-memory purge --grace-days 30` — "
             f"{archived_older_than_grace} archived rows older than 30 days."
         )
 
     if old_non_archived_count > 0:
         any_rec = True
         print(
-            f"Consider running `run_compaction()` — "
+            f"Run `hermes-memory compact --dry-run` to preview merging — "
             f"{old_non_archived_count} old non-archived rows that may be "
             "near-duplicates."
         )
@@ -508,6 +510,318 @@ def _cmd_doctor(
     print()
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Stats / search / purge / compact subcommands
+# ---------------------------------------------------------------------------
+
+_SNIPPET_LEN = 160
+_COMPACT_PLAN_PREVIEW = 10
+
+
+def _cmd_stats(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Print store statistics — the doctor header without the full scan.
+
+    ``--json`` emits the raw ``MemoryStore.stats()`` dict for scripting.
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    store = _store if _store is not None else _open_store(args)
+    stats = store.stats()
+
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2, sort_keys=True, default=str))
+        return 0
+
+    total = stats.get("total_memories", 0)
+    active = stats.get("active_memories", 0)
+    archived = stats.get("archived_memories", 0)
+    archived_ratio = (archived / total * 100) if total else 0.0
+    print(f"db_path:           {stats.get('db_path', '')}")
+    print(f"embedding_model:   {stats.get('embedding_model', '')}")
+    print(f"vector_dimensions: {stats.get('vector_dimensions', '')}")
+    print(f"total_memories:    {total}")
+    print(f"active:            {active}")
+    print(f"archived:          {archived} ({archived_ratio:.1f}%)")
+    categories = stats.get("categories", {})
+    if categories:
+        print("categories:")
+        for cat, cnt in sorted(categories.items(), key=lambda kv: -kv[1]):
+            print(f"  {cat}: {cnt}")
+    tiers = stats.get("tiers", {})
+    if tiers:
+        print("tiers:")
+        for tier, cnt in sorted(tiers.items(), key=lambda kv: -kv[1]):
+            print(f"  {tier}: {cnt}")
+    return 0
+
+
+def _row_score(row: dict[str, Any]) -> float | None:
+    """Best-effort relevance score for a search row, mode-agnostic.
+
+    Mirrors ``MemoryStore.search`` result conventions: hybrid rows carry
+    ``_rrf_score``, BM25 rows ``_score``, vector rows ``_distance``
+    (cosine distance — reported as ``1 - distance`` so higher is better,
+    matching the ``min_score`` semantics in ``MemoryStore.search``).
+    """
+    if "_rrf_score" in row:
+        return float(row["_rrf_score"])
+    if "_score" in row:
+        return float(row["_score"])
+    if "_distance" in row:
+        return 1.0 - float(row["_distance"])
+    return None
+
+
+def _snippet(text: str) -> str:
+    """Collapse newlines and truncate for one-line terminal output."""
+    text = (text or "").replace("\n", " ")
+    if len(text) > _SNIPPET_LEN:
+        return text[: _SNIPPET_LEN - 1] + "…"
+    return text
+
+
+def _cmd_search(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Search memories from the command line — recall debugging.
+
+    Runs the same ``MemoryStore.search`` the provider uses, so what this
+    prints is what the agent would be able to recall. ``--json`` emits the
+    raw result rows (vectors stripped — they dwarf everything else).
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    store = _store if _store is not None else _open_store(args)
+    quiet = getattr(args, "quiet", False)
+
+    rows = store.search(
+        getattr(args, "query", "") or "",
+        limit=getattr(args, "limit", 10),
+        mode=getattr(args, "mode", "hybrid"),
+        category=getattr(args, "category", None),
+        scope=getattr(args, "scope", None),
+        session_id=getattr(args, "session_id", None),
+        min_score=getattr(args, "min_score", None),
+    )
+
+    if getattr(args, "json", False):
+        slim = [{k: v for k, v in row.items() if k != "vector"} for row in rows]
+        print(json.dumps(slim, indent=2, default=str))
+        _stderr(f"{len(rows)} result(s)", quiet)
+        return 0
+
+    if not rows:
+        _stderr("no results", quiet)
+        return 0
+    for row in rows:
+        score = _row_score(row)
+        score_str = f"{score:.4f}" if score is not None else "   -  "
+        print(
+            f"{score_str}  {row.get('id', '')}  "
+            f"[{row.get('category', '?')}/{row.get('scope', '?')}]  "
+            f"{_snippet(row.get('text', ''))}"
+        )
+    _stderr(f"{len(rows)} result(s)", quiet)
+    return 0
+
+
+def _cmd_purge(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Permanently delete archived memories past the grace period.
+
+    Only rows whose metadata ``state`` is ``archived`` AND whose
+    ``invalidated_at`` is older than ``--grace-days`` are removed — active
+    memories are never touched. ``--dry-run`` reports the count without
+    deleting anything; a real run prompts for confirmation unless ``--yes``.
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    grace_days = getattr(args, "grace_days", 30)
+    dry_run = bool(getattr(args, "dry_run", False))
+    quiet = getattr(args, "quiet", False)
+
+    if not dry_run and not getattr(args, "yes", False):
+        db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+        print(
+            f"This will PERMANENTLY DELETE archived memories older than "
+            f"{grace_days} days at: {db_path}"
+        )
+        answer = input('Type "yes" to proceed: ').strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return 1
+
+    store = _store if _store is not None else _open_store(args)
+    count = store.purge_archived(grace_period_days=grace_days, dry_run=dry_run)
+    if dry_run:
+        _stderr(
+            f"[dry-run] would purge {count} archived memories "
+            f"older than {grace_days} days",
+            quiet,
+        )
+    else:
+        _stderr(
+            f"purged {count} archived memories older than {grace_days} days",
+            quiet,
+        )
+    return 0
+
+
+def _cmd_compact(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Cluster near-duplicate memories and merge each cluster into one row.
+
+    Wraps ``memory_compactor.run_compaction`` — the same pass the provider
+    runs automatically on a cooldown — with explicit knobs. ``--dry-run``
+    prints the merge plan without changing the store.
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    from .memory_compactor import CompactionConfig, run_compaction
+
+    store = _store if _store is not None else _open_store(args)
+    quiet = getattr(args, "quiet", False)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    cfg = CompactionConfig(
+        min_age_days=getattr(args, "min_age_days", 7),
+        similarity_threshold=getattr(args, "similarity", 0.88),
+        max_memories_to_scan=getattr(args, "max_scan", 200),
+        dry_run=dry_run,
+    )
+    result = run_compaction(store, cfg, scopes=getattr(args, "scope", None) or None)
+
+    if dry_run:
+        _stderr(
+            f"[dry-run] scanned {result.scanned} memories, "
+            f"{result.clusters_found} mergeable cluster(s)",
+            quiet,
+        )
+        for i, plan in enumerate(result.plans[:_COMPACT_PLAN_PREVIEW], start=1):
+            print(
+                f"  cluster {i}: {len(plan.member_indices)} rows → "
+                f"{_snippet(plan.merged.text)}"
+            )
+        if len(result.plans) > _COMPACT_PLAN_PREVIEW:
+            print(
+                f"  … and {len(result.plans) - _COMPACT_PLAN_PREVIEW} more cluster(s)"
+            )
+        return 0
+
+    _stderr(
+        f"scanned {result.scanned} memories: merged {result.clusters_found} "
+        f"cluster(s), -{result.memories_deleted} +{result.memories_created}",
+        quiet,
+    )
+    return 0
+
+
+def _add_store_admin_parsers(subs) -> None:
+    """Wire stats/search/purge/compact onto a subparsers group.
+
+    Shared by ``main()`` and ``register_cli()`` so the standalone and in-host
+    CLIs cannot drift apart flag-by-flag.
+    """
+    p_stats = subs.add_parser(
+        "stats",
+        help="Print store statistics (counts, categories, tiers)",
+        description="Print memory-store statistics without the doctor's full anomaly scan.",
+    )
+    p_stats.add_argument("--json", action="store_true",
+                         help="Emit the raw stats dict as JSON")
+    p_stats.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_stats.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
+
+    p_search = subs.add_parser(
+        "search",
+        help="Search memories (recall debugging)",
+        description=(
+            "Run the same hybrid/vector/BM25 search the provider uses for recall "
+            "and print the matching rows."
+        ),
+    )
+    p_search.add_argument("query", metavar="QUERY", help="Search query text")
+    p_search.add_argument("--mode", default="hybrid",
+                          choices=["hybrid", "vector", "bm25"],
+                          help="Search mode (default: hybrid)")
+    p_search.add_argument("--limit", type=int, default=10, metavar="N",
+                          help="Maximum results (default: 10)")
+    p_search.add_argument("--category", default=None, metavar="CAT",
+                          help="Restrict to one category")
+    p_search.add_argument("--scope", default=None, metavar="SCOPE",
+                          help="Restrict to one scope")
+    p_search.add_argument("--session-id", dest="session_id", default=None, metavar="ID",
+                          help="Apply session scoping as the provider would")
+    p_search.add_argument("--min-score", dest="min_score", type=float, default=None,
+                          metavar="X", help="Drop results scoring below X")
+    p_search.add_argument("--json", action="store_true",
+                          help="Emit result rows as JSON (vectors stripped)")
+    p_search.add_argument("--path", default=None, metavar="PATH",
+                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_search.add_argument("-q", "--quiet", action="store_true",
+                          help="Suppress non-essential output")
+
+    p_purge = subs.add_parser(
+        "purge",
+        help="Permanently delete archived memories past the grace period",
+        description=(
+            "Hard-delete rows that were archived (superseded/forgotten) more than "
+            "--grace-days ago. Active memories are never touched."
+        ),
+    )
+    p_purge.add_argument("--grace-days", dest="grace_days", type=int, default=30,
+                         metavar="N",
+                         help="Only purge rows archived more than N days ago (default: 30)")
+    p_purge.add_argument("--dry-run", action="store_true",
+                         help="Report what would be purged without deleting")
+    p_purge.add_argument("-y", "--yes", action="store_true",
+                         help="Skip confirmation prompt")
+    p_purge.add_argument("--path", default=None, metavar="PATH",
+                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_purge.add_argument("-q", "--quiet", action="store_true",
+                         help="Suppress non-essential output")
+
+    p_compact = subs.add_parser(
+        "compact",
+        help="Merge clusters of near-duplicate memories",
+        description=(
+            "Cluster near-duplicate memories by vector similarity and merge each "
+            "cluster into a single row (sources are archived). The provider runs "
+            "this automatically on a cooldown; this command runs it on demand."
+        ),
+    )
+    p_compact.add_argument("--dry-run", action="store_true",
+                           help="Print the merge plan without changing the store")
+    p_compact.add_argument("--scope", action="append", default=None, metavar="SCOPE",
+                           help="Restrict to a scope (repeatable; default: all scopes)")
+    p_compact.add_argument("--min-age-days", dest="min_age_days", type=int, default=7,
+                           metavar="N",
+                           help="Only consider rows older than N days (default: 7)")
+    p_compact.add_argument("--similarity", type=float, default=0.88, metavar="X",
+                           help="Cosine similarity threshold for clustering (default: 0.88)")
+    p_compact.add_argument("--max-scan", dest="max_scan", type=int, default=200,
+                           metavar="N",
+                           help="Maximum rows to scan per pass (default: 200)")
+    p_compact.add_argument("--path", default=None, metavar="PATH",
+                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_compact.add_argument("-q", "--quiet", action="store_true",
+                           help="Suppress non-essential output")
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +842,10 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
         "import": _cmd_import,
         "doctor": _cmd_doctor,
         "reset": _cmd_reset,
+        "stats": _cmd_stats,
+        "search": _cmd_search,
+        "purge": _cmd_purge,
+        "compact": _cmd_compact,
     }.get(cmd, lambda _: 0)(args)
 
 
@@ -538,7 +856,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     and calls this with a **fresh** ArgumentParser for the provider's own
     namespace.  Commands appear as:
 
-        hermes lancedb_pro init|doctor|export|import|reset
+        hermes lancedb_pro init|doctor|export|import|reset|stats|search|purge|compact|task
 
     Follows the hermes memory plugin CLI spec exactly:
     ``add_subparsers`` on the fresh parser + ``set_defaults(func=dispatcher)``
@@ -624,6 +942,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
+
+    _add_store_admin_parsers(subs)
 
     p_task = subs.add_parser(
         "task",
@@ -1495,6 +1815,9 @@ def main() -> int:
         prog="hermes-memory-lancedb-pro",
         description="Hermes LanceDB memory CLI — manage the lancedb_pro plugin and memory store.",
     )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
 
     subparsers = parser.add_subparsers(dest="subcommand", title="subcommands")
 
@@ -1595,6 +1918,9 @@ def main() -> int:
     p_import.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 
+    # ---- stats / search / purge / compact ----
+    _add_store_admin_parsers(subparsers)
+
     # ---- install-plugin ----
     p_install = subparsers.add_parser(
         "install-plugin",
@@ -1652,6 +1978,10 @@ def main() -> int:
         "doctor": _cmd_doctor,
         "export": _cmd_export,
         "import": _cmd_import,
+        "stats": _cmd_stats,
+        "search": _cmd_search,
+        "purge": _cmd_purge,
+        "compact": _cmd_compact,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }

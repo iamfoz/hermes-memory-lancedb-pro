@@ -37,15 +37,37 @@ hermes-memory-lancedb-pro export -o backup.jsonl [--include-archived] [--limit N
 
 # Import rows from JSONL
 hermes-memory-lancedb-pro import --in backup.jsonl [--reembed] [--allow-existing]
+
+# Store statistics without the doctor's full anomaly scan
+hermes-memory-lancedb-pro stats [--json]
+
+# Search memories — the same hybrid/vector/BM25 search the provider uses
+hermes-memory-lancedb-pro search "QUERY" [--mode hybrid|vector|bm25] [--limit N] \
+    [--category CAT] [--scope SCOPE] [--session-id ID] [--min-score X] [--json]
+
+# Permanently delete archived rows past the grace period
+hermes-memory-lancedb-pro purge [--grace-days N] [--dry-run] [-y]
+
+# Merge clusters of near-duplicate memories (the auto-compaction pass, on demand)
+hermes-memory-lancedb-pro compact [--dry-run] [--scope SCOPE] [--min-age-days N] \
+    [--similarity X] [--max-scan N]
 ```
 
-`init` and `reset` prompt for confirmation before changing data; pass
+`init`, `reset`, and `purge` prompt for confirmation before changing data; pass
 `-y` / `--yes` to skip the prompt in scripts. `import --reembed` re-encodes each
 row's text with the current embedding model instead of trusting stored vectors.
 `export` exits non-zero if the table scan fails (a corrupt store is never
 silently reported as empty); `export --salvage` then performs a best-effort
 recovery scan — walking the dataset's version history and, if needed, reading
 it fragment-by-fragment — to rescue whatever rows are still readable.
+
+`purge` only touches rows that are already archived (superseded/forgotten) and
+older than `--grace-days` (default 30) — active memories are never deleted.
+`compact` runs the same near-duplicate merge pass the provider triggers
+automatically on a cooldown; `--dry-run` prints the merge plan without writing.
+`search` is a recall-debugging tool: what it prints is what the agent can
+recall, including `--session-id` scoping. `stats --json` and `search --json`
+emit machine-readable output (search strips vectors).
 
 ### Durable task ledger
 

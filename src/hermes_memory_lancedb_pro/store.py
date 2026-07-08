@@ -1531,11 +1531,15 @@ class MemoryStore:
             "tiers": tier_counts,
         }
 
-    def purge_archived(self, grace_period_days: int = 30) -> int:
+    def purge_archived(
+        self, grace_period_days: int = 30, *, dry_run: bool = False
+    ) -> int:
         """Permanently delete archived memories older than grace_period_days.
 
-        Returns the number of entries deleted. Iterates pages so stores
-        larger than MAX_SCAN_ROWS are still cleaned up correctly."""
+        Returns the number of entries deleted. With ``dry_run=True`` nothing
+        is deleted — the return value is the count a real run would remove.
+        Iterates pages so stores larger than MAX_SCAN_ROWS are still cleaned
+        up correctly."""
         cutoff_ms = int(time.time() * 1000) - (grace_period_days * 24 * 60 * 60 * 1000)
         purged = 0
         for row in self._scan_all(limit=MAX_SCAN_ROWS):
@@ -1546,10 +1550,11 @@ class MemoryStore:
             if invalidated and invalidated < cutoff_ms:
                 mem_id = row.get("id")
                 if mem_id:
-                    self._table.delete(f"id = '{_escape_sql(mem_id)}'")
+                    if not dry_run:
+                        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
                     purged += 1
 
-        if purged:
+        if purged and not dry_run:
             logger.info(
                 "Purged %d archived memories older than %d days",
                 purged, grace_period_days,
