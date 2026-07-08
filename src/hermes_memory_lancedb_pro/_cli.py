@@ -352,6 +352,7 @@ def _cmd_doctor(
 
     # ---- Header ----
     print("=== Hermes Memory Doctor ===")
+    print(f"package_version:   {__version__}")
     print(f"db_path:           {stats['db_path']}")
     print(f"embedding_model:   {stats['embedding_model']}")
     print(f"vector_dimensions: {stats['vector_dimensions']}")
@@ -535,13 +536,15 @@ def _cmd_stats(
     stats = store.stats()
 
     if getattr(args, "json", False):
-        print(json.dumps(stats, indent=2, sort_keys=True, default=str))
+        payload = {"package_version": __version__, **stats}
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
         return 0
 
     total = stats.get("total_memories", 0)
     active = stats.get("active_memories", 0)
     archived = stats.get("archived_memories", 0)
     archived_ratio = (archived / total * 100) if total else 0.0
+    print(f"package_version:   {__version__}")
     print(f"db_path:           {stats.get('db_path', '')}")
     print(f"embedding_model:   {stats.get('embedding_model', '')}")
     print(f"vector_dimensions: {stats.get('vector_dimensions', '')}")
@@ -745,8 +748,6 @@ def _add_store_admin_parsers(subs) -> None:
                          help="Emit the raw stats dict as JSON")
     p_stats.add_argument("--path", default=None, metavar="PATH",
                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
-    p_stats.add_argument("-q", "--quiet", action="store_true",
-                         help="Suppress non-essential output")
 
     p_search = subs.add_parser(
         "search",
@@ -1994,9 +1995,10 @@ def main() -> int:
 
 
 def smoke_main() -> int:
-    """Run the same end-to-end smoke test as ``scripts/memory_smoke_test.py``,
-    but driven from the installed package so users don't have to clone the
-    source. Use ``--ephemeral`` to point at a tmp dir that is wiped on exit."""
+    """Run a condensed version of ``scripts/memory_smoke_test.py`` (store,
+    all three search modes, supersede via update, has_id) driven from the
+    installed package so users don't have to clone the source. Use
+    ``--ephemeral`` to point at a tmp dir that is wiped on exit."""
     parser = argparse.ArgumentParser(prog="hermes-memory-smoke")
     parser.add_argument("--path", help="Custom DB directory")
     parser.add_argument("--ephemeral", action="store_true", help="Use a tmp dir")
