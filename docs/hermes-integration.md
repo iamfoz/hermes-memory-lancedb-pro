@@ -1,57 +1,50 @@
 # Hermes Agent integration
 
 This guide covers installing `hermes-memory-lancedb-pro` as a Hermes Agent
-memory provider, how the discovery shim works, upgrades, and troubleshooting.
+memory provider, upgrades, and troubleshooting.
 
-## The two pieces of an install
+## Install
 
-A working install always has two parts:
-
-1. **The package** — all the code (`lancedb`, `sentence-transformers`, and the
-   provider itself). This must live in **Hermes' own Python environment**.
-2. **The discovery shim** — a tiny directory at `~/.hermes/plugins/lancedb_pro/`
-   that lets hermes-agent find the provider.
-
-## Step 1 — install the package
-
-Install into Hermes' environment with `hermes-pip`:
+This repository is itself a Hermes plugin. Install it with Hermes' plugin
+manager:
 
 ```bash
-hermes-pip install hermes-memory-lancedb-pro
+hermes plugins install iamfoz/hermes-memory-lancedb-pro
 ```
 
-Or from a clone:
+Accept the prompt to make it the active memory provider (or set
+`memory.provider: lancedb_pro` in `config.yaml` yourself), then restart the
+gateway. Verify with:
 
 ```bash
-hermes-pip install -e .
+hermes memory status        # Provider: lancedb_pro / Plugin: installed ✓
+hermes plugins doctor lancedb_pro
 ```
 
-> **Use `hermes-pip`, not plain `pip`.** A plain `pip install` puts the package
-> in whatever Python is currently active. hermes-agent loads the discovery shim
-> inside *its own* environment; if the package is not there, the shim's `import`
-> fails silently and the plugin never loads. `hermes-pip` is the wrapper that
-> targets the correct environment.
+Everything else — embedding-model warmup, the smart extractor, admission
+control, reflection capture, automatic compaction — is wired automatically.
 
-## Step 2 — create the discovery shim
+### What happens under the hood
 
-```bash
-hermes-memory-lancedb-pro install-plugin
-```
+The repo root holds a `plugin.yaml` (`name: lancedb_pro`, so the plugin lands
+in `~/.hermes/plugins/lancedb_pro/`), an `__init__.py` that re-exports the
+provider's `register` / `register_memory_provider`, and a `cli.py` for
+`hermes lancedb_pro <command>`.
 
-This creates `~/.hermes/plugins/lancedb_pro/` containing three files:
+Because the repo also has a `pyproject.toml` with a build backend, Hermes'
+package manager (PM) treats the plugin as an installable project: it builds
+the package **and its dependencies** (`lancedb`, `sentence-transformers`, …)
+into Hermes' managed environment. PM includes the active memory provider's
+requirements in every environment generation it builds, so `hermes update`
+keeps them.
 
-| File | Purpose |
-|---|---|
-| `__init__.py` | The discovery shim — re-exports `register` / `register_memory_provider` from the package. Those names double as the markers the host uses to auto-detect a memory provider. |
-| `cli.py` | Re-exports `register_cli`, so `hermes lancedb_pro <command>` works. |
-| `plugin.yaml` | Copied from the wheel — declares `name` and the hook list. It deliberately has **no `kind:`** — see below. |
-
-The shim is just re-exports, so code upgrades never need the plugin directory
-touched — `hermes-pip install -U hermes-memory-lancedb-pro` upgrades the
-provider. The one exception is when the bundled `plugin.yaml` itself changes
-(as in the release that dropped `kind: memory`): re-run
-`hermes-memory-lancedb-pro install-plugin` afterwards. It detects the stale
-copy and refreshes it automatically.
+> **Do not use `pip` (or the old `hermes-pip`) against Hermes' environment.**
+> Current Hermes rebuilds its environment from its own lock plus enabled
+> plugins' declared dependencies. A package installed by hand is not
+> declared, so the next environment generation drops it — and the plugin
+> fails with `Memory provider 'lancedb_pro' loaded but no provider instance
+> found` (the underlying `No module named 'hermes_memory_lancedb_pro'` is
+> logged only at DEBUG).
 
 ### Why the manifest has no `kind`
 
@@ -63,84 +56,79 @@ absent**: an unrecognised value such as the old `kind: memory` is coerced to
 `standalone`, skips detection, and the general plugin manager then eagerly
 imports the plugin as a standalone plugin. Leave the field out.
 
-`install-plugin` accepts:
+## Upgrading
 
 ```bash
-hermes-memory-lancedb-pro install-plugin --hermes-home /path/to/profile  # non-default profile
-hermes-memory-lancedb-pro install-plugin --force                         # overwrite an existing shim
+hermes plugins update lancedb_pro
 ```
 
-It also auto-migrates older, incorrectly-placed installs and refreshes a stale
-shim, so re-running it is always safe.
+PM validates the new dependency set before publishing the new code.
 
-## Step 3 — activate the provider
+## Migrating from a `hermes-pip` + `install-plugin` install
 
-In hermes-agent's `config.yaml`:
+Older releases had you `hermes-pip install` the package and then run
+`hermes-memory-lancedb-pro install-plugin` to write a small shim into
+`~/.hermes/plugins/lancedb_pro/`. On current Hermes that package is not part of
+PM's environment and disappears on update. Replace the shim with a plugin
+install — your memory database (`~/.hermes/memory-lancedb/`) and task ledgers
+are untouched:
 
-```yaml
-memory:
-  provider: lancedb_pro
+```bash
+mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old   # the old shim
+hermes plugins install iamfoz/hermes-memory-lancedb-pro
+hermes memory status
 ```
 
-Restart the gateway. Everything else — embedding-model warmup, the smart
-extractor, admission control, reflection capture, automatic compaction — is
-wired automatically.
+The installer refuses to overwrite an existing `lancedb_pro` directory, which
+is why the old shim has to move first. Delete the `.old` directory once
+`hermes memory status` shows the plugin installed.
 
-## Entry-point discovery (no shim)
+## Removing
 
-The package also registers a setuptools entry point:
+```bash
+hermes plugins remove lancedb_pro
+```
+
+This removes the plugin code. The memory database is left on disk.
+
+## Standalone CLI and `install-plugin`
+
+The package still installs the `hermes-memory-lancedb-pro` / `hermes-memory`
+console scripts for using the store outside Hermes. Its `install-plugin` /
+`uninstall-plugin` commands write and remove the legacy shim; they are only
+useful on pre-PM Hermes builds where you manage Hermes' environment yourself.
+
+## Entry-point discovery
+
+For hosts that discover pip-installed memory providers, the package registers:
 
 ```toml
-[project.entry-points."hermes.plugins"]
+[project.entry-points."hermes_agent.memory_providers"]
 lancedb_pro = "hermes_memory_lancedb_pro.provider:register"
 ```
 
-hermes-agent builds that support `importlib.metadata` entry-point discovery find
-the provider from the installed package alone — Step 2 is not needed. The shim
-is kept for hosts that only scan `~/.hermes/plugins/`. The same package supports
-both discovery paths.
-
-## Uninstalling
-
-```bash
-hermes-memory-lancedb-pro uninstall-plugin
-```
-
-This removes only the files the installer created (`__init__.py`, `cli.py`,
-`plugin.yaml`, `__pycache__`). If the directory contains other, unmanaged files
-it is left in place.
+It deliberately does **not** register under `hermes_agent.plugins`, the general
+plugin group, which the general plugin manager imports eagerly.
 
 ## Troubleshooting
 
-**The plugin does not load.** Confirm the package is importable from *Hermes'*
-Python, not yours:
-
-```bash
-hermes-pip run python -c "import hermes_memory_lancedb_pro as m; print(m.__version__, m.__file__)"
-```
-
-**A stale copy is shadowing the install.** If `__file__` above points inside
-`~/.hermes/plugins/lancedb_pro/` and the version is old, an old full checkout is
-shadowing the installed package. Earlier guidance told users to clone the repo
-*into* the plugin directory; that is no longer correct. Replace it with the shim:
-
-```bash
-mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old   # back up
-hermes-pip install -U hermes-memory-lancedb-pro
-hermes-memory-lancedb-pro install-plugin
-```
+**`loaded but no provider instance found` / `hermes memory status` says
+`NOT installed`.** The plugin directory was found, but its import of
+`hermes_memory_lancedb_pro` failed — almost always because the package is not
+in Hermes' environment. On an old shim install, follow
+[Migrating](#migrating-from-a-hermes-pip--install-plugin-install). On a plugin
+install, `hermes plugins doctor lancedb_pro` reports the failing check, and
+`hermes pm install` re-syncs the environment.
 
 **The provider is loaded as a standalone plugin / not routed to the memory
-manager.** `plugin.yaml` must **not** declare a `kind`. Older releases shipped
-`kind: memory`, which current hermes-agent treats as invalid and coerces to
-`standalone`. Check `~/.hermes/plugins/lancedb_pro/plugin.yaml`; if it still
-has a `kind:` line, upgrade and re-run `hermes-memory-lancedb-pro install-plugin`
-(it refreshes stale copies), or simply delete the line.
+manager.** `plugin.yaml` must **not** declare a `kind`. Check
+`~/.hermes/plugins/lancedb_pro/plugin.yaml`; if it has a `kind:` line, update
+the plugin (`hermes plugins update lancedb_pro`) or delete the line.
 
 **Check store health at any time:**
 
 ```bash
-hermes-memory-lancedb-pro doctor
+hermes lancedb_pro doctor
 ```
 
 ## Related documentation

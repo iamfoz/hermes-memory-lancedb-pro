@@ -13,6 +13,30 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Changed — install method (action required on current Hermes)
+- **Install with `hermes plugins install iamfoz/hermes-memory-lancedb-pro`.**
+  Current Hermes builds its Python environment through its package manager
+  (PM) from its own lock plus enabled plugins' declared dependencies, and
+  rebuilds it on update. A package added with `hermes-pip` (since removed
+  from Hermes) is not declared, so the rebuild dropped it, and the provider
+  failed with `Memory provider 'lancedb_pro' loaded but no provider instance
+  found` — the real `No module named 'hermes_memory_lancedb_pro'` is logged
+  only at DEBUG — while `hermes memory status` reported the plugin
+  `NOT installed`. The repo is now itself a Hermes plugin (root
+  `plugin.yaml`, `__init__.py`, `cli.py`); PM builds the package and its
+  dependencies into every environment generation. **Migrate:**
+  `mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old`, then
+  `hermes plugins install iamfoz/hermes-memory-lancedb-pro`. The memory
+  database and task ledgers are untouched.
+- **Entry point moved to `hermes_agent.memory_providers`**, the group Hermes
+  scans for pip-installed memory providers. It was registered under
+  `hermes_agent.plugins`, the general plugin group, which the general plugin
+  manager imports eagerly — the path upstream keeps memory providers out of.
+  The legacy `hermes.plugins` group is kept.
+- `install-plugin` now warns that its shim is not durable on package-managed
+  Hermes and points at the plugin install; docs no longer reference
+  `hermes-pip`.
+
 ### Added
 - **`valid_until` is enforced on recall.** Memories the smart extractor
   stamped with an expiry ("dentist appointment tomorrow" → +24h, "in 3

@@ -33,15 +33,16 @@ PLUGIN_NAME = "lancedb_pro"
 # no `hermes lancedb_pro` CLI). Both `register` and `register_memory_provider`
 # are re-exported so the host's loader finds an entry point either way.
 PLUGIN_SHIM_CONTENT = '''\
-"""Hermes plugin discovery shim for hermes-memory-lancedb-pro.
+"""Legacy Hermes discovery shim for hermes-memory-lancedb-pro.
 
-The heavy package (lancedb, sentence-transformers, ...) must be installed
-into Hermes' own Python environment with `hermes-pip install
-hermes-memory-lancedb-pro`; this shim only re-exports the plugin's
-`register` / `register_memory_provider` entry points so hermes-agent's
-plugin loader recognises and discovers this MemoryProvider. If the import
-below fails, the package landed in the wrong environment — reinstall with
-hermes-pip.
+This shim only re-exports the MemoryProvider's `register` /
+`register_memory_provider`; the package itself must already be importable
+from Hermes' Python. On current Hermes (package-managed environment) that is
+not durable — the next update rebuilds the environment without it. Replace
+this directory with a plugin install instead:
+
+    mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old
+    hermes plugins install iamfoz/hermes-memory-lancedb-pro
 
 Regenerate with: hermes-memory-lancedb-pro install-plugin
 """
@@ -1161,6 +1162,14 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
             f"Next: set `memory.provider: lancedb_pro` in config.yaml, restart\n"
             f"the Hermes gateway, then `hermes memory setup` (optional).\n"
         )
+    _stderr(
+        "NOTE: this legacy shim only works if hermes_memory_lancedb_pro is already in\n"
+        "Hermes' Python environment. Current Hermes manages that environment itself\n"
+        "and drops hand-installed packages on update. Prefer:\n"
+        f"  mv {plugin_dir} {plugin_dir}.old\n"
+        "  hermes plugins install iamfoz/hermes-memory-lancedb-pro",
+        quiet,
+    )
     _warn_home_mismatch(hermes_home, quiet)
     return 0
 

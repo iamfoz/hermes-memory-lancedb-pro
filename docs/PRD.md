@@ -223,14 +223,16 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
   `on_recall_used` + `on_tool_call_observed` (non-standard, inert on stock
   hosts), `on_session_switch`, `shutdown`, `on_session_end`.
   `before_prompt_build` deliberately not implemented (host-skip semantics).
-- **FR-61** ✅ Three discovery paths: entry points (`hermes_agent.plugins` +
-  legacy `hermes.plugins`), the `install-plugin` shim under
-  `$HERMES_HOME/plugins/lancedb_pro/` (with auto-migration from two
-  historical wrong paths and staleness auto-refresh), and
-  `ctx.register_cli_command` for host-level CLI wiring. The manifest declares
-  **no `kind`**: the host auto-detects memory providers from the shim's
-  `__init__.py` markers only when `kind` is absent (valid kinds are
-  standalone/backend/exclusive/platform/model-provider).
+- **FR-61** ✅ The repo is itself a Hermes plugin: `hermes plugins install
+  iamfoz/hermes-memory-lancedb-pro` places it at `$HERMES_HOME/plugins/lancedb_pro/`
+  (root `plugin.yaml` / `__init__.py` / `cli.py`), and Hermes' package manager
+  builds the package plus its dependencies into every environment generation
+  (the active memory provider joins PM's dependency union). Entry point under
+  `hermes_agent.memory_providers` (never the general `hermes_agent.plugins`
+  group) plus legacy `hermes.plugins`; the legacy `install-plugin` shim remains
+  for pre-PM hosts. The manifest declares **no `kind`**: the host auto-detects
+  memory providers from the `__init__.py` markers only when `kind` is absent
+  (valid kinds are standalone/backend/exclusive/platform/model-provider).
 - **FR-62** ✅ jmunch gateway compensation: env/header detection; recall
   widening; admission loosened to high-recall; pass-through headers on LLM
   calls. Zero code dependency on jmunch.
@@ -326,6 +328,7 @@ Gaps identified in the 2026-07 review, with disposition:
 | GA-18 | Manifest declared `kind: memory`, now invalid upstream — coerced to `standalone`, skipping memory auto-detection | Defect | **Fixed** — `kind` removed; regression test guards it |
 | GA-19 | Classifier verdict written as `memory_temporal_type` but decay read `temporal_type` (always "static") — classification had no effect | Defect | **Fixed** — both keys written; decay prefers the verdict, so existing rows recover without migration |
 | GA-20 | `valid_until` is inferred and stored but never consulted on recall — expired events still surface | Gap | **Fixed** — filtered from search, retriever, session anchors, and extractor dedup; `doctor` reports the count |
+| GA-21 | Package installed with `hermes-pip` outside PM's declared dependency set — dropped when current Hermes rebuilt its environment, so the provider failed to load ("loaded but no provider instance found"); entry point was in the general `hermes_agent.plugins` group, not `hermes_agent.memory_providers` | Defect | **Fixed** — repo installs via `hermes plugins install`, PM owns the dependencies; entry point moved |
 
 ## 9. Roadmap
 

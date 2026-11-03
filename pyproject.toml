@@ -44,13 +44,17 @@ hermes-memory-smoke = "hermes_memory_lancedb_pro._cli:smoke_main"
 hermes-memory-lancedb-pro = "hermes_memory_lancedb_pro._cli:main"
 hermes-memory = "hermes_memory_lancedb_pro._cli:main"
 
-# Plugin entry point — hermes-agent versions that support entry-point
-# discovery (via importlib.metadata) can find the provider without a shim.
-# Older versions still use the ~/.hermes/plugins/lancedb_pro/ shim that
-# `hermes-memory install-plugin` creates. Current hermes-agent reads
-# `hermes_agent.plugins`; the older `hermes.plugins` group is kept for
-# back-compatibility.
-[project.entry-points."hermes_agent.plugins"]
+# Plugin entry points. The supported install is `hermes plugins install
+# iamfoz/hermes-memory-lancedb-pro` (this repo is itself a Hermes plugin: see
+# the root plugin.yaml / __init__.py), which never needs these. They cover
+# entry-point discovery when the package is present some other way.
+#
+# hermes-agent discovers pip-installed MEMORY providers through
+# `hermes_agent.memory_providers`. Do NOT register under
+# `hermes_agent.plugins`: that is the general plugin group, which the general
+# plugin manager eagerly imports — the path upstream keeps memory providers
+# out of. The older `hermes.plugins` group is kept for pre-PM hosts.
+[project.entry-points."hermes_agent.memory_providers"]
 lancedb_pro = "hermes_memory_lancedb_pro.provider:register"
 
 [project.entry-points."hermes.plugins"]

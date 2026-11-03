@@ -97,8 +97,12 @@ The smart extractor needs an LLM. It resolves a client in this order: the full
 | `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model for the Anthropic fallback. |
 
 The `openai` and `anthropic` SDKs are **not** required dependencies — they are
-imported lazily, only when the matching variables resolve. Install whichever you
-need: `hermes-pip install openai` or `hermes-pip install anthropic`.
+imported lazily, only when the matching variables resolve. Inside Hermes both
+normally come from Hermes' own environment: `openai` is a core Hermes
+dependency, and `anthropic` is part of Hermes' `all` extra, which a standard
+`hermes pm install` selects. Never `pip install` into Hermes' environment — PM
+drops undeclared packages on the next rebuild. Standalone, install them into
+your own environment as usual.
 
 ## jmunch
 
@@ -122,8 +126,10 @@ rerank stage.
 | `LANGSEARCH_API_KEY` | *(none)* | Enables the LangSearch cross-encoder reranker. |
 | `GOOGLE_CLOUD_PROJECT` | *(none)* | Enables the Google Discovery Engine reranker. Also read as `GOOGLE_PROJECT_ID` / `GOOGLE_PROJECT`. Authentication uses Application Default Credentials — no API key. |
 
-The Google reranker needs the `google-auth` library:
-`hermes-pip install 'hermes-memory-lancedb-pro[google]'`.
+The Google reranker needs the `google-auth` library. Inside Hermes, add it
+through Hermes' own `google` extra: `hermes pm install --extra google`.
+Standalone: `pip install 'hermes-memory-lancedb-pro[google]'`. Without it the
+Google backend disables itself with an actionable warning.
 
 ## Hermes home and tasks
 

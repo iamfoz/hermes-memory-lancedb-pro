@@ -62,42 +62,35 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 **Requirements:** Python 3.11+ and a working Hermes Agent installation.
 
-Install the package into **Hermes' own Python environment** with `hermes-pip`,
-then create the discovery shim:
+This repository is itself a Hermes plugin. Install it with Hermes' plugin
+manager:
 
 ```bash
-# 1. Install into Hermes' environment (not your system Python)
-hermes-pip install hermes-memory-lancedb-pro
-
-# 2. Create the plugin discovery shim under ~/.hermes/plugins/lancedb_pro/
-hermes-memory-lancedb-pro install-plugin
+hermes plugins install iamfoz/hermes-memory-lancedb-pro
+hermes memory status          # Provider: lancedb_pro / Plugin: installed ✓
 ```
 
-> **Why `hermes-pip`?** This is the single most common install mistake. A plain
-> `pip install` lands the package in whatever Python is active, but hermes-agent
-> loads the discovery shim inside *its own* environment. If the package isn't
-> there, the import fails silently and the plugin never loads. `hermes-pip`
-> targets the correct environment.
+Hermes' package manager builds the package **and its dependencies** into
+Hermes' managed environment and keeps them across `hermes update`. Upgrade
+with `hermes plugins update lancedb_pro`.
 
-A working install has two pieces: the **package** holds all the code, and the
-**shim** at `~/.hermes/plugins/lancedb_pro/` is ~5 lines that let hermes-agent
-discover the provider. Because the shim only re-exports the package, upgrades
-are just `hermes-pip install -U hermes-memory-lancedb-pro` — no need to touch
-the plugin directory.
+> **Upgrading from a `hermes-pip` + `install-plugin` install?** Current Hermes
+> rebuilds its environment on update and drops packages installed by hand,
+> which shows up as `Memory provider 'lancedb_pro' loaded but no provider
+> instance found`. Move the old shim aside and install the plugin:
+> `mv ~/.hermes/plugins/lancedb_pro ~/.hermes/plugins/lancedb_pro.old` then
+> `hermes plugins install iamfoz/hermes-memory-lancedb-pro`. Your memory
+> database is untouched.
 
-Newer hermes-agent builds that support entry-point discovery
-(`importlib.metadata`, group `hermes.plugins`) find the provider without the
-shim — step 1 alone is enough.
-
-Full install detail, upgrade notes, and troubleshooting are in
+Full install detail, migration, and troubleshooting are in
 [docs/hermes-integration.md](docs/hermes-integration.md).
 
 ## Usage
 
 ### Using it in Hermes Agent
 
-After [installing](#install), activate the provider in hermes-agent's
-`config.yaml`:
+After [installing](#install), make sure the provider is active — the installer
+offers to set this — in hermes-agent's `config.yaml`:
 
 ```yaml
 memory:
