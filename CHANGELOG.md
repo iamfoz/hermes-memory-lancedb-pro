@@ -41,6 +41,28 @@ minor versions; breaking changes are called out under **Changed** and
   analysis, and roadmap.
 
 ### Fixed
+- **Temporal classification now actually affects decay.** The smart
+  extractor recorded its static/dynamic verdict as `memory_temporal_type`,
+  but decay reads `temporal_type` — which the store defaults to `"static"` on
+  every row. Every extracted memory therefore decayed as a permanent fact,
+  including "dentist appointment tomorrow". The extractor now writes both
+  keys, and decay prefers `memory_temporal_type`, so memories already in a
+  store pick up their recorded verdict with no migration. Dynamic memories
+  now use the intended one-third half-life.
+- **Temporal classifier: broader coverage, without misfiring on permanent
+  facts.** Adds a curated subset of the unmerged
+  `feat/temporal-classifier-expand` work: `this afternoon/evening/weekend`,
+  `next <day>`, `N hours ago` / `a few days ago`, `deadline` and
+  `due on/by/date/soon`, relative durations (`in 3 days`, `3天后`, `两周后`),
+  and Chinese `即将` / `马上` / `截止` / `这个周末`, with matching expiries
+  (offsets round up, so an event is never expired early). Relative durations
+  are *weak* signals: a habitual marker (`usually`, `every week`, `通常`, …)
+  vetoes them, so "I can usually finish a sprint in 10 days" stays static.
+  Patterns from the branch that misclassified permanent facts were left
+  out — bare dates and ISO dates (birthdays), ordinals ("the 5th edition"),
+  `on <day>` ("I go to the gym on Monday"), bare `appointment` /
+  `scheduled` / `expires`, bare 周末, and unnumbered 天后 (also "diva"). Ten
+  such facts are pinned as regression tests.
 - **`doctor` no longer recommends commands that don't exist.** It used to
   suggest `hermes-memory purge --grace-days 30` (which was not a subcommand)
   and calling `run_compaction()` (Python-only). Both recommendations now point

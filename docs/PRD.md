@@ -170,8 +170,11 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
   preview**.
 - **FR-33** ✅ LanceDB **fragment compaction** (`optimize()`) auto-triggered
   every N writes (default 256), single-flighted, to prevent FD exhaustion.
-- **FR-34** ✅ Temporal classification (`static`/`dynamic`, EN + zh cues) and
-  expiry inference feed decay and validity windows.
+- **FR-34** ✅ Temporal classification (`static`/`dynamic`, EN + zh cues)
+  feeds decay (dynamic → one-third half-life) and expiry inference records
+  `valid_until`. Classification favours false negatives: strong signals
+  always win, relative durations are vetoed by habitual markers. 🔶
+  `valid_until` is recorded but not yet enforced on recall (see GA-20).
 
 ### 5.5 Extraction & admission (opt-in LLM)
 
@@ -320,6 +323,8 @@ Gaps identified in the 2026-07 review, with disposition:
 | GA-16 | No test coverage for the `_cmd_init`/`_cmd_reset`/`smoke_main`/task-CLI wrapper layer (module logic is tested; the argparse wrappers are not) | Gap | Roadmap R2 |
 | GA-17 | `MemoryStore.optimize()` (fragment compaction) has no manual CLI trigger — automatic only | Nice-to-have | Roadmap R4 (`maintain` includes it) |
 | GA-18 | Manifest declared `kind: memory`, now invalid upstream — coerced to `standalone`, skipping memory auto-detection | Defect | **Fixed** — `kind` removed; regression test guards it |
+| GA-19 | Classifier verdict written as `memory_temporal_type` but decay read `temporal_type` (always "static") — classification had no effect | Defect | **Fixed** — both keys written; decay prefers the verdict, so existing rows recover without migration |
+| GA-20 | `valid_until` is inferred and stored but never consulted on recall — expired events still surface | Gap | Open — decide whether recall should filter or down-weight expired rows |
 
 ## 9. Roadmap
 
