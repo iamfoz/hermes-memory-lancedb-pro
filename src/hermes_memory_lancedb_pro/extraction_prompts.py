@@ -261,6 +261,7 @@ Return JSON format:
 
 
 def build_merge_prompt(
+    *,
     existing_abstract: str,
     existing_overview: str,
     existing_content: str,

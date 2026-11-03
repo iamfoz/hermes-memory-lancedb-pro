@@ -226,9 +226,11 @@ class TestGoogleAuthToken:
 
     def test_missing_google_auth_library_trips_disable(self, monkeypatch, caplog):
         r = self._retriever_with_google(monkeypatch)
-        with patch.dict(sys.modules, {"google.auth": None, "google.auth.transport.requests": None}):
-            with caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"):
-                token = r._get_google_auth_token()
+        with (
+            patch.dict(sys.modules, {"google.auth": None, "google.auth.transport.requests": None}),
+            caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"),
+        ):
+            token = r._get_google_auth_token()
         assert token is None
         assert r._google_disabled is True
         assert "google-auth" in caplog.text
@@ -237,9 +239,11 @@ class TestGoogleAuthToken:
         r = self._retriever_with_google(monkeypatch)
         mock_auth = MagicMock()
         mock_auth.default.side_effect = Exception("Could not find credentials")
-        with patch.dict(sys.modules, self._mock_google_modules(mock_auth=mock_auth)):
-            with caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"):
-                token = r._get_google_auth_token()
+        with (
+            patch.dict(sys.modules, self._mock_google_modules(mock_auth=mock_auth)),
+            caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"),
+        ):
+            token = r._get_google_auth_token()
         assert token is None
         assert r._google_disabled is True
         assert "GOOGLE_APPLICATION_CREDENTIALS" in caplog.text
@@ -275,9 +279,11 @@ class TestGoogleAuthToken:
         mock_creds.refresh.side_effect = Exception("Token refresh failed")
         mock_auth = MagicMock()
         mock_auth.default.return_value = (mock_creds, "test-project")
-        with patch.dict(sys.modules, self._mock_google_modules(mock_auth=mock_auth)):
-            with caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"):
-                token = r._get_google_auth_token()
+        with (
+            patch.dict(sys.modules, self._mock_google_modules(mock_auth=mock_auth)),
+            caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"),
+        ):
+            token = r._get_google_auth_token()
         assert token is None
         assert r._google_disabled is True
 
@@ -351,9 +357,11 @@ class TestGoogleRerankBackend:
         r._google_session.headers = {}
         r._google_session.post.return_value = mock_resp
 
-        with patch.object(r, "_get_google_auth_token", return_value="ya29.test-token"):
-            with caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"):
-                r._rerank_google("query", results, top_n=3)
+        with (
+            patch.object(r, "_get_google_auth_token", return_value="ya29.test-token"),
+            caplog.at_level(logging.WARNING, logger="hermes_memory_lancedb_pro.retriever"),
+        ):
+            r._rerank_google("query", results, top_n=3)
 
         assert r._google_disabled is True
         assert "Discovery Engine" in caplog.text

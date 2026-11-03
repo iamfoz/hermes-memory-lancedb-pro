@@ -126,71 +126,63 @@ class TestDedupPrompt:
 # ---------------------------------------------------------------------------
 
 
+def _merge_prompt(**overrides: str) -> str:
+    """build_merge_prompt is keyword-only — seven same-typed strings are easy to
+    transpose silently, so every caller must name them."""
+    kwargs = dict(
+        existing_abstract="old abstract",
+        existing_overview="old overview",
+        existing_content="old content",
+        new_abstract="new abstract",
+        new_overview="new overview",
+        new_content="new content",
+        category="preferences",
+    )
+    kwargs.update(overrides)
+    return build_merge_prompt(**kwargs)
+
+
 class TestMergePrompt:
+    def test_positional_call_is_rejected(self) -> None:
+        with pytest.raises(TypeError):
+            build_merge_prompt("ea", "eo", "ec", "na", "no", "nc", "cases")  # type: ignore[misc]
+
     def test_existing_abstract_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "old abstract" in prompt
 
     def test_existing_overview_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "old overview" in prompt
 
     def test_existing_content_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "old content" in prompt
 
     def test_new_abstract_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "new abstract" in prompt
 
     def test_new_overview_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "new overview" in prompt
 
     def test_new_content_present(self) -> None:
-        prompt = build_merge_prompt(
-            "old abstract", "old overview", "old content",
-            "new abstract", "new overview", "new content",
-            "preferences",
-        )
+        prompt = _merge_prompt()
         assert "new content" in prompt
 
     def test_category_appears(self) -> None:
-        prompt = build_merge_prompt(
-            "ea", "eo", "ec",
-            "na", "no", "nc",
-            "entities",
-        )
+        prompt = _merge_prompt(category="entities")
         assert "entities" in prompt
 
     def test_output_json_contract_abstract(self) -> None:
-        prompt = build_merge_prompt("ea", "eo", "ec", "na", "no", "nc", "cases")
+        prompt = _merge_prompt(category="cases")
         assert '"abstract"' in prompt
 
     def test_output_json_contract_overview(self) -> None:
-        prompt = build_merge_prompt("ea", "eo", "ec", "na", "no", "nc", "cases")
+        prompt = _merge_prompt(category="cases")
         assert '"overview"' in prompt
 
     def test_output_json_contract_content(self) -> None:
-        prompt = build_merge_prompt("ea", "eo", "ec", "na", "no", "nc", "cases")
+        prompt = _merge_prompt(category="cases")
         assert '"content"' in prompt

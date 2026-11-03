@@ -976,9 +976,13 @@ class SmartExtractor:
         existing_content = existing_meta.l2_content or existing.get("text", "")
 
         prompt = build_merge_prompt(
-            existing_abstract, existing_overview, existing_content,
-            candidate.abstract, candidate.overview, candidate.content,
-            candidate.category,
+            existing_abstract=existing_abstract,
+            existing_overview=existing_overview,
+            existing_content=existing_content,
+            new_abstract=candidate.abstract,
+            new_overview=candidate.overview,
+            new_content=candidate.content,
+            category=candidate.category,
         )
         merged = self._llm_complete_json_with_retry(prompt, label="merge-memory")
         if not merged:

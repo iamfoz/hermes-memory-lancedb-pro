@@ -611,6 +611,7 @@ class MemoryStore:
         scope: str = "global",
         importance: float = 0.5,
         tier: str = "working",
+        *,
         confidence: float = 0.8,
         metadata_extra: dict[str, Any] | None = None,
     ) -> str:
@@ -793,6 +794,7 @@ class MemoryStore:
         importance: float | None = None,
         category: str | None = None,
         tier: str | None = None,
+        *,
         metadata_extra: dict[str, Any] | None = None,
     ) -> str | None:
         """Update an existing memory.
@@ -1169,6 +1171,7 @@ class MemoryStore:
         tier: str | None = None,
         scope: str | None = None,
         offset: int = 0,
+        *,
         include_archived: bool = False,
         session_id: str | None = None,
         # Hermes core may pass `categories` instead of `category`
@@ -1285,6 +1288,7 @@ class MemoryStore:
         mode: str = "hybrid",  # "vector" | "bm25" | "hybrid"
         category: str | None = None,
         scope: str | None = None,
+        *,
         session_id: str | None = None,
         min_score: float | None = None,
     ) -> list[dict[str, Any]]:

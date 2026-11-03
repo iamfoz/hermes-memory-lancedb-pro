@@ -392,10 +392,7 @@ class TestReflectionWiring:
 class TestExtractionRateLimiter:
     def test_rate_limiter_not_created_when_zero(self, monkeypatch):
         monkeypatch.setattr(provider, "_EXTRACTION_RATE_LIMIT", 0)
-        extractor = provider._maybe_build_default_smart_extractor.__wrapped__ if hasattr(
-            provider._maybe_build_default_smart_extractor, "__wrapped__"
-        ) else None
-        # The simpler check: build an extractor directly and confirm no limiter
+        # Build an extractor directly and confirm no limiter is attached.
         from hermes_memory_lancedb_pro.smart_extractor import ExtractionRateLimiter, SmartExtractor
         ex = SmartExtractor.__new__(SmartExtractor)
         ex._rate_limiter = None

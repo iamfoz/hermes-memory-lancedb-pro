@@ -61,6 +61,19 @@ minor versions; breaking changes are called out under **Changed** and
   `kind` key reappears.
 
 ### Changed
+- **Trailing optional parameters are now keyword-only** on high-arity public
+  APIs (ruff `PLR0917`). The first five parameters keep their positions;
+  only the 6th onward must be named:
+  - `MemoryStore.store(…, *, confidence, metadata_extra)`
+  - `MemoryStore.update(…, *, metadata_extra)`
+  - `MemoryStore.list_memories(…, *, include_archived, session_id, categories)`
+  - `MemoryStore.search(…, *, session_id, min_score)`
+  - `build_merge_prompt(*, …)` — fully keyword-only: its seven same-typed
+    string arguments were easy to transpose silently.
+
+  No call site in the package, tests, scripts, or docs passed those
+  arguments positionally. External code that did will now get a
+  `TypeError` — name the arguments to fix it.
 - **Agent-facing task commands now use the in-host `hermes lancedb_pro task …`
   form.** The durable-task protocol injected by the provider every turn, the
   `durable-task` / `task-to-skill` skills, and the `task to-skill` scaffold
