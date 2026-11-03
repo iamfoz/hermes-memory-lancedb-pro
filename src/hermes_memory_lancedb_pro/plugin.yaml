@@ -1,7 +1,13 @@
 name: lancedb_pro
 version: 0.14.3
-kind: memory
 description: "LanceDB memory provider — hybrid BM25+vector search with Weibull decay and tier management"
+# No `kind:` on purpose. Upstream's valid kinds are standalone / backend /
+# exclusive / platform / model-provider; memory providers are auto-detected
+# from the shim __init__.py markers (`register_memory_provider` /
+# `MemoryProvider`), and that detection ONLY runs when `kind` is absent. An
+# invalid value (e.g. the old `kind: memory`) is coerced to standalone, skips
+# detection, and gets the plugin eagerly imported by the general plugin
+# manager — the path upstream keeps memory providers out of.
 # `before_prompt_build` is intentionally NOT implemented: overriding it makes
 # the host's prefetch_all() skip this provider, and the host never calls the
 # hook anyway. on_recall_used / on_tool_call_observed are non-standard hooks

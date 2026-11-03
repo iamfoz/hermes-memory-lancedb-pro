@@ -13,6 +13,20 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Fixed
+- **Removed `kind: memory` from `plugin.yaml`.** hermes-agent's manifest
+  taxonomy now accepts only `standalone`, `backend`, `exclusive`, `platform`,
+  and `model-provider`; memory providers are auto-detected from the shim's
+  `__init__.py` markers, and that detection only runs when `kind` is absent.
+  The invalid `memory` value was coerced to `standalone`, skipping
+  auto-detection and letting the general plugin manager eagerly import the
+  provider as a standalone plugin — the path upstream keeps memory providers
+  out of. Memory discovery kept working via its separate path, but the
+  plugin was mis-classified. **Existing installs:** re-run
+  `hermes-memory-lancedb-pro install-plugin` after upgrading — it detects the
+  stale copied manifest and refreshes it. A regression test now fails if a
+  `kind` key reappears.
+
 ### Changed
 - **Agent-facing task commands now use the in-host `hermes lancedb_pro task …`
   form.** The durable-task protocol injected by the provider every turn, the

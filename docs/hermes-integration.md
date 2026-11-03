@@ -42,12 +42,26 @@ This creates `~/.hermes/plugins/lancedb_pro/` containing three files:
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | The discovery shim — re-exports `register` / `register_memory_provider` from the package. |
+| `__init__.py` | The discovery shim — re-exports `register` / `register_memory_provider` from the package. Those names double as the markers the host uses to auto-detect a memory provider. |
 | `cli.py` | Re-exports `register_cli`, so `hermes lancedb_pro <command>` works. |
-| `plugin.yaml` | Copied from the wheel — declares `name`, `kind: memory`, and the hook list. |
+| `plugin.yaml` | Copied from the wheel — declares `name` and the hook list. It deliberately has **no `kind:`** — see below. |
 
-The shim is just re-exports, so **upgrades never touch the plugin directory** —
-`hermes-pip install -U hermes-memory-lancedb-pro` is the whole upgrade.
+The shim is just re-exports, so code upgrades never need the plugin directory
+touched — `hermes-pip install -U hermes-memory-lancedb-pro` upgrades the
+provider. The one exception is when the bundled `plugin.yaml` itself changes
+(as in the release that dropped `kind: memory`): re-run
+`hermes-memory-lancedb-pro install-plugin` afterwards. It detects the stale
+copy and refreshes it automatically.
+
+### Why the manifest has no `kind`
+
+hermes-agent's manifest kinds are `standalone`, `backend`, `exclusive`,
+`platform`, and `model-provider`. Memory providers are not declared — the host
+auto-detects them from the `__init__.py` markers and routes them to the memory
+discovery path (as `exclusive`). That auto-detection **only runs when `kind` is
+absent**: an unrecognised value such as the old `kind: memory` is coerced to
+`standalone`, skips detection, and the general plugin manager then eagerly
+imports the plugin as a standalone plugin. Leave the field out.
 
 `install-plugin` accepts:
 
@@ -116,9 +130,12 @@ hermes-pip install -U hermes-memory-lancedb-pro
 hermes-memory-lancedb-pro install-plugin
 ```
 
-**The provider is found but not routed.** `plugin.yaml` must declare
-`kind: memory`. The bundled file already does; if you hand-edited it, restore
-that line so the host routes the plugin to the memory manager.
+**The provider is loaded as a standalone plugin / not routed to the memory
+manager.** `plugin.yaml` must **not** declare a `kind`. Older releases shipped
+`kind: memory`, which current hermes-agent treats as invalid and coerces to
+`standalone`. Check `~/.hermes/plugins/lancedb_pro/plugin.yaml`; if it still
+has a `kind:` line, upgrade and re-run `hermes-memory-lancedb-pro install-plugin`
+(it refreshes stale copies), or simply delete the line.
 
 **Check store health at any time:**
 

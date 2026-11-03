@@ -591,3 +591,51 @@ class TestRegisterCli:
         args = parser.parse_args(["reset"])
         assert args.lancedb_pro_command == "reset"
         assert callable(getattr(args, "func", None))
+
+
+# ---------------------------------------------------------------------------
+# Manifest taxonomy — memory providers must be auto-detected, not declared
+# ---------------------------------------------------------------------------
+
+
+class TestManifestKind:
+    """hermes-agent only auto-detects memory providers when ``kind`` is absent.
+
+    Valid declared kinds are standalone/backend/exclusive/platform/
+    model-provider. An invalid value (the old ``kind: memory``) is coerced to
+    ``standalone``, skips auto-detection, and the plugin gets eagerly imported
+    by the general plugin manager instead of routed to memory discovery.
+    """
+
+    def _manifest_lines(self) -> list[str]:
+        from hermes_memory_lancedb_pro._cli import _packaged_plugin_yaml
+
+        return _packaged_plugin_yaml().read_text(encoding="utf-8").splitlines()
+
+    def test_packaged_manifest_declares_no_kind(self):
+        kind_lines = [ln for ln in self._manifest_lines() if ln.lstrip().startswith("kind:")]
+        assert kind_lines == [], f"plugin.yaml must not declare kind: {kind_lines}"
+
+    def test_packaged_manifest_keeps_name(self):
+        assert "name: lancedb_pro" in self._manifest_lines()
+
+    def test_shim_carries_memory_provider_markers(self):
+        from hermes_memory_lancedb_pro._cli import PLUGIN_SHIM_CONTENT
+
+        # Auto-detection text-scans the shim for these markers.
+        assert "register_memory_provider" in PLUGIN_SHIM_CONTENT
+        assert "MemoryProvider" in PLUGIN_SHIM_CONTENT
+
+    def test_install_refreshes_stale_kind_memory_manifest(self, tmp_path):
+        """An install from an older release still carrying kind: memory is
+        detected as stale and rewritten from the packaged manifest."""
+        hermes_home = tmp_path / ".hermes"
+        assert _cmd_install_plugin(_Args(hermes_home=str(hermes_home), quiet=True)) == 0
+        yaml_path = hermes_home / "plugins" / "lancedb_pro" / "plugin.yaml"
+        yaml_path.write_text(
+            "name: lancedb_pro\nversion: 0.14.3\nkind: memory\n", encoding="utf-8"
+        )
+
+        assert _cmd_install_plugin(_Args(hermes_home=str(hermes_home), quiet=True)) == 0
+        refreshed = yaml_path.read_text(encoding="utf-8")
+        assert not any(ln.startswith("kind:") for ln in refreshed.splitlines())
