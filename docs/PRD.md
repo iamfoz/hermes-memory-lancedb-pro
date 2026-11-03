@@ -173,8 +173,9 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
 - **FR-34** ✅ Temporal classification (`static`/`dynamic`, EN + zh cues)
   feeds decay (dynamic → one-third half-life) and expiry inference records
   `valid_until`. Classification favours false negatives: strong signals
-  always win, relative durations are vetoed by habitual markers. 🔶
-  `valid_until` is recorded but not yet enforced on recall (see GA-20).
+  always win, relative durations are vetoed by habitual markers. Expired
+  memories (`valid_until` passed) are hidden from every recall path but kept
+  for admin paths; `MEMORY_ENFORCE_VALID_UNTIL=off` disables.
 
 ### 5.5 Extraction & admission (opt-in LLM)
 
@@ -324,7 +325,7 @@ Gaps identified in the 2026-07 review, with disposition:
 | GA-17 | `MemoryStore.optimize()` (fragment compaction) has no manual CLI trigger — automatic only | Nice-to-have | Roadmap R4 (`maintain` includes it) |
 | GA-18 | Manifest declared `kind: memory`, now invalid upstream — coerced to `standalone`, skipping memory auto-detection | Defect | **Fixed** — `kind` removed; regression test guards it |
 | GA-19 | Classifier verdict written as `memory_temporal_type` but decay read `temporal_type` (always "static") — classification had no effect | Defect | **Fixed** — both keys written; decay prefers the verdict, so existing rows recover without migration |
-| GA-20 | `valid_until` is inferred and stored but never consulted on recall — expired events still surface | Gap | Open — decide whether recall should filter or down-weight expired rows |
+| GA-20 | `valid_until` is inferred and stored but never consulted on recall — expired events still surface | Gap | **Fixed** — filtered from search, retriever, session anchors, and extractor dedup; `doctor` reports the count |
 
 ## 9. Roadmap
 

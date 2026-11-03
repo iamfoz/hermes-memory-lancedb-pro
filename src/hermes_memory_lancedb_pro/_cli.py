@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import store as _store_module
 from . import task_ledger as _tl
+from ._sql import is_expired as _is_expired
 from ._sql import parse_metadata as _parse_metadata
 from .store import (
     DEFAULT_DB_PATH,
@@ -402,6 +404,7 @@ def _cmd_doctor(
     cross_session_zero_access: list[str] = []
     archived_older_than_grace: int = 0
     old_non_archived_count: int = 0
+    expired_ids: list[str] = []  # active rows whose valid_until has passed
 
     # First pass — collect all ids
     for row in store._scan_all(limit=_DOCTOR_MAX_SCAN):
@@ -446,6 +449,10 @@ def _cmd_doctor(
             # Compaction candidates: old non-archived rows
             if ts and ts < compaction_cutoff:
                 old_non_archived_count += 1
+
+            # Past valid_until — hidden from recall when enforcement is on
+            if _is_expired(meta, now_ms):
+                expired_ids.append(rid)
         else:
             # Archived older than 30 days (purge recommendation)
             grace_ms = 30 * 86_400_000
@@ -485,6 +492,21 @@ def _cmd_doctor(
 
     if not has_anomalies:
         print("  No anomalies detected.")
+    print()
+
+    # ---- Expiry ----
+    # Not an anomaly: time-bound memories ("dentist tomorrow") are meant to
+    # expire. Reported so "why isn't X recalled?" has an answer.
+    print("--- Expiry ---")
+    enforcing = _store_module.ENFORCE_VALID_UNTIL
+    print(
+        f"valid_until enforcement: {'on' if enforcing else 'off'} "
+        "(MEMORY_ENFORCE_VALID_UNTIL)"
+    )
+    verb = "hidden from recall" if enforcing else "still recalled"
+    print(f"expired memories ({verb}): {len(expired_ids)}")
+    for eid in expired_ids[:_ORPHAN_EXAMPLE_LIMIT]:
+        print(f"  {eid}")
     print()
 
     # ---- Recommendations ----

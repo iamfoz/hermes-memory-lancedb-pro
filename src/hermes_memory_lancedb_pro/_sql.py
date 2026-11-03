@@ -41,6 +41,22 @@ def is_archived(metadata: Any) -> bool:
     return parsed.get("state") == ARCHIVED_STATE
 
 
+def is_expired(metadata: Any, now_ms: int) -> bool:
+    """True if the row's ``valid_until`` (epoch ms) is set and at or before
+    *now_ms*.
+
+    Missing, null, zero, negative, or non-numeric values mean "no expiry" —
+    a malformed timestamp must never hide a memory."""
+    raw = parse_metadata(metadata).get("valid_until")
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        valid_until = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 0 < valid_until <= now_ms
+
+
 def and_clauses(*clauses: str | None) -> str | None:
     """Join SQL clauses with AND, dropping None / empty strings."""
     parts = [c for c in clauses if c]

@@ -46,6 +46,9 @@ from ._sql import (
     is_archived as _is_archived,
 )
 from ._sql import (
+    is_expired as _is_expired,
+)
+from ._sql import (
     match_session as _match_session,
 )
 from ._sql import (
@@ -139,6 +142,25 @@ ACCESS_COUNT_THROTTLE_SECONDS: int = int(
 CROSS_SESSION_PROMOTION_THRESHOLD: int = int(
     os.environ.get("MEMORY_CROSS_SESSION_PROMOTION_K", "3")
 )
+
+# Hide memories whose metadata `valid_until` (epoch ms, inferred by the smart
+# extractor from phrases like "tomorrow" / "in 3 days") has passed from every
+# recall path: search (all modes), the retriever, session anchors, and the
+# extractor's dedup neighbour search. Expired rows are not deleted — admin
+# paths (get_by_id, list_memories, export, doctor) still see them. Set
+# MEMORY_ENFORCE_VALID_UNTIL=off to restore the old record-only behaviour.
+ENFORCE_VALID_UNTIL: bool = os.environ.get(
+    "MEMORY_ENFORCE_VALID_UNTIL", "on"
+).strip().lower() not in ("off", "0", "false", "no")
+
+
+def _hidden_from_recall(metadata: Any, now_ms: int) -> bool:
+    """True if a row must never be surfaced by recall: archived, or past its
+    ``valid_until`` while enforcement is on. Reads the module-level switch at
+    call time so tests (and embedders) can toggle it."""
+    if _is_archived(metadata):
+        return True
+    return ENFORCE_VALID_UNTIL and _is_expired(metadata, now_ms)
 
 # Prompt-injection guard mode — applied at every write site that takes
 # free-form text. Stops a malicious tool result or pasted snippet from
@@ -781,10 +803,14 @@ class MemoryStore:
         if where:
             search = search.where(where)
         results = search.limit(max(limit * SEARCH_OVERFETCH_MULTIPLIER, limit)).to_list()
+        # Expired rows are excluded too: the smart extractor uses this for
+        # dedup, and matching an expired "dentist tomorrow" would merge or
+        # skip a fresh occurrence into a row recall can no longer surface.
+        now_ms = int(time.time() * 1000)
         return [
             self._row_to_dict(r, distance=r.get("_distance"), keep_vector=keep_vector)
             for r in results
-            if not _is_archived(r.get("metadata", ""))
+            if not _hidden_from_recall(r.get("metadata", ""), now_ms)
         ][:limit]
 
     def update(
@@ -1224,8 +1250,9 @@ class MemoryStore:
         return rows[offset : offset + limit]
 
     def recent_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
-        """Return the *limit* most recently written non-archived memories for
-        *session_id*, ordered newest-first by timestamp.
+        """Return the *limit* most recently written recallable (non-archived,
+        non-expired) memories for *session_id*, ordered newest-first by
+        timestamp.
 
         Used by the recall path as a recency anchor so the agent keeps sight
         of the latest instruction even when the current query is semantically
@@ -1241,10 +1268,11 @@ class MemoryStore:
             )
         except Exception:
             return []
+        now_ms = int(time.time() * 1000)
         out = []
         for r in rows:
             d = self._row_to_dict(r)
-            if d["metadata"].get("state") == ARCHIVED_STATE:
+            if _hidden_from_recall(d["metadata"], now_ms):
                 continue
             if not _match_session(d["metadata"], session_id):
                 continue
@@ -1253,8 +1281,8 @@ class MemoryStore:
         return out[:limit]
 
     def first_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
-        """Return the *limit* oldest non-archived memories for *session_id*,
-        ordered oldest-first by timestamp.
+        """Return the *limit* oldest recallable (non-archived, non-expired)
+        memories for *session_id*, ordered oldest-first by timestamp.
 
         Used alongside `recent_for_session` to pin task-framing memories
         (written at the start of a session) so they are always injected even
@@ -1270,10 +1298,11 @@ class MemoryStore:
             )
         except Exception:
             return []
+        now_ms = int(time.time() * 1000)
         out = []
         for r in rows:
             d = self._row_to_dict(r)
-            if d["metadata"].get("state") == ARCHIVED_STATE:
+            if _hidden_from_recall(d["metadata"], now_ms):
                 continue
             if not _match_session(d["metadata"], session_id):
                 continue
@@ -1347,15 +1376,16 @@ class MemoryStore:
         *,
         session_id: str | None,
     ) -> list[dict[str, Any]]:
-        """Apply non-archived + session_id filters in Python.
+        """Apply non-archived, non-expired, and session_id filters in Python.
 
-        Archived filtering is always applied (callers that want archived
-        rows go through different paths). Session filtering is applied
-        only when `session_id` is provided."""
+        Archived and expired (``valid_until`` passed) filtering is always
+        applied — callers that want those rows go through admin paths.
+        Session filtering is applied only when `session_id` is provided."""
+        now_ms = int(time.time() * 1000)
         out = []
         for row in rows:
             meta = row.get("metadata", "")
-            if _is_archived(meta):
+            if _hidden_from_recall(meta, now_ms):
                 continue
             if session_id is not None and not _match_session(meta, session_id):
                 continue

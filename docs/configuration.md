@@ -34,6 +34,7 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 | `MEMORY_RECALL_MAX_ITEM_CHARS` | `600` | Hard per-memory character cap inside the recall block. |
 | `MEMORY_ACTIVE_TASK_PIN` | `on` | Pin `active_task` memories to the front of recall, bypassing filters and the char budget. |
 | `MEMORY_TASK_PROTOCOL` | `on` | Prepend the durable-task protocol text to every recall block. |
+| `MEMORY_ENFORCE_VALID_UNTIL` | `on` | Hide memories whose `valid_until` has passed from every recall path (search, retriever, session anchors, extractor dedup). Rows are kept — `doctor`, `export`, and `get_by_id` still see them. `off` restores record-only behaviour. |
 
 ## Admission control
 

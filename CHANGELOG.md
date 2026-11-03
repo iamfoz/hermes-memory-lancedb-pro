@@ -14,6 +14,18 @@ minor versions; breaking changes are called out under **Changed** and
 ## [Unreleased]
 
 ### Added
+- **`valid_until` is enforced on recall.** Memories the smart extractor
+  stamped with an expiry ("dentist appointment tomorrow" → +24h, "in 3
+  days" → +72h) are now hidden from every recall path once it passes:
+  `search` in all modes, `MemoryRetriever`, the session recency/first-turn
+  anchors, and `search_by_vector` — the extractor's dedup neighbour search,
+  so a fresh occurrence of an event is never merged into, or skipped
+  because of, an expired row recall can no longer show. Rows are not
+  deleted: `get_by_id`, `list_memories`, `export`, and `doctor` still see
+  them, and `doctor` gains an *Expiry* section reporting the enforcement
+  state and how many memories are expired. Missing, null, zero, or
+  malformed `valid_until` values never hide a memory. Turn it off with
+  `MEMORY_ENFORCE_VALID_UNTIL=off`.
 - **`stats` subcommand** — store statistics (counts, categories, tiers)
   without the doctor's full anomaly scan; `--json` emits the raw
   `MemoryStore.stats()` dict for scripting.
