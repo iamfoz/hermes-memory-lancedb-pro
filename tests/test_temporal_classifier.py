@@ -259,3 +259,108 @@ class TestCurrentPattern:
 
     def test_current_in_compound_classified_dynamic(self):
         assert classify_temporal("My current address is 42 Main St") == "dynamic"
+
+
+# ---------------------------------------------------------------------------
+# Curated expansion (salvaged from feat/temporal-classifier-expand)
+# ---------------------------------------------------------------------------
+
+# Permanent or recurring facts. Every one of these was misclassified as
+# dynamic by the unmerged branch; they must stay static with no expiry.
+_STATIC_FACT_PROBES = [
+    "My birthday is March 15",
+    "I was born on 1990-05-07",
+    "I go to the gym on Monday",
+    "I have a monthly dentist appointment",
+    "Nightly backups are scheduled at 2am",
+    "My passport expires in 2031",
+    "I love 21st century architecture, especially the 5th edition of the guide",
+    "我周末喜欢打球",
+    "我最喜欢的歌手是天后王菲",
+    "I can usually finish a sprint in 10 days",
+]
+
+
+@pytest.mark.parametrize("text", _STATIC_FACT_PROBES)
+def test_permanent_facts_stay_static(text: str) -> None:
+    assert classify_temporal(text) == "static"
+
+
+@pytest.mark.parametrize("text", _STATIC_FACT_PROBES)
+def test_permanent_facts_get_no_expiry(text: str) -> None:
+    assert infer_expiry(text, now_ms=NOW_MS) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Call me back this afternoon",
+        "Dinner this evening",
+        "We're hiking this weekend",
+        "The review is next Friday",
+        "I pushed the fix 3 hours ago",
+        "Saw it a few days ago",
+        "The deadline moved",
+        "Rent is due on the first",
+        "Flight leaves in 3 days",
+        "Back in an hour",
+        "3天后出发",
+        "两周后见",
+        "项目即将上线",
+        "我马上回来",
+        "报名截止了",
+        "这个周末去爬山",
+    ],
+)
+def test_expanded_dynamic_signals(text: str) -> None:
+    assert classify_temporal(text) == "dynamic"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I usually reply in 2 days",
+        "We typically ship in 3 weeks",
+        "Every week the build finishes in 4 hours",
+        "通常3天后到货",
+        "每周两天后复盘",
+    ],
+)
+def test_habitual_marker_vetoes_relative_duration(text: str) -> None:
+    assert classify_temporal(text) == "static"
+    assert infer_expiry(text, now_ms=NOW_MS) is None
+
+
+def test_strong_signal_beats_habitual_marker() -> None:
+    # A habitual marker only vetoes weak (relative-duration) signals.
+    assert classify_temporal("I usually skip standup but the deadline is tomorrow") == "dynamic"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_offset_ms"),
+    [
+        ("Flight leaves in 3 days", 3 * _MS_PER_DAY),
+        ("Sync again in 2 weeks", 14 * _MS_PER_DAY),
+        ("Back in 4 hours", 4 * _MS_PER_HOUR),
+        ("Reminder in 30 minutes", 30 * 60 * 1000),
+        ("3天后出发", 3 * _MS_PER_DAY),
+        ("2周后复查", 14 * _MS_PER_DAY),
+        ("5小时后开会", 5 * _MS_PER_HOUR),
+        ("The review is next Friday", 7 * _MS_PER_DAY),
+        ("We're hiking this weekend", 7 * _MS_PER_DAY),
+        ("这个周末去爬山", 7 * _MS_PER_DAY),
+        ("Call me back this afternoon", 18 * _MS_PER_HOUR),
+    ],
+)
+def test_expanded_expiry(text: str, expected_offset_ms: int) -> None:
+    assert infer_expiry(text, now_ms=NOW_MS) == NOW_MS + expected_offset_ms
+
+
+def test_fixed_rule_takes_precedence_over_variable() -> None:
+    assert infer_expiry("Tomorrow, then again in 5 days", now_ms=NOW_MS) == NOW_MS + 24 * _MS_PER_HOUR
+
+
+def test_british_spelling_is_static_keyword() -> None:
+    from hermes_memory_lancedb_pro import temporal_classifier as tc
+
+    assert any(p.search("My favourite colour") for p in tc._STATIC_PATTERNS_EN)
