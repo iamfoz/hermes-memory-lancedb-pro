@@ -216,7 +216,7 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
 
 ### 5.7 Host integration
 
-- **FR-60** ✅ 10 provider hooks (`plugin.yaml`): `system_prompt_block`
+- **FR-60** ✅ 10 provider hooks (`MemoryProvider` methods the host calls directly — deliberately not listed in `plugin.yaml`, whose `hooks:` field is for general plugin hooks): `system_prompt_block`
   (cache-stable, never raises), `prefetch` (the real recall path),
   `sync_turn` (non-blocking daemon-thread writes), `on_pre_compress`
   (recovery anchor), `on_memory_write` (mirrors host memory tool),

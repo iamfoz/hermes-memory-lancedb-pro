@@ -75,3 +75,14 @@ def test_no_stray_root_python_modules():
     # The host loader imports EVERY top-level *.py in the plugin dir as a
     # submodule; only the two shims may live there.
     assert sorted(p.name for p in ROOT.glob("*.py")) == ["__init__.py", "cli.py"]
+
+
+def test_manifest_declares_no_general_plugin_hooks():
+    # `hooks:` / `provides_hooks:` declare GENERAL plugin hooks (registered via
+    # ctx.register_hook, checked against Hermes' VALID_HOOKS). Our lifecycle is
+    # MemoryProvider methods the memory manager calls directly; listing them made
+    # `hermes plugins doctor` report "unknown hook" errors.
+    import re
+
+    text = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+    assert not re.search(r"^(hooks|provides_hooks)\s*:", text, re.MULTILINE)

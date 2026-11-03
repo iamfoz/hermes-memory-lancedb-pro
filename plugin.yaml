@@ -8,18 +8,16 @@ description: "LanceDB memory provider — hybrid BM25+vector search with Weibull
 # invalid value (e.g. the old `kind: memory`) is coerced to standalone, skips
 # detection, and gets the plugin eagerly imported by the general plugin
 # manager — the path upstream keeps memory providers out of.
+#
+# No `hooks:` / `provides_hooks:` on purpose either. That field declares
+# GENERAL plugin hooks registered with ctx.register_hook() and is checked
+# against Hermes' VALID_HOOKS. This provider registers none: its lifecycle
+# (system_prompt_block, prefetch, sync_turn, on_pre_compress, on_memory_write,
+# on_session_switch, on_session_end, shutdown, plus the non-standard
+# on_recall_used / on_tool_call_observed) is MemoryProvider methods the host's
+# memory manager calls directly. Listing them made `hermes plugins doctor`
+# report "unknown hook" errors. See docs/hooks.md.
+#
 # `before_prompt_build` is intentionally NOT implemented: overriding it makes
 # the host's prefetch_all() skip this provider, and the host never calls the
-# hook anyway. on_recall_used / on_tool_call_observed are non-standard hooks
-# (feat/memory-provider-hooks branch) and are inert when the host omits them.
-hooks:
-  - system_prompt_block
-  - prefetch
-  - sync_turn
-  - on_pre_compress
-  - on_memory_write
-  - on_recall_used
-  - on_tool_call_observed
-  - on_session_switch
-  - shutdown
-  - on_session_end
+# hook anyway.

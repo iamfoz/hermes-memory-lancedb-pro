@@ -5,9 +5,11 @@ drives a memory provider through a set of **lifecycle hooks** — methods the ho
 calls at defined points in a session. This document lists every hook the
 provider implements.
 
-The hooks a provider offers are declared in `plugin.yaml`. A host only ever
-calls hooks it knows about, so declaring a hook the host does not recognise is
-harmless — it is simply never invoked.
+These hooks are **`MemoryProvider` methods**, not general plugin hooks: the
+host's memory manager calls them directly on the provider object, so they are
+*not* listed in `plugin.yaml`. A host only ever calls methods it knows about, so
+implementing one the host does not recognise is harmless — it is simply never
+invoked.
 
 ## Standard hooks
 
@@ -96,20 +98,11 @@ hook anyway. Recall is delivered through `prefetch` and `system_prompt_block`
 instead. This is a deliberate choice, not an omission — see the comment in
 `plugin.yaml`.
 
-## Declared hook list
+## Why `plugin.yaml` lists no hooks
 
-For reference, the `hooks:` list in `plugin.yaml`:
-
-```yaml
-hooks:
-  - system_prompt_block
-  - prefetch
-  - sync_turn
-  - on_pre_compress
-  - on_memory_write
-  - on_recall_used          # non-standard
-  - on_tool_call_observed   # non-standard
-  - on_session_switch
-  - shutdown
-  - on_session_end
-```
+The manifest's `hooks:` / `provides_hooks:` field declares **general plugin
+hooks** — callbacks a plugin registers with `ctx.register_hook()`, validated
+against Hermes' `VALID_HOOKS`. This provider registers none, so the field is
+omitted. Earlier releases listed the provider methods above there, which made
+`hermes plugins doctor lancedb_pro` report an `unknown hook` error for most of
+them and a "declared but registration did not add it" warning for all of them.
