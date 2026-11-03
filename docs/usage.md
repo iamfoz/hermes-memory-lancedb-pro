@@ -45,8 +45,8 @@ hermes-memory-lancedb-pro stats [--json]
 hermes-memory-lancedb-pro search "QUERY" [--mode hybrid|vector|bm25] [--limit N] \
     [--category CAT] [--scope SCOPE] [--session-id ID] [--min-score X] [--json]
 
-# Permanently delete archived rows past the grace period
-hermes-memory-lancedb-pro purge [--grace-days N] [--dry-run] [-y]
+# Permanently delete archived (and optionally expired) rows past the grace period
+hermes-memory-lancedb-pro purge [--grace-days N] [--include-expired] [--dry-run] [-y]
 
 # Merge clusters of near-duplicate memories (the auto-compaction pass, on demand)
 hermes-memory-lancedb-pro compact [--dry-run] [--scope SCOPE] [--min-age-days N] \
@@ -63,6 +63,12 @@ it fragment-by-fragment — to rescue whatever rows are still readable.
 
 `purge` only touches rows that are already archived (superseded/forgotten) and
 older than `--grace-days` (default 30) — active memories are never deleted.
+`--include-expired` also deletes memories whose `valid_until` passed more than
+`--grace-days` ago — the time-bound rows recall already hides ("dentist
+tomorrow", a month on). The grace window is measured from the expiry, so a
+recently expired event stays on disk for a while; rows with a missing or
+malformed `valid_until` are never touched. `doctor`'s *Expiry* section shows
+how many there are.
 `compact` runs the same near-duplicate merge pass the provider triggers
 automatically on a cooldown; `--dry-run` prints the merge plan without writing.
 `search` is a recall-debugging tool: what it prints is what the agent can

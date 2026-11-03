@@ -1595,6 +1595,38 @@ class MemoryStore:
             )
         return purged
 
+    def purge_expired(
+        self, grace_period_days: int = 30, *, dry_run: bool = False
+    ) -> int:
+        """Permanently delete memories whose ``valid_until`` passed more than
+        *grace_period_days* ago.
+
+        The grace window mirrors :meth:`purge_archived` — measured from the
+        expiry, not the write — so an event is kept on disk for a while after
+        recall stops showing it. Archived rows are skipped (they belong to
+        ``purge_archived``, so nothing is counted twice), and rows with a
+        missing or malformed ``valid_until`` are never touched. Returns the
+        number deleted, or with ``dry_run=True`` the number a real run would
+        delete."""
+        cutoff_ms = int(time.time() * 1000) - (grace_period_days * 24 * 60 * 60 * 1000)
+        purged = 0
+        for row in self._scan_all(limit=MAX_SCAN_ROWS):
+            meta = _parse_metadata(row.get("metadata", "{}"))
+            if meta.get("state") == ARCHIVED_STATE or not _is_expired(meta, cutoff_ms):
+                continue
+            mem_id = row.get("id")
+            if mem_id:
+                if not dry_run:
+                    self._table.delete(f"id = '{_escape_sql(mem_id)}'")
+                purged += 1
+
+        if purged and not dry_run:
+            logger.info(
+                "Purged %d memories expired more than %d days ago",
+                purged, grace_period_days,
+            )
+        return purged
+
     def _checkout_latest(self) -> None:
         """Advance the table handle to the latest dataset version.
 

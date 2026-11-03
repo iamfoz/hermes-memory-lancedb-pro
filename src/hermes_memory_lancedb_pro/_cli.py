@@ -663,11 +663,14 @@ def _cmd_purge(
     args: argparse.Namespace,
     _store: MemoryStore | None = None,
 ) -> int:
-    """Permanently delete archived memories past the grace period.
+    """Permanently delete archived (and optionally expired) memories past the
+    grace period.
 
-    Only rows whose metadata ``state`` is ``archived`` AND whose
+    By default only rows whose metadata ``state`` is ``archived`` AND whose
     ``invalidated_at`` is older than ``--grace-days`` are removed — active
-    memories are never touched. ``--dry-run`` reports the count without
+    memories are never touched. ``--include-expired`` also removes active
+    rows whose ``valid_until`` passed more than ``--grace-days`` ago (the
+    rows recall already hides). ``--dry-run`` reports counts without
     deleting anything; a real run prompts for confirmation unless ``--yes``.
 
     ``_store`` is an optional pre-built store, used by tests to bypass the
@@ -676,11 +679,13 @@ def _cmd_purge(
     grace_days = getattr(args, "grace_days", 30)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = getattr(args, "quiet", False)
+    include_expired = bool(getattr(args, "include_expired", False))
+    what = "archived and expired memories" if include_expired else "archived memories"
 
     if not dry_run and not getattr(args, "yes", False):
         db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
         print(
-            f"This will PERMANENTLY DELETE archived memories older than "
+            f"This will PERMANENTLY DELETE {what} older than "
             f"{grace_days} days at: {db_path}"
         )
         answer = input('Type "yes" to proceed: ').strip().lower()
@@ -689,18 +694,21 @@ def _cmd_purge(
             return 1
 
     store = _store if _store is not None else _open_store(args)
-    count = store.purge_archived(grace_period_days=grace_days, dry_run=dry_run)
-    if dry_run:
+    archived = store.purge_archived(grace_period_days=grace_days, dry_run=dry_run)
+    prefix = "[dry-run] would purge" if dry_run else "purged"
+    _stderr(f"{prefix} {archived} archived memories older than {grace_days} days", quiet)
+    if include_expired:
+        expired = store.purge_expired(grace_period_days=grace_days, dry_run=dry_run)
         _stderr(
-            f"[dry-run] would purge {count} archived memories "
-            f"older than {grace_days} days",
+            f"{prefix} {expired} memories expired more than {grace_days} days ago",
             quiet,
         )
-    else:
-        _stderr(
-            f"purged {count} archived memories older than {grace_days} days",
-            quiet,
-        )
+        if not _store_module.ENFORCE_VALID_UNTIL:
+            _stderr(
+                "note: MEMORY_ENFORCE_VALID_UNTIL is off, so recall was still "
+                "showing these expired rows",
+                quiet,
+            )
     return 0
 
 
@@ -806,7 +814,9 @@ def _add_store_admin_parsers(subs) -> None:
         help="Permanently delete archived memories past the grace period",
         description=(
             "Hard-delete rows that were archived (superseded/forgotten) more than "
-            "--grace-days ago. Active memories are never touched."
+            "--grace-days ago. Other active memories are never touched; with "
+            "--include-expired, rows whose valid_until passed more than "
+            "--grace-days ago are deleted too."
         ),
     )
     p_purge.add_argument("--grace-days", dest="grace_days", type=int, default=30,
@@ -814,6 +824,9 @@ def _add_store_admin_parsers(subs) -> None:
                          help="Only purge rows archived more than N days ago (default: 30)")
     p_purge.add_argument("--dry-run", action="store_true",
                          help="Report what would be purged without deleting")
+    p_purge.add_argument("--include-expired", dest="include_expired", action="store_true",
+                         help="Also delete memories whose valid_until passed more than "
+                              "--grace-days ago (recall already hides them)")
     p_purge.add_argument("-y", "--yes", action="store_true",
                          help="Skip confirmation prompt")
     p_purge.add_argument("--path", default=None, metavar="PATH",

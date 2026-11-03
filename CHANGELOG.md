@@ -50,6 +50,15 @@ minor versions; breaking changes are called out under **Changed** and
   state and how many memories are expired. Missing, null, zero, or
   malformed `valid_until` values never hide a memory. Turn it off with
   `MEMORY_ENFORCE_VALID_UNTIL=off`.
+- **`purge --include-expired`** — also hard-deletes memories whose
+  `valid_until` passed more than `--grace-days` (default 30) ago, the rows
+  recall already hides. The grace window runs from the expiry, mirroring how
+  archived rows are aged from `invalidated_at`. Archived rows stay
+  `purge_archived`'s job, so nothing is counted twice; missing or malformed
+  `valid_until` values are never touched. Works with `--dry-run`, prompts
+  for confirmation unless `-y`, and is available in both the standalone and
+  in-host CLIs. New `MemoryStore.purge_expired(grace_period_days, *,
+  dry_run)`.
 - **`stats` subcommand** — store statistics (counts, categories, tiers)
   without the doctor's full anomaly scan; `--json` emits the raw
   `MemoryStore.stats()` dict for scripting.

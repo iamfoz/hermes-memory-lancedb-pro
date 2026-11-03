@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import shutil
 import sys
 import tempfile
@@ -249,3 +250,129 @@ class TestEndToEndExpiry:
             assert s.list_memories(limit=10), "row still exists for admin paths"
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# purge --include-expired
+# ---------------------------------------------------------------------------
+
+DAY = 24 * HOUR
+
+
+class _PurgeArgs:
+    def __init__(self, **kw):
+        self.grace_days, self.dry_run, self.yes, self.quiet = 30, False, True, False
+        self.include_expired, self.path = False, None
+        self.__dict__.update(kw)
+
+
+@pytest.fixture
+def purge_store():
+    """Rows covering every purge-relevant case, keyed by role."""
+    d = tempfile.mkdtemp(prefix="hermes-purge-expired-")
+    s = MemoryStore(db_path=d)
+    s._initialise()
+    s._embedder = StubEmbedder()
+    now = int(time.time() * 1000)
+    meta = {
+        "long_expired": {"valid_until": now - 40 * DAY},
+        "just_expired": {"valid_until": now - HOUR},           # inside grace
+        "future": {"valid_until": now + DAY},
+        "permanent": {},
+        "malformed": {"valid_until": "not-a-timestamp"},
+    }
+    ids = {k: s.store(text=f"purge fixture {k}", category="fact", metadata_extra=v)
+           for k, v in meta.items()}
+    # Archived long ago AND long expired: purge_archived's job, counted once.
+    ids["archived_expired"] = s.store_raw(
+        text="purge fixture archived_expired", vector=s.encode("archived expired"),
+        category="fact", scope="global", importance=0.4,
+        metadata=json.dumps({"state": "archived", "invalidated_at": now - 40 * DAY,
+                             "valid_until": now - 40 * DAY}),
+    )
+    yield s, ids
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def _remaining(s) -> set[str]:
+    return {r["id"] for r in s._scan_all()}
+
+
+@pytestmark_integration
+class TestPurgeExpired:
+    def test_store_purge_expired_respects_grace(self, purge_store):
+        s, ids = purge_store
+        assert s.purge_expired(grace_period_days=30) == 1
+        left = _remaining(s)
+        assert ids["long_expired"] not in left
+        for keep in ("just_expired", "future", "permanent", "malformed", "archived_expired"):
+            assert ids[keep] in left, keep
+
+    def test_store_purge_expired_dry_run_deletes_nothing(self, purge_store):
+        s, ids = purge_store
+        before = _remaining(s)
+        assert s.purge_expired(grace_period_days=30, dry_run=True) == 1
+        assert _remaining(s) == before
+
+    def test_zero_grace_removes_everything_expired_but_not_malformed(self, purge_store):
+        s, ids = purge_store
+        assert s.purge_expired(grace_period_days=0) == 2
+        left = _remaining(s)
+        assert ids["long_expired"] not in left and ids["just_expired"] not in left
+        assert ids["malformed"] in left
+
+    def test_cli_default_leaves_expired_rows(self, purge_store, capsys):
+        s, ids = purge_store
+        from hermes_memory_lancedb_pro._cli import _cmd_purge
+
+        assert _cmd_purge(_PurgeArgs(), _store=s) == 0
+        left = _remaining(s)
+        assert ids["long_expired"] in left            # untouched without the flag
+        assert ids["archived_expired"] not in left    # normal archived purge
+        assert "expired more than" not in capsys.readouterr().err
+
+    def test_cli_include_expired_reports_each_kind_once(self, purge_store, capsys):
+        s, ids = purge_store
+        from hermes_memory_lancedb_pro._cli import _cmd_purge
+
+        assert _cmd_purge(_PurgeArgs(include_expired=True), _store=s) == 0
+        err = capsys.readouterr().err
+        assert "purged 1 archived memories older than 30 days" in err
+        assert "purged 1 memories expired more than 30 days ago" in err
+        left = _remaining(s)
+        assert ids["long_expired"] not in left and ids["archived_expired"] not in left
+        assert {ids["just_expired"], ids["future"], ids["permanent"], ids["malformed"]} <= left
+
+    def test_cli_include_expired_dry_run(self, purge_store, capsys):
+        s, _ = purge_store
+        from hermes_memory_lancedb_pro._cli import _cmd_purge
+
+        before = _remaining(s)
+        assert _cmd_purge(_PurgeArgs(include_expired=True, dry_run=True), _store=s) == 0
+        assert "[dry-run] would purge 1 memories expired" in capsys.readouterr().err
+        assert _remaining(s) == before
+
+    def test_cli_notes_when_enforcement_off(self, purge_store, capsys, monkeypatch):
+        s, _ = purge_store
+        from hermes_memory_lancedb_pro._cli import _cmd_purge
+
+        monkeypatch.setattr(store_module, "ENFORCE_VALID_UNTIL", False)
+        _cmd_purge(_PurgeArgs(include_expired=True, dry_run=True), _store=s)
+        assert "MEMORY_ENFORCE_VALID_UNTIL is off" in capsys.readouterr().err
+
+
+def test_include_expired_flag_parses_on_both_cli_surfaces(monkeypatch):
+    import argparse
+
+    from hermes_memory_lancedb_pro import _cli
+
+    parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+    _cli.register_cli(parser)
+    args = parser.parse_args(["purge", "--include-expired", "--grace-days", "7", "--dry-run"])
+    assert args.include_expired is True and args.grace_days == 7
+
+    seen = {}
+    monkeypatch.setattr(_cli, "_cmd_purge", lambda a: seen.setdefault("a", a) and 0)
+    monkeypatch.setattr(sys, "argv", ["hermes-memory", "purge", "--include-expired", "--dry-run"])
+    _cli.main()
+    assert seen["a"].include_expired is True
