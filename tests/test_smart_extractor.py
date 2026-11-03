@@ -565,3 +565,39 @@ class TestExtractorIntegration:
         )
         assert target["metadata"].get("memory_category") == "preferences"
         assert target["metadata"].get("l0_abstract") == "user prefers UK English in writing"
+
+
+# ---------------------------------------------------------------------------
+# Temporal classification reaches decay
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalTypeWiring:
+    """Decay reads `temporal_type`; the extractor used to write only
+    `memory_temporal_type`, so every extracted memory decayed as static."""
+
+    def _create(self, content: str) -> dict:
+        store = FakeStore()
+        llm = FakeLlm(extract={"memories": [{
+            "category": "events",
+            "abstract": content,
+            "overview": "",
+            "content": content,
+        }]})
+        stats = SmartExtractor(store, llm=llm).extract_and_persist(
+            user_content=content, assistant_content="Noted.", session_key="sess-1",
+        )
+        assert stats.created == 1
+        return store.stored[0]["metadata_extra"]
+
+    def test_dynamic_candidate_sets_key_decay_reads(self):
+        meta = self._create("Dentist appointment tomorrow at 9:30am")
+        assert meta["temporal_type"] == "dynamic"
+        assert meta["memory_temporal_type"] == "dynamic"
+        assert meta["valid_until"] is not None
+
+    def test_static_candidate_sets_both_keys_static(self):
+        meta = self._create("User is allergic to peanuts")
+        assert meta["temporal_type"] == "static"
+        assert meta["memory_temporal_type"] == "static"
+        assert "valid_until" not in meta

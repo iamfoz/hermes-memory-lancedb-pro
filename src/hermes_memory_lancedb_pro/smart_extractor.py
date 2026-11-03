@@ -155,6 +155,18 @@ _SYSTEM_HEADER_RE = re.compile(
 )
 
 
+def _temporal_fields(text: str) -> dict[str, str]:
+    """Classifier verdict under both metadata keys.
+
+    `temporal_type` is what decay reads (and what the store defaults to
+    "static"); `memory_temporal_type` is the TS-native name other readers
+    use. Writing only the latter left every extracted memory decaying as
+    static regardless of its classification.
+    """
+    verdict = classify_temporal(text)
+    return {"temporal_type": verdict, "memory_temporal_type": verdict}
+
+
 def strip_envelope_metadata(text: str) -> str:
     """Remove platform envelope metadata that pollutes LLM extraction.
 
@@ -1070,9 +1082,7 @@ class SmartExtractor:
                     "source": "auto-capture",
                     "source_session": session_key,
                     "supersedes": match_id,
-                    "memory_temporal_type": classify_temporal(
-                        candidate.content or candidate.abstract
-                    ),
+                    **_temporal_fields(candidate.content or candidate.abstract),
                     "valid_until": infer_expiry(candidate.content or candidate.abstract),
                 },
             )
@@ -1223,7 +1233,7 @@ class SmartExtractor:
             "memory_category": candidate.category,
             "source_session": session_key,
             "source": "auto-capture",
-            "memory_temporal_type": classify_temporal(classify_text),
+            **_temporal_fields(classify_text),
         }
         expiry = infer_expiry(classify_text)
         if expiry is not None:

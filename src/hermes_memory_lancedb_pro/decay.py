@@ -211,7 +211,16 @@ def compute_decay_score(
         _created_at_raw = entry.get("timestamp")
     created_at = int(_created_at_raw if _created_at_raw is not None else now_ms)
     last_accessed_at = int(metadata.get("last_accessed_at", created_at) or created_at)
-    temporal_type = metadata.get("temporal_type", "static")
+    # The smart extractor records its classifier verdict as
+    # `memory_temporal_type` (TS-native name); `temporal_type` is the store's
+    # write-time default ("static" on every row). Prefer the explicit verdict
+    # so rows written before the extractor also set `temporal_type` decay
+    # correctly without a migration.
+    temporal_type = (
+        metadata.get("memory_temporal_type")
+        or metadata.get("temporal_type")
+        or "static"
+    )
 
     # Evidence-weighted confidence: blend write-time confidence with the
     # accumulated confirmation/contradiction evidence in support_info.

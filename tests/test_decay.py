@@ -127,6 +127,20 @@ class TestComputeDecayScore:
         s_dynamic = compute_decay_score(e_dynamic, now_ms=NOW)
         assert s_dynamic["recency"] < s_static["recency"]
 
+    def test_memory_temporal_type_verdict_drives_decay(self):
+        """Rows written before the extractor also set `temporal_type` carry
+        the store default "static" alongside the classifier's verdict in
+        `memory_temporal_type`. The verdict must win."""
+        legacy = make_entry(
+            age_days=15,
+            metadata_extra={"temporal_type": "static", "memory_temporal_type": "dynamic"},
+        )
+        dynamic = make_entry(age_days=15, metadata_extra={"temporal_type": "dynamic"})
+        static = make_entry(age_days=15)
+        s_legacy = compute_decay_score(legacy, now_ms=NOW)
+        assert s_legacy["recency"] == compute_decay_score(dynamic, now_ms=NOW)["recency"]
+        assert s_legacy["recency"] < compute_decay_score(static, now_ms=NOW)["recency"]
+
     def test_metadata_only_dict_back_compat(self):
         """Old callers pass a metadata-only dict positionally."""
         meta = {
