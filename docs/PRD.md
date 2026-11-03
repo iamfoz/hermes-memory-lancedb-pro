@@ -6,7 +6,7 @@
 | **Version** | 1.0 |
 | **Date** | 2026-07-08 |
 | **Owner** | Martyn Forryan (@iamfoz) |
-| **Product version covered** | 0.14.x |
+| **Product version covered** | 0.15.x |
 
 ---
 
@@ -284,8 +284,10 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
   without lancedb/torch; integration tests run on a real LanceDB with a
   deterministic stub embedder (no model download); LLM paths tested with
   fake clients. Current suite: ~1300 tests.
-- **NFR-8 — Platform.** Python ≥ 3.11; primary dev target arm64-darwin
-  (Apple Silicon); CI/Linux supported.
+- **NFR-8 — Platform.** Python 3.11–3.14 (tested on 3.11 and 3.14; Hermes'
+  package manager runs the plugin on CPython 3.14.9). 3.15 waits on Hermes,
+  which requires `<3.15`. Primary dev target arm64-darwin (Apple Silicon);
+  Linux supported.
 - **NFR-9 — Injection-resistant.** Write guard on stores, sanitiser on
   reflection recall lines, envelope stripping before extraction.
 

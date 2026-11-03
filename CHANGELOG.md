@@ -13,6 +13,10 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+---
+
+## [0.15.0] — 2026-11-03
+
 ### Changed — install method (action required on current Hermes)
 - **Install with `hermes plugins install iamfoz/hermes-memory-lancedb-pro`.**
   Current Hermes builds its Python environment through its package manager
@@ -36,6 +40,12 @@ minor versions; breaking changes are called out under **Changed** and
 - `install-plugin` now warns that its shim is not durable on package-managed
   Hermes and points at the plugin install; docs no longer reference
   `hermes-pip`.
+- **Python 3.13 and 3.14 supported and tested**; the development pin
+  (`.python-version`) moves from 3.11 to 3.14, matching the CPython 3.14.9
+  that Hermes' package manager pins on every platform. `requires-python`
+  stays `>=3.11`. Python 3.15 is not supported yet: Hermes itself requires
+  `<3.15`, so the plugin cannot run there even though its dependencies
+  already publish 3.15 wheels.
 
 ### Added
 - **`valid_until` is enforced on recall.** Memories the smart extractor
@@ -86,6 +96,17 @@ minor versions; breaking changes are called out under **Changed** and
   analysis, and roadmap.
 
 ### Fixed
+- **`hermes plugins doctor lancedb_pro` is clean.** The manifest's `hooks:`
+  list (an alias for `provides_hooks`) named our `MemoryProvider` methods,
+  but that field declares *general* plugin hooks registered with
+  `ctx.register_hook()` and checked against Hermes' `VALID_HOOKS`. The doctor
+  therefore reported nine "unknown hook" errors and ten "declared but
+  registration did not add it" warnings. The host's memory manager calls
+  provider methods directly and never reads that list, so it is removed; the
+  doctor now reports OK.
+- **The manifest version tracked the package version only by hand** (it is
+  what `hermes plugins doctor` displays); a test now fails if `pyproject`,
+  `__version__`, and either manifest disagree.
 - **Temporal classification now actually affects decay.** The smart
   extractor recorded its static/dynamic verdict as `memory_temporal_type`,
   but decay reads `temporal_type` — which the store defaults to `"static"` on
@@ -574,7 +595,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...v0.15.0
 [0.14.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.0...v0.14.1

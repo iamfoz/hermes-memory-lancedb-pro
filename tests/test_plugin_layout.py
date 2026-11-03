@@ -86,3 +86,24 @@ def test_manifest_declares_no_general_plugin_hooks():
 
     text = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     assert not re.search(r"^(hooks|provides_hooks)\s*:", text, re.MULTILINE)
+
+
+def test_version_is_identical_everywhere():
+    # `hermes plugins doctor` shows the manifest version; it once lagged the
+    # package. pyproject, __version__, and both manifests must agree.
+    import re
+
+    from hermes_memory_lancedb_pro import __version__
+
+    def manifest_version(path: Path) -> str:
+        m = re.search(r"^version:\s*(\S+)\s*$", path.read_text(encoding="utf-8"), re.MULTILINE)
+        assert m, f"no version in {path}"
+        return m.group(1)
+
+    versions = {
+        "pyproject": _pyproject()["project"]["version"],
+        "__version__": __version__,
+        "plugin.yaml (root)": manifest_version(ROOT / "plugin.yaml"),
+        "plugin.yaml (packaged)": manifest_version(PACKAGED_MANIFEST),
+    }
+    assert len(set(versions.values())) == 1, versions
