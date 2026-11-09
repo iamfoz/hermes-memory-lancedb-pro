@@ -15,6 +15,34 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.15.1] — 2026-11-09
+
+### Fixed
+- **Gateway crash (SIGABRT / SIGSEGV) on Apple Silicon on the first turn.**
+  torch's MPS backend is not thread-safe. `initialize()` starts the
+  `lancedb-pro-warmup` thread, whose `warmup()` runs the first encode (model
+  load + Metal shader JIT), while the first turn's prefetch thread encodes
+  the query on the same model; two concurrent encodes abort in Metal with
+  "A command encoder is already encoding to this command buffer". The store
+  only locked model *loading*. Every embedder call — `encode()`,
+  `encode_batch()`, `warmup()` and model construction — now takes one
+  process-wide lock (`MemoryStore._encode_lock`). It is shared by all stores
+  in the process because the MPS stream is process-wide and one gateway can
+  hold a store per Hermes profile. Embedding throughput is unchanged: the
+  model already ran one batch at a time.
+
+### Added
+- **`MEMORY_EMBEDDING_DEVICE`** — optional device override for the embedding
+  model (`cpu`, `mps`, `cuda`, `cuda:1`, …). Unset keeps automatic selection.
+  If the device cannot be used, a warning is logged and the model loads with
+  automatic selection instead. `MEMORY_EMBEDDING_DEVICE=cpu` is a fallback
+  for hosts where MPS misbehaves.
+- `stats()` reports `embedding_device`, and `hermes lancedb_pro stats` /
+  `doctor` print it (`auto` until the model is loaded; reading it never loads
+  the model).
+
+---
+
 ## [0.15.0] — 2026-11-03
 
 ### Changed — install method (action required on current Hermes)
@@ -595,7 +623,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...v0.15.0
 [0.14.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.1...v0.14.2
