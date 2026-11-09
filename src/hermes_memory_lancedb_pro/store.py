@@ -67,6 +67,23 @@ DEFAULT_DB_PATH: str = os.path.expanduser(
 DEFAULT_EMBEDDING_MODEL: str = "nomic-ai/nomic-embed-text-v1.5"
 VECTOR_DIM: int = 768
 
+# Optional device override for the embedding model: "cpu", "mps", "cuda",
+# "cuda:1", ... Unset leaves the choice to sentence-transformers (MPS on Apple
+# Silicon, CUDA when present, else CPU). If the requested device cannot be
+# used, loading logs a warning and falls back to automatic selection rather
+# than failing every turn. Read at load time, so it applies per process.
+EMBEDDING_DEVICE: str | None = os.environ.get("MEMORY_EMBEDDING_DEVICE", "").strip() or None
+
+# One embedder operation at a time, process-wide. torch's MPS backend is not
+# thread-safe: two threads encoding concurrently abort in Metal ("A command
+# encoder is already encoding to this command buffer", SIGABRT/SIGSEGV) — e.g.
+# the provider's warmup thread and the first turn's prefetch thread. The MPS
+# stream is shared by every model in the process, and one gateway can hold a
+# MemoryStore per Hermes profile, so this is module-level rather than per
+# store. Model loading takes it too: moving weights onto the device uses the
+# same stream. Lock order everywhere: a store's _embedder_lock, then this one.
+_ENCODE_LOCK = threading.Lock()
+
 # Reasonable upper bound for full-table scans inside the API. Configurable
 # via env var so users with very large stores can lift it.
 MAX_SCAN_ROWS: int = int(os.environ.get("MEMORY_MAX_SCAN_ROWS", "100000"))
@@ -355,6 +372,10 @@ class MemoryStore:
         self.embedding_model_name = embedding_model
         self._embedder: SentenceTransformer | None = None
         self._embedder_lock = threading.Lock()
+        # Serialises every embedder call (encode, warmup, model load). torch's
+        # MPS backend is not thread-safe, so concurrent encodes abort in Metal.
+        # Shared by all stores in the process — see _ENCODE_LOCK.
+        self._encode_lock = _ENCODE_LOCK
         self._db = None
         self._table = None
         self._initialised = False
@@ -401,7 +422,27 @@ class MemoryStore:
             if self._embedder is None:  # double-checked under lock
                 from sentence_transformers import SentenceTransformer  # heavy import
                 logger.debug("Loading embedding model: %s", self.embedding_model_name)
-                self._embedder = SentenceTransformer(self.embedding_model_name)
+                # Loading moves the weights onto the device; on MPS that uses
+                # the process-wide stream, so serialise it with encodes.
+                with self._encode_lock:
+                    self._embedder = self._construct_embedder(SentenceTransformer)
+
+    def _construct_embedder(self, sentence_transformer_cls):
+        """Build the model on ``EMBEDDING_DEVICE`` when set. A device that
+        cannot be used (typo, CUDA absent, MPS unavailable) falls back to
+        automatic selection with a warning: the override is a safety valve,
+        and failing every turn would be worse than ignoring it."""
+        device = EMBEDDING_DEVICE
+        if not device:
+            return sentence_transformer_cls(self.embedding_model_name)
+        try:
+            return sentence_transformer_cls(self.embedding_model_name, device=device)
+        except Exception as e:
+            logger.warning(
+                "MEMORY_EMBEDDING_DEVICE=%r could not be used (%s); falling back "
+                "to automatic device selection", device, e,
+            )
+            return sentence_transformer_cls(self.embedding_model_name)
 
     def warmup(self) -> None:
         """Pre-load the embedding model + run a throwaway encode.
@@ -414,9 +455,12 @@ class MemoryStore:
         self._initialise()
         self._load_embedder()
         try:
-            self._embedder.encode(  # type: ignore[union-attr]
-                "warmup", normalize_embeddings=True,
-            )
+            # The warmup thread races the first turn's prefetch encode; on
+            # MPS two concurrent encodes abort the process. Serialise.
+            with self._encode_lock:
+                self._embedder.encode(  # type: ignore[union-attr]
+                    "warmup", normalize_embeddings=True,
+                )
         except Exception as e:
             logger.warning("MemoryStore.warmup encode failed: %s", e)
 
@@ -550,6 +594,14 @@ class MemoryStore:
         self._load_embedder()
         return self._embedder
 
+    def _embedding_device_label(self) -> str:
+        """The device the loaded model runs on, else the configured override,
+        else "auto". Never loads the model (stats must stay cheap)."""
+        device = getattr(self._embedder, "device", None) if self._embedder is not None else None
+        if device is not None:
+            return str(device)
+        return EMBEDDING_DEVICE or "auto"
+
     @staticmethod
     def _to_list(vec) -> list[float]:
         """Normalise an embedder return value to a Python list."""
@@ -558,17 +610,26 @@ class MemoryStore:
         return vec.tolist()  # numpy.ndarray, torch.Tensor, etc.
 
     def encode(self, text: str) -> list[float]:
-        """Encode text into a single normalised 768-d vector."""
-        vector = self.embedder.encode(text, normalize_embeddings=True)
+        """Encode text into a single normalised 768-d vector. Thread-safe:
+        embedder calls are serialised process-wide (see _ENCODE_LOCK)."""
+        # Resolve (and if needed load) the model BEFORE taking the encode
+        # lock — loading takes _embedder_lock then the encode lock, and the
+        # order must be the same everywhere.
+        model = self.embedder
+        with self._encode_lock:
+            vector = model.encode(text, normalize_embeddings=True)
         return self._to_list(vector)
 
     def encode_batch(self, texts: Sequence[str]) -> list[list[float]]:
-        """Encode many texts in one shot. Use this for bulk inserts."""
-        vectors = self.embedder.encode(
-            list(texts),
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        """Encode many texts in one shot. Use this for bulk inserts.
+        Thread-safe, like :meth:`encode`."""
+        model = self.embedder
+        with self._encode_lock:
+            vectors = model.encode(
+                list(texts),
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         return [self._to_list(v) for v in vectors]
 
     # ----- internals -----
@@ -1560,6 +1621,7 @@ class MemoryStore:
             "archived_memories": archived_count,
             "db_path": self.db_path,
             "embedding_model": self.embedding_model_name,
+            "embedding_device": self._embedding_device_label(),
             "vector_dimensions": VECTOR_DIM,
             "categories": cat_counts,
             "tiers": tier_counts,

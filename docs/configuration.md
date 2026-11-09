@@ -20,6 +20,7 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 | `MEMORY_ACCESS_COUNT_THROTTLE_S` | `300` | Minimum seconds between `access_count` increments for one memory. Breaks the recall-frequency feedback loop that produces "sticky" memories. |
 | `MEMORY_CROSS_SESSION_PROMOTION_K` | `3` | A memory recalled across this many distinct sessions is auto-promoted to `cross_session=True`. `0` disables. |
 | `MEMORY_INJECTION_GUARD` | `warn` | Prompt-injection guard at write time: `off` / `warn` / `reject` / `sanitize`. |
+| `MEMORY_EMBEDDING_DEVICE` | *(auto)* | Device for the embedding model: `cpu`, `mps`, `cuda`, `cuda:1`, …. Unset lets sentence-transformers choose. An unusable device logs a warning and falls back to automatic selection. `cpu` is a fallback for Apple Silicon hosts where MPS misbehaves. All embedder calls are serialised process-wide regardless of device. |
 
 ## Recall and retrieval
 
