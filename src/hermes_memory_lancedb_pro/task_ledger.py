@@ -178,12 +178,16 @@ def create_task(
     objective: str,
     *,
     target_iterations: int | None = None,
+    max_wakes: int | None = None,
     next_action: str = "Begin first iteration.",
     invariants: list[str] | None = None,
     extra: dict[str, Any] | None = None,
     root: Path | None = None,
 ) -> dict[str, Any]:
     """Create a new task ledger directory and ``state.json``.
+
+    *max_wakes* is an optional budget for unattended wakes (``wake_task``);
+    the ledger records it, the scheduler that wakes the task enforces it.
 
     Raises ``FileExistsError`` if a task with this *task_id* already exists.
     Returns the initial state dict.
@@ -205,6 +209,8 @@ def create_task(
         "recent_summary": "",
         "blockers": [],
         "waiting_on": None,
+        "wake_count": 0,
+        "max_wakes": max_wakes,
         "files": {
             "results": "results.jsonl",
             "events": "events.jsonl",
@@ -221,6 +227,8 @@ def create_task(
 # ``task show``) always see every field.
 _FIELD_DEFAULTS: dict[str, Any] = {
     "waiting_on": None,
+    "wake_count": 0,
+    "max_wakes": None,
 }
 
 
@@ -378,6 +386,26 @@ def unwait_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
     state["waiting_on"] = None
     save_state(task_id, state, root)
     append_jsonl(task_id, "events.jsonl", {"event": "unwait", "from": previous}, root=root)
+    return state
+
+
+def wake_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
+    """Record one unattended wake: add 1 to ``wake_count`` (from 0).
+
+    Sets ``last_woken_at`` and logs a ``wake`` event. Does not change the
+    status and does not enforce ``max_wakes`` — compare the two to decide
+    whether to wake again.
+    """
+    state = load_state(task_id, root)
+    state["wake_count"] = int(state.get("wake_count") or 0) + 1
+    state["last_woken_at"] = _now_iso()
+    save_state(task_id, state, root)
+    append_jsonl(
+        task_id, "events.jsonl",
+        {"event": "wake", "wake_count": state["wake_count"],
+         "max_wakes": state.get("max_wakes")},
+        root=root,
+    )
     return state
 
 

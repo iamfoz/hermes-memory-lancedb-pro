@@ -1407,11 +1407,17 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
         return 1
     objective = getattr(args, "objective", None) or ""
     iterations = getattr(args, "iterations", None)
+    max_wakes = getattr(args, "max_wakes", None)
+    if max_wakes is not None and max_wakes < 0:
+        print("error: --max-wakes must be 0 or more", file=sys.stderr)
+        return 1
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
-        state = _tl.create_task(task_id, objective, target_iterations=iterations, root=root)
+        state = _tl.create_task(
+            task_id, objective, target_iterations=iterations, max_wakes=max_wakes, root=root
+        )
         if not quiet:
             state_path = _tl._state_path(task_id, root)
             print(f"Created task {task_id!r}")
@@ -1419,6 +1425,8 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
             print(f"  Objective: {state['objective']}")
             if state["target_iterations"] is not None:
                 print(f"  Target iterations: {state['target_iterations']}")
+            if state["max_wakes"] is not None:
+                print(f"  Max wakes: {state['max_wakes']}")
         return 0
     except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1709,6 +1717,28 @@ def _cmd_task_park(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_task_wake(args: argparse.Namespace) -> int:
+    """Record one unattended wake of a task (wake_count += 1)."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.wake_task(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+    if not quiet:
+        count, limit = state["wake_count"], state.get("max_wakes")
+        print(f"Task {task_id!r}: wake {count}" + (f" of {limit}" if limit is not None else ""))
+        if limit is not None and count >= limit:
+            print("  max_wakes reached — do not wake this task again.")
+    return 0
+
+
 def _cmd_task_to_skill(args: argparse.Namespace) -> int:
     """Scaffold a draft skill from a task, or list candidate tasks."""
     from . import task_skill as _tsk
@@ -1766,7 +1796,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     if sub is None:
         print(
             "Usage: ... task <create|list|show|resume|advance|complete|pin|"
-            "gc|hold|unhold|wait|block|unwait|to-skill>"
+            "gc|hold|unhold|wait|block|unwait|wake|to-skill>"
         )
         return 0
     return {
@@ -1783,6 +1813,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "wait": _cmd_task_park,
         "block": _cmd_task_park,
         "unwait": _cmd_task_park,
+        "wake": _cmd_task_wake,
         "to-skill": _cmd_task_to_skill,
     }.get(sub, lambda _: 0)(args)
 
@@ -1798,6 +1829,8 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
                           help="One-line task objective")
     p_create.add_argument("--iterations", type=int, default=None, metavar="N",
                           help="Target iteration count (optional)")
+    p_create.add_argument("--max-wakes", dest="max_wakes", type=int, default=None,
+                          metavar="N", help="Budget of unattended wakes (optional)")
     p_create.add_argument("--task-root", default=None, metavar="PATH",
                           help="Task root dir (default: ~/.hermes/workspace/tasks)")
     p_create.add_argument("-q", "--quiet", action="store_true")
@@ -1900,6 +1933,13 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_unwait.add_argument("task_id", metavar="TASK_ID")
     p_unwait.add_argument("--task-root", default=None, metavar="PATH")
     p_unwait.add_argument("-q", "--quiet", action="store_true")
+
+    p_wake = tsubs.add_parser(
+        "wake", help="Record one unattended wake of a task (wake_count += 1)"
+    )
+    p_wake.add_argument("task_id", metavar="TASK_ID")
+    p_wake.add_argument("--task-root", default=None, metavar="PATH")
+    p_wake.add_argument("-q", "--quiet", action="store_true")
 
     p_skill = tsubs.add_parser(
         "to-skill",

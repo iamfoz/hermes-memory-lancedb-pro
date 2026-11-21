@@ -22,6 +22,10 @@ minor versions; breaking changes are called out under **Changed** and
   null` in for older ledgers), and the control block shows what a parked task
   is waiting on. Library: `wait_task`, `block_task`, `unwait_task`,
   `TaskStateError`.
+- **`wake_count` and `max_wakes`.** `task create --max-wakes N` stores a wake
+  budget (default `null`); `task wake <id>` adds 1 to `wake_count` (from 0)
+  and sets `last_woken_at`. `task show` reports both. The budget is recorded,
+  not enforced: the scheduler that wakes the task decides when to stop.
 
 ---
 

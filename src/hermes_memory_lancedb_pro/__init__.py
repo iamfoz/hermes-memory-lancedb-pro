@@ -109,6 +109,7 @@ from .task_ledger import (  # noqa: F401
     save_state,
     unwait_task,
     wait_task,
+    wake_task,
 )
 from .temporal_classifier import (  # noqa: F401
     TemporalType,
@@ -234,6 +235,7 @@ __all__ = [
     "save_state",
     "unwait_task",
     "wait_task",
+    "wake_task",
     # Smart extractor + LLM client
     "AnthropicLlmClient",
     "DedupResult",

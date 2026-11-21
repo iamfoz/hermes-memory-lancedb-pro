@@ -98,7 +98,7 @@ compaction. Ledgers live under `~/.hermes/workspace/tasks/` by default
 (`--task-root` to override).
 
 ```bash
-hermes-memory-lancedb-pro task create --id TASK_ID [--objective TEXT] [--iterations N]
+hermes-memory-lancedb-pro task create --id TASK_ID [--objective TEXT] [--iterations N] [--max-wakes N]
 hermes-memory-lancedb-pro task list
 hermes-memory-lancedb-pro task show TASK_ID
 hermes-memory-lancedb-pro task resume TASK_ID          # prints the control block
@@ -110,6 +110,7 @@ hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
 hermes-memory-lancedb-pro task wait TASK_ID --reason TEXT [--ref REF] [--clears-when TEXT]
 hermes-memory-lancedb-pro task block TASK_ID --reason TEXT
 hermes-memory-lancedb-pro task unwait TASK_ID          # waiting/blocked -> running
+hermes-memory-lancedb-pro task wake TASK_ID            # wake_count += 1
 hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
 hermes-memory-lancedb-pro task to-skill [TASK_ID]      # scaffold a skill draft from a task
 hermes-memory-lancedb-pro task to-skill --list         # list tasks that could become a skill
@@ -132,6 +133,12 @@ run, a release, a reply) and records a `waiting_on` object —
 `task unwait` returns either to `running` and clears `waiting_on`. A completed
 task cannot be parked, and `unwait` on a task that is not parked is refused.
 `task show` always includes `status` and `waiting_on`.
+
+`task wake` records one unattended wake of a task by a scheduler: it adds 1
+to `wake_count` (which starts at 0) and sets `last_woken_at`. `task create
+--max-wakes N` stores a wake budget in `max_wakes` (default `null`). The
+ledger records the budget but does not enforce it: a wake past it is still
+counted, with a warning, and the scheduler decides whether to stop.
 
 Completed task ledgers are garbage-collected automatically — archived under
 `<task-root>/archive/`, then hard-deleted after a grace period. Run

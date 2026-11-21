@@ -123,6 +123,56 @@ class TestWaitBlockUnwait:
 
 
 # ---------------------------------------------------------------------------
+# wake_count / max_wakes
+# ---------------------------------------------------------------------------
+
+
+class TestWakes:
+    def test_create_records_max_wakes(self, task_root, monkeypatch, capsys):
+        assert cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "3", "-q") == 0
+        state = show(monkeypatch, capsys, "t")
+        assert state["max_wakes"] == 3 and state["wake_count"] == 0
+
+    def test_max_wakes_defaults_to_null(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        state = show(monkeypatch, capsys, "t")
+        assert state["max_wakes"] is None and state["wake_count"] == 0
+
+    def test_negative_max_wakes_rejected(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "-1", "-q") != 0
+        assert not (task_root / "t").exists()
+
+    def test_wake_counts_up(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "3", "-q")
+        for _ in range(2):
+            assert cli(monkeypatch, "task", "wake", "t", "-q") == 0
+        state = show(monkeypatch, capsys, "t")
+        assert state["wake_count"] == 2 and state["max_wakes"] == 3
+        assert state["last_woken_at"]
+        assert state["status"] == "running"
+
+    def test_wake_past_budget_still_counts_and_warns(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "1", "-q")
+        cli(monkeypatch, "task", "wake", "t")
+        assert "max_wakes reached" in capsys.readouterr().out
+        assert cli(monkeypatch, "task", "wake", "t", "-q") == 0
+        assert _tl.load_state("t")["wake_count"] == 2
+
+    def test_wake_missing_task_fails(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task", "wake", "nope") != 0
+
+    def test_wake_older_ledger_starts_at_zero(self, task_root, monkeypatch, capsys):
+        _tl.create_task("old", "o")
+        state = _tl.load_state("old")
+        del state["wake_count"], state["max_wakes"]
+        _tl.save_state("old", state)
+        assert show(monkeypatch, capsys, "old")["wake_count"] == 0
+        cli(monkeypatch, "task", "wake", "old", "-q")
+        state = show(monkeypatch, capsys, "old")
+        assert state["wake_count"] == 1 and state["max_wakes"] is None
+
+
+# ---------------------------------------------------------------------------
 # The heartbeat's ledger-caps probe, verbatim (subprocess + HERMES_TASK_ROOT)
 # ---------------------------------------------------------------------------
 
@@ -155,3 +205,11 @@ class TestProbeContract:
         assert _probe_show(root, "probe")["status"] == "blocked"
         assert _probe_cli(root, "unwait", "probe").returncode == 0
         assert _probe_show(root, "probe")["status"] == "running"
+
+    def test_wakes(self, tmp_path):
+        root = tmp_path / "scratch"
+        assert _probe_cli(root, "create", "--id", "probe", "--max-wakes", "3", "-q").returncode == 0
+        for _ in range(2):
+            assert _probe_cli(root, "wake", "probe").returncode == 0
+        s = _probe_show(root, "probe")
+        assert s["wake_count"] == 2 and s["max_wakes"] == 3
