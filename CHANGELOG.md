@@ -28,6 +28,15 @@ minor versions; breaking changes are called out under **Changed** and
   not enforced: the scheduler that wakes the task decides when to stop.
 - **`task list --json`** prints a JSON array of every task's `state.json`
   object, sorted by `task_id` (`[]` when there are none).
+- **Locked state writes.** Every ledger state write holds an exclusive
+  `fcntl.flock` on `<task dir>/.lock` from the read of `state.json` through
+  the atomic replace (and the matching `results.jsonl` / `events.jsonl`
+  append), so concurrent writers — the agent, an unattended scheduler,
+  other processes — no longer lose each other's updates. `task_lock()` is
+  exported for code that edits `state.json` itself. It is not re-entrant,
+  and locking a missing task raises `FileNotFoundError` rather than
+  creating a directory. This release is the first with the lock: point a
+  version check (such as a heartbeat's `ledger_flock_min_version`) at it.
 
 ### Fixed
 - **`last_successful_iteration` is now only moved by a passing advance.**

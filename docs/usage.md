@@ -140,6 +140,13 @@ to `wake_count` (which starts at 0) and sets `last_woken_at`. `task create
 ledger records the budget but does not enforce it: a wake past it is still
 counted, with a warning, and the scheduler decides whether to stop.
 
+Every state write holds an exclusive `flock` on `<task dir>/.lock` from the
+read of `state.json` through its atomic replace, so the agent and an
+unattended scheduler can write the same ledger at once without losing
+updates. Code that edits `state.json` itself should hold the same lock
+(`task_lock(task_id)` in the library). On platforms without `fcntl`
+(Windows) writes stay atomic but are not locked.
+
 Completed task ledgers are garbage-collected automatically — archived under
 `<task-root>/archive/`, then hard-deleted after a grace period. Run
 `task gc --dry-run` to preview, or `task gc` to collect now; `task hold`

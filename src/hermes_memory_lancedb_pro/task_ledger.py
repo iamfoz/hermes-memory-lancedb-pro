@@ -32,10 +32,17 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
+
+try:  # POSIX only; without it (Windows) state writes are atomic but unlocked.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Task root directory
@@ -194,8 +201,6 @@ def create_task(
     """
     _validate_task_id(task_id)
     sp = _state_path(task_id, root)
-    if sp.exists():
-        raise FileExistsError(f"Task {task_id!r} already exists at {sp}")
     state: dict[str, Any] = {
         "task_id": task_id,
         "status": "running",
@@ -218,7 +223,10 @@ def create_task(
         },
         **(extra or {}),
     }
-    atomic_write_json(sp, state)
+    with task_lock(task_id, root, create=True):
+        if sp.exists():
+            raise FileExistsError(f"Task {task_id!r} already exists at {sp}")
+        _write_state(task_id, state, root)
     return state
 
 
@@ -250,11 +258,52 @@ def load_state(task_id: str, root: Path | None = None) -> dict[str, Any]:
         return json.load(f)
 
 
+LOCK_FILENAME = ".lock"
+
+
+@contextmanager
+def task_lock(
+    task_id: str, root: Path | None = None, *, create: bool = False
+) -> Iterator[None]:
+    """Hold an exclusive ``fcntl.flock`` on ``<task dir>/.lock``.
+
+    Every state write in this module runs inside it, from the read of
+    ``state.json`` through the atomic replace (and the matching JSONL
+    append), so concurrent writers — the agent's CLI calls, a scheduler,
+    another process — cannot lose each other's updates. External code that
+    does its own read-modify-write of ``state.json`` should hold it too.
+
+    The lock is per open file, so it is NOT re-entrant: do not call a
+    locking function (``save_state``, ``advance_iteration``, ...) while
+    holding it. Raises ``FileNotFoundError`` when the task directory does not
+    exist, unless *create* is true, so locking never creates a ledger.
+    """
+    _validate_task_id(task_id)
+    task_dir = _task_dir(task_id, root)
+    if create:
+        task_dir.mkdir(parents=True, exist_ok=True)
+    elif not task_dir.is_dir():
+        raise FileNotFoundError(f"Task {task_id!r} not found at {task_dir}")
+    fd = os.open(task_dir / LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
+def _write_state(task_id: str, state: dict[str, Any], root: Path | None) -> None:
+    """Write ``state.json``; the caller holds ``task_lock``."""
+    atomic_write_json(_state_path(task_id, root), state)
+
+
 def save_state(
     task_id: str, state: dict[str, Any], root: Path | None = None
 ) -> None:
-    """Atomically overwrite ``state.json`` with *state*."""
-    atomic_write_json(_state_path(task_id, root), state)
+    """Atomically overwrite ``state.json`` with *state*, under ``task_lock``."""
+    with task_lock(task_id, root, create=True):
+        _write_state(task_id, state, root)
 
 
 def advance_iteration(
@@ -277,33 +326,34 @@ def advance_iteration(
     result leaves it where it was, so it always names the last iteration
     that actually succeeded.
     """
-    state = load_state(task_id, root)
-    current = int(state.get("current_iteration") or 0)
-    state["current_iteration"] = current + 1
-    if result == "pass":
-        state["last_successful_iteration"] = current + 1
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        current = int(state.get("current_iteration") or 0)
+        state["current_iteration"] = current + 1
+        if result == "pass":
+            state["last_successful_iteration"] = current + 1
 
-    if next_action is not None:
-        state["next_action"] = next_action
-    else:
-        target = state.get("target_iterations")
-        n = state["current_iteration"]
-        if target is not None:
-            state["next_action"] = (
-                f"Run iteration {n + 1}." if n < target else "All iterations complete."
-            )
+        if next_action is not None:
+            state["next_action"] = next_action
         else:
-            state["next_action"] = f"Run iteration {n + 1}."
+            target = state.get("target_iterations")
+            n = state["current_iteration"]
+            if target is not None:
+                state["next_action"] = (
+                    f"Run iteration {n + 1}." if n < target else "All iterations complete."
+                )
+            else:
+                state["next_action"] = f"Run iteration {n + 1}."
 
-    if summary is not None:
-        state["recent_summary"] = summary
-    if blockers is not None:
-        state["blockers"] = blockers
+        if summary is not None:
+            state["recent_summary"] = summary
+        if blockers is not None:
+            state["blockers"] = blockers
 
-    append_jsonl(
-        task_id, "results.jsonl", {"iteration": current, "result": result}, root=root
-    )
-    save_state(task_id, state, root)
+        append_jsonl(
+            task_id, "results.jsonl", {"iteration": current, "result": result}, root=root
+        )
+        _write_state(task_id, state, root)
     return state
 
 
@@ -313,14 +363,15 @@ def complete_task(
     root: Path | None = None,
 ) -> dict[str, Any]:
     """Mark task as complete and write a completion event."""
-    state = load_state(task_id, root)
-    state["status"] = "complete"
-    state["completed_at"] = _now_iso()
-    state["next_action"] = "Task complete."
-    if summary:
-        state["recent_summary"] = summary
-    save_state(task_id, state, root)
-    append_jsonl(task_id, "events.jsonl", {"event": "complete"}, root=root)
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        state["status"] = "complete"
+        state["completed_at"] = _now_iso()
+        state["next_action"] = "Task complete."
+        if summary:
+            state["recent_summary"] = summary
+        _write_state(task_id, state, root)
+        append_jsonl(task_id, "events.jsonl", {"event": "complete"}, root=root)
     return state
 
 
@@ -330,15 +381,16 @@ def _park_task(
     waiting_on: dict[str, Any],
     root: Path | None,
 ) -> dict[str, Any]:
-    state = load_state(task_id, root)
-    if state.get("status") in _DONE_STATUSES:
-        raise TaskStateError(
-            f"task {task_id!r} is {state.get('status')}; cannot mark it {status}"
-        )
-    state["status"] = status
-    state["waiting_on"] = waiting_on
-    save_state(task_id, state, root)
-    append_jsonl(task_id, "events.jsonl", {"event": status, **waiting_on}, root=root)
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        if state.get("status") in _DONE_STATUSES:
+            raise TaskStateError(
+                f"task {task_id!r} is {state.get('status')}; cannot mark it {status}"
+            )
+        state["status"] = status
+        state["waiting_on"] = waiting_on
+        _write_state(task_id, state, root)
+        append_jsonl(task_id, "events.jsonl", {"event": status, **waiting_on}, root=root)
     return state
 
 
@@ -382,16 +434,17 @@ def block_task(
 def unwait_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
     """Return a ``waiting`` or ``blocked`` task to ``running`` and clear
     ``waiting_on``. Raises ``TaskStateError`` for any other status."""
-    state = load_state(task_id, root)
-    previous = state.get("status")
-    if previous not in PARKED_STATUSES:
-        raise TaskStateError(
-            f"task {task_id!r} is {previous}, not waiting or blocked"
-        )
-    state["status"] = "running"
-    state["waiting_on"] = None
-    save_state(task_id, state, root)
-    append_jsonl(task_id, "events.jsonl", {"event": "unwait", "from": previous}, root=root)
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        previous = state.get("status")
+        if previous not in PARKED_STATUSES:
+            raise TaskStateError(
+                f"task {task_id!r} is {previous}, not waiting or blocked"
+            )
+        state["status"] = "running"
+        state["waiting_on"] = None
+        _write_state(task_id, state, root)
+        append_jsonl(task_id, "events.jsonl", {"event": "unwait", "from": previous}, root=root)
     return state
 
 
@@ -402,16 +455,17 @@ def wake_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
     status and does not enforce ``max_wakes`` — compare the two to decide
     whether to wake again.
     """
-    state = load_state(task_id, root)
-    state["wake_count"] = int(state.get("wake_count") or 0) + 1
-    state["last_woken_at"] = _now_iso()
-    save_state(task_id, state, root)
-    append_jsonl(
-        task_id, "events.jsonl",
-        {"event": "wake", "wake_count": state["wake_count"],
-         "max_wakes": state.get("max_wakes")},
-        root=root,
-    )
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        state["wake_count"] = int(state.get("wake_count") or 0) + 1
+        state["last_woken_at"] = _now_iso()
+        _write_state(task_id, state, root)
+        append_jsonl(
+            task_id, "events.jsonl",
+            {"event": "wake", "wake_count": state["wake_count"],
+             "max_wakes": state.get("max_wakes")},
+            root=root,
+        )
     return state
 
 
@@ -424,9 +478,10 @@ def set_task_hold(
     never archived, deleted, or reported as abandoned, regardless of age or
     status. Returns the updated state.
     """
-    state = load_state(task_id, root)
-    state["gc_hold"] = bool(hold)
-    save_state(task_id, state, root)
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        state["gc_hold"] = bool(hold)
+        _write_state(task_id, state, root)
     return state
 
 
