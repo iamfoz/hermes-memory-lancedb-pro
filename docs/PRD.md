@@ -6,7 +6,7 @@
 | **Version** | 1.0 |
 | **Date** | 2026-07-08 |
 | **Owner** | Martyn Forryan (@iamfoz) |
-| **Product version covered** | 0.15.x |
+| **Product version covered** | 0.16.x |
 
 ---
 

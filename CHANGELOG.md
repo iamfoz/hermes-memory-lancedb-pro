@@ -13,6 +13,10 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+---
+
+## [0.16.0] — 2026-11-21
+
 ### Added
 - **Task statuses `waiting` and `blocked`.** `task wait <id> --reason R
   [--ref REF] [--clears-when TEXT]` parks a task as `waiting` and records
@@ -675,7 +679,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...v0.15.0
 [0.14.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.2...v0.14.3
