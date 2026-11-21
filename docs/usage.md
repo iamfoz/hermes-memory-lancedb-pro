@@ -111,6 +111,7 @@ hermes-memory-lancedb-pro task wait TASK_ID --reason TEXT [--ref REF] [--clears-
 hermes-memory-lancedb-pro task block TASK_ID --reason TEXT
 hermes-memory-lancedb-pro task unwait TASK_ID          # waiting/blocked -> running
 hermes-memory-lancedb-pro task wake TASK_ID            # wake_count += 1
+hermes-memory-lancedb-pro task reported TASK_ID        # completed results were reported
 hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
 hermes-memory-lancedb-pro task to-skill [TASK_ID]      # scaffold a skill draft from a task
 hermes-memory-lancedb-pro task to-skill --list         # list tasks that could become a skill
@@ -145,6 +146,12 @@ to `wake_count` (which starts at 0) and sets `last_woken_at`. `task create
 --max-wakes N` stores a wake budget in `max_wakes` (default `null`). The
 ledger records the budget but does not enforce it: a wake past it is still
 counted, with a warning, and the scheduler decides whether to stop.
+
+A pinned completed task asks the model to present its results on every turn
+until `task reported` marks them reported (`reported: true`, `false` at
+create). After that the pin only says the task is done and its results were
+already reported, so they are not repeated. Only a completed task can be
+marked reported.
 
 Every state write holds an exclusive `flock` on `<task dir>/.lock` from the
 read of `state.json` through its atomic replace, so the agent and an

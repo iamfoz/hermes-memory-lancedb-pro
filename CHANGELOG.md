@@ -37,6 +37,13 @@ minor versions; breaking changes are called out under **Changed** and
   and locking a missing task raises `FileNotFoundError` rather than
   creating a directory. This release is the first with the lock: point a
   version check (such as a heartbeat's `ledger_flock_min_version`) at it.
+- **`reported` flag.** New field `reported` (`false` at create); `task
+  reported <id>` sets it to `true` (and `reported_at`) on a completed task,
+  and is refused for any other status. A pinned completed task with
+  `reported: true` no longer asks the model to present its results — the
+  pin only says the task is done and was already reported, keeping the
+  do-not-greet / do-not-re-run guard. `task list` shows `[complete,
+  reported]`. Library: `mark_reported`.
 
 ### Changed
 - **`task` commands exit `2` for usage/config errors and `4` for

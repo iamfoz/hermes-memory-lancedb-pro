@@ -300,6 +300,82 @@ class TestExitCodes:
 
 
 # ---------------------------------------------------------------------------
+# reported
+# ---------------------------------------------------------------------------
+
+
+def _pin_text(task_root, task_id: str, *, stable: bool = False) -> str:
+    from hermes_memory_lancedb_pro import provider
+
+    mem = {
+        "category": "active_task", "text": "pinned snapshot",
+        "metadata": {"task_id": task_id, "state_path": str(_tl._state_path(task_id))},
+    }
+    return provider._refresh_active_task_memories([mem], stable=stable)[0]["text"]
+
+
+class TestReported:
+    def test_reported_false_at_create(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        assert show(monkeypatch, capsys, "t")["reported"] is False
+
+    def test_reported_after_complete(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        cli(monkeypatch, "task", "complete", "t", "-q")
+        assert cli(monkeypatch, "task", "reported", "t", "-q") == 0
+        state = show(monkeypatch, capsys, "t")
+        assert state["reported"] is True and state["reported_at"]
+        assert state["status"] == "complete"
+
+    def test_reported_is_idempotent(self, task_root, monkeypatch):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        cli(monkeypatch, "task", "complete", "t", "-q")
+        assert cli(monkeypatch, "task", "reported", "t", "-q") == 0
+        assert cli(monkeypatch, "task", "reported", "t", "-q") == 0
+
+    def test_reported_on_unfinished_task_is_refused(self, task_root, monkeypatch):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        assert cli(monkeypatch, "task", "reported", "t") == 4
+        assert _tl.load_state("t")["reported"] is False
+
+    def test_reported_missing_task_exits_4(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task", "reported", "missing") == 4
+
+    def test_older_ledger_defaults_to_unreported(self, task_root, monkeypatch, capsys):
+        _tl.create_task("old", "o")
+        state = _tl.load_state("old")
+        del state["reported"]
+        _tl.save_state("old", state)
+        assert show(monkeypatch, capsys, "old")["reported"] is False
+
+    @pytest.mark.parametrize("stable", [False, True])
+    def test_completed_pin_stops_presenting_results_once_reported(self, task_root, stable):
+        _tl.create_task("t", "Benchmark the parser")
+        _tl.complete_task("t", summary="p50 12ms")
+        before = _pin_text(task_root, "t", stable=stable)
+        assert "Present these results" in before and "p50 12ms" in before
+        _tl.mark_reported("t")
+        after = _pin_text(task_root, "t", stable=stable)
+        assert "Present these results" not in after and "ACTION:" not in after
+        assert "p50 12ms" not in after
+        assert "already been reported" in after
+        assert "Do NOT greet" in after and "Do NOT re-run" in after
+        assert "Benchmark the parser" in after
+
+    def test_running_pin_unaffected(self, task_root):
+        _tl.create_task("t", "o")
+        assert "ACTIVE TASK CONTROL BLOCK" in _pin_text(task_root, "t")
+
+    def test_plain_list_marks_reported(self, task_root, monkeypatch, capsys):
+        _tl.create_task("t", "o")
+        _tl.complete_task("t")
+        _tl.mark_reported("t")
+        capsys.readouterr()
+        cli(monkeypatch, "task", "list")
+        assert "[complete, reported]" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # The heartbeat's ledger-caps probe, verbatim (subprocess + HERMES_TASK_ROOT)
 # ---------------------------------------------------------------------------
 
@@ -361,3 +437,10 @@ class TestProbeContract:
         root = tmp_path / "scratch"
         assert _probe_cli(root, "show", "no-such-task").returncode == 4
         assert _probe_cli(root, "show", "no-such-task", "--no-such-flag").returncode == 2
+
+    def test_reported(self, tmp_path):
+        root = tmp_path / "scratch"
+        assert _probe_cli(root, "create", "--id", "probe", "-q").returncode == 0
+        assert _probe_cli(root, "complete", "probe", "-q").returncode == 0
+        assert _probe_cli(root, "reported", "probe").returncode == 0
+        assert _probe_show(root, "probe")["reported"] is True

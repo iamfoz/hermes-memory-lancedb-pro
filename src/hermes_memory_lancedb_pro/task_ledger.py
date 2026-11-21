@@ -216,6 +216,7 @@ def create_task(
         "waiting_on": None,
         "wake_count": 0,
         "max_wakes": max_wakes,
+        "reported": False,
         "files": {
             "results": "results.jsonl",
             "events": "events.jsonl",
@@ -237,6 +238,7 @@ _FIELD_DEFAULTS: dict[str, Any] = {
     "waiting_on": None,
     "wake_count": 0,
     "max_wakes": None,
+    "reported": False,
 }
 
 
@@ -468,6 +470,28 @@ def wake_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
              "max_wakes": state.get("max_wakes")},
             root=root,
         )
+    return state
+
+
+def mark_reported(task_id: str, root: Path | None = None) -> dict[str, Any]:
+    """Record that a completed task's results have been reported to the user.
+
+    Sets ``reported = True`` and ``reported_at``. A pinned completed task
+    then stops asking the model to present its results. Raises
+    ``TaskStateError`` unless the task is complete — marking an unfinished
+    task would hide results that do not exist yet.
+    """
+    with task_lock(task_id, root):
+        state = load_state(task_id, root)
+        if state.get("status") not in _DONE_STATUSES:
+            raise TaskStateError(
+                f"task {task_id!r} is {state.get('status')}, not complete; "
+                "only a completed task can be marked reported"
+            )
+        state["reported"] = True
+        state["reported_at"] = _now_iso()
+        _write_state(task_id, state, root)
+        append_jsonl(task_id, "events.jsonl", {"event": "reported"}, root=root)
     return state
 
 

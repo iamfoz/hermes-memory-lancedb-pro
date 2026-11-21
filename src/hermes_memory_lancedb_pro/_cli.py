@@ -1462,6 +1462,8 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
         target = t.get("target_iterations")
         iter_str = f"{current}/{target}" if target is not None else str(current)
         held = "  [held]" if t.get("gc_hold") else ""
+        if t.get("reported"):
+            status = f"{status}, reported"
         print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}{held}")
     return 0
 
@@ -1759,6 +1761,28 @@ def _cmd_task_wake(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_task_reported(args: argparse.Namespace) -> int:
+    """Mark a completed task's results as reported to the user."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return EXIT_USAGE
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        _tl.mark_reported(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except _tl.TaskStateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    if not quiet:
+        print(f"Task {task_id!r} marked reported — its pin no longer asks to present results.")
+    return 0
+
+
 def _cmd_task_to_skill(args: argparse.Namespace) -> int:
     """Scaffold a draft skill from a task, or list candidate tasks."""
     from . import task_skill as _tsk
@@ -1819,7 +1843,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     if sub is None:
         print(
             "Usage: ... task <create|list|show|resume|advance|complete|pin|"
-            "gc|hold|unhold|wait|block|unwait|wake|to-skill>",
+            "gc|hold|unhold|wait|block|unwait|wake|reported|to-skill>",
             file=sys.stderr,
         )
         return EXIT_USAGE
@@ -1838,6 +1862,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "block": _cmd_task_park,
         "unwait": _cmd_task_park,
         "wake": _cmd_task_wake,
+        "reported": _cmd_task_reported,
         "to-skill": _cmd_task_to_skill,
     }.get(sub)
     if handler is None:
@@ -1980,6 +2005,13 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_wake.add_argument("task_id", metavar="TASK_ID")
     p_wake.add_argument("--task-root", default=None, metavar="PATH")
     p_wake.add_argument("-q", "--quiet", action="store_true")
+
+    p_reported = tsubs.add_parser(
+        "reported", help="Mark a completed task's results as reported to the user"
+    )
+    p_reported.add_argument("task_id", metavar="TASK_ID")
+    p_reported.add_argument("--task-root", default=None, metavar="PATH")
+    p_reported.add_argument("-q", "--quiet", action="store_true")
 
     p_skill = tsubs.add_parser(
         "to-skill",
