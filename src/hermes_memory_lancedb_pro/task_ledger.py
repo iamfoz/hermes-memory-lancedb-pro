@@ -251,8 +251,10 @@ def state_view(state: dict[str, Any]) -> dict[str, Any]:
 def load_state(task_id: str, root: Path | None = None) -> dict[str, Any]:
     """Load and return task state.
 
-    Raises ``FileNotFoundError`` if the task does not exist.
+    Raises ``FileNotFoundError`` if the task does not exist and ``ValueError``
+    for an invalid *task_id*.
     """
+    _validate_task_id(task_id)
     sp = _state_path(task_id, root)
     with sp.open("r", encoding="utf-8") as f:
         return json.load(f)

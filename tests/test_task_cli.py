@@ -88,14 +88,14 @@ class TestWaitBlockUnwait:
 
     def test_unwait_running_task_is_refused(self, task_root, monkeypatch):
         cli(monkeypatch, "task", "create", "--id", "t", "-q")
-        assert cli(monkeypatch, "task", "unwait", "t") != 0
+        assert cli(monkeypatch, "task", "unwait", "t") == 4
         assert _tl.load_state("t")["status"] == "running"
 
     def test_wait_on_completed_task_is_refused(self, task_root, monkeypatch):
         cli(monkeypatch, "task", "create", "--id", "t", "-q")
         cli(monkeypatch, "task", "complete", "t", "-q")
-        assert cli(monkeypatch, "task", "wait", "t", "--reason", "r") != 0
-        assert cli(monkeypatch, "task", "block", "t", "--reason", "r") != 0
+        assert cli(monkeypatch, "task", "wait", "t", "--reason", "r") == 4
+        assert cli(monkeypatch, "task", "block", "t", "--reason", "r") == 4
         assert _tl.load_state("t")["status"] == "complete"
 
     def test_events_logged(self, task_root, monkeypatch):
@@ -139,7 +139,7 @@ class TestWakes:
         assert state["max_wakes"] is None and state["wake_count"] == 0
 
     def test_negative_max_wakes_rejected(self, task_root, monkeypatch):
-        assert cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "-1", "-q") != 0
+        assert cli(monkeypatch, "task", "create", "--id", "t", "--max-wakes", "-1", "-q") == 2
         assert not (task_root / "t").exists()
 
     def test_wake_counts_up(self, task_root, monkeypatch, capsys):
@@ -159,7 +159,7 @@ class TestWakes:
         assert _tl.load_state("t")["wake_count"] == 2
 
     def test_wake_missing_task_fails(self, task_root, monkeypatch):
-        assert cli(monkeypatch, "task", "wake", "nope") != 0
+        assert cli(monkeypatch, "task", "wake", "nope") == 4
 
     def test_wake_older_ledger_starts_at_zero(self, task_root, monkeypatch, capsys):
         _tl.create_task("old", "o")
@@ -226,6 +226,80 @@ class TestAdvanceFail:
 
 
 # ---------------------------------------------------------------------------
+# Exit codes: 2 = usage/config, 4 = not found/refused
+# ---------------------------------------------------------------------------
+
+_ON_MISSING = [
+    ("show",), ("resume",), ("advance",), ("complete",), ("hold",), ("unhold",),
+    ("wait", "--reason", "r"), ("block", "--reason", "r"), ("unwait",), ("wake",),
+    ("to-skill",),
+]
+
+
+class TestExitCodes:
+    @pytest.mark.parametrize("argv", _ON_MISSING, ids=lambda a: a[0])
+    def test_missing_task_exits_4(self, task_root, monkeypatch, tmp_path, argv):
+        verb, *rest = argv
+        if verb == "to-skill":
+            rest = ["--out", str(tmp_path / "skill")]
+        assert cli(monkeypatch, "task", verb, "missing", *rest) == 4
+        assert not (task_root / "missing").exists()
+
+    def test_pin_missing_task_exits_4(self, task_root, monkeypatch, tmp_path):
+        assert cli(monkeypatch, "task", "pin", "missing", "--path", str(tmp_path / "db")) == 4
+
+    def test_create_existing_exits_4(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task", "create", "--id", "t", "-q") == 0
+        assert cli(monkeypatch, "task", "create", "--id", "t", "-q") == 4
+
+    def test_refused_transition_exits_4(self, task_root, monkeypatch):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        assert cli(monkeypatch, "task", "unwait", "t") == 4
+
+    @pytest.mark.parametrize("argv", [
+        ("show", "missing", "--no-such-flag"),
+        ("list", "--no-such-flag"),
+        ("no-such-verb",),
+        ("wait", "t"),             # --reason is required
+        ("create",),               # --id is required
+        ("advance", "t", "--result", "maybe"),
+        ("create", "--id", "t", "--max-wakes", "lots"),
+    ])
+    def test_usage_errors_exit_2(self, task_root, monkeypatch, argv):
+        assert cli(monkeypatch, "task", *argv) == 2
+
+    def test_no_task_command_exits_2(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task") == 2
+
+    @pytest.mark.parametrize("bad_id", ["../escape", "a/b", "..", "sp ace"])
+    def test_invalid_task_id_exits_2(self, task_root, monkeypatch, bad_id):
+        assert cli(monkeypatch, "task", "show", bad_id) == 2
+        assert cli(monkeypatch, "task", "create", "--id", bad_id, "-q") == 2
+        assert cli(monkeypatch, "task", "wake", bad_id) == 2
+
+    def test_bad_gc_mode_env_exits_2(self, task_root, monkeypatch):
+        monkeypatch.setenv("MEMORY_TASK_GC_MODE", "shred")
+        assert cli(monkeypatch, "task", "gc", "--dry-run", "-q") == 2
+
+    def test_success_is_0(self, task_root, monkeypatch):
+        assert cli(monkeypatch, "task", "create", "--id", "t", "-q") == 0
+        assert cli(monkeypatch, "task", "list") == 0
+
+    def test_in_host_dispatch_returns_the_same_codes(self, task_root):
+        # `hermes lancedb_pro task ...` goes through register_cli; Hermes
+        # turns the handler's int return into the process exit code.
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="hermes lancedb_pro")
+        _cli.register_cli(parser)
+        args = parser.parse_args(["task", "show", "missing"])
+        assert args.func(args) == 4
+        with pytest.raises(SystemExit) as e:
+            parser.parse_args(["task", "show", "missing", "--no-such-flag"])
+        assert e.value.code == 2
+
+
+# ---------------------------------------------------------------------------
 # The heartbeat's ledger-caps probe, verbatim (subprocess + HERMES_TASK_ROOT)
 # ---------------------------------------------------------------------------
 
@@ -282,3 +356,8 @@ class TestProbeContract:
         assert _probe_show(root, "probe")["last_successful_iteration"] == 1
         assert _probe_cli(root, "advance", "probe", "--result", "fail", "-q").returncode == 0
         assert _probe_show(root, "probe")["last_successful_iteration"] == 1
+
+    def test_exit_codes(self, tmp_path):
+        root = tmp_path / "scratch"
+        assert _probe_cli(root, "show", "no-such-task").returncode == 4
+        assert _probe_cli(root, "show", "no-such-task", "--no-such-flag").returncode == 2

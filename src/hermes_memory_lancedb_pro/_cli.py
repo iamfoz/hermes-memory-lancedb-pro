@@ -1397,6 +1397,14 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Task ledger subcommands
 # ---------------------------------------------------------------------------
+# Exit codes, for scripts and schedulers that drive the task CLI:
+#   0  success
+#   2  usage or configuration error (argparse uses 2 for bad flags too)
+#   4  not found, or refused (the task's state does not allow the change,
+#      or the task already exists)
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 4
+EXIT_REFUSED = 4
 
 
 def _cmd_task_create(args: argparse.Namespace) -> int:
@@ -1404,13 +1412,13 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: --id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     objective = getattr(args, "objective", None) or ""
     iterations = getattr(args, "iterations", None)
     max_wakes = getattr(args, "max_wakes", None)
     if max_wakes is not None and max_wakes < 0:
         print("error: --max-wakes must be 0 or more", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1430,7 +1438,10 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
         return 0
     except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 def _cmd_task_list(args: argparse.Namespace) -> int:
@@ -1460,7 +1471,7 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     try:
@@ -1469,7 +1480,7 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_resume(args: argparse.Namespace) -> int:
@@ -1477,7 +1488,7 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     try:
@@ -1492,7 +1503,7 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_complete(args: argparse.Namespace) -> int:
@@ -1500,7 +1511,7 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     summary = getattr(args, "summary", "") or ""
@@ -1512,7 +1523,7 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_pin(args: argparse.Namespace) -> int:
@@ -1525,7 +1536,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1533,7 +1544,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
         state = _tl.load_state(task_id, root)
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
     control_block = _tl.build_control_block(state)
     state_path = str(_tl._state_path(task_id, root))
@@ -1563,7 +1574,7 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     result = getattr(args, "result", "pass") or "pass"
@@ -1587,7 +1598,7 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_gc(args: argparse.Namespace) -> int:
@@ -1619,6 +1630,11 @@ def _cmd_task_gc(args: argparse.Namespace) -> int:
             getattr(args, "archive_grace_days", None),
             "MEMORY_TASK_ARCHIVE_GRACE_DAYS", 90),
     )
+
+    if cfg.mode not in ("archive", "delete"):
+        print(f"error: task GC mode must be 'archive' or 'delete', not {cfg.mode!r} "
+              "(check MEMORY_TASK_GC_MODE)", file=sys.stderr)
+        return EXIT_USAGE
 
     result = _tgc.run_task_gc(root=root, config=cfg)
 
@@ -1667,7 +1683,7 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1682,7 +1698,7 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_park(args: argparse.Namespace) -> int:
@@ -1690,7 +1706,7 @@ def _cmd_task_park(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1710,10 +1726,10 @@ def _cmd_task_park(args: argparse.Namespace) -> int:
             state = _tl.unwait_task(task_id, root=root)
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
     except _tl.TaskStateError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
     if not quiet:
         waiting_on = state.get("waiting_on") or {}
         reason = f" — {waiting_on['reason']}" if waiting_on.get("reason") else ""
@@ -1726,7 +1742,7 @@ def _cmd_task_wake(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1734,7 +1750,7 @@ def _cmd_task_wake(args: argparse.Namespace) -> int:
         state = _tl.wake_task(task_id, root=root)
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
     if not quiet:
         count, limit = state["wake_count"], state.get("max_wakes")
         print(f"Task {task_id!r}: wake {count}" + (f" of {limit}" if limit is not None else ""))
@@ -1782,10 +1798,13 @@ def _cmd_task_to_skill(args: argparse.Namespace) -> int:
         )
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
-    except (FileExistsError, ValueError) as e:
+        return EXIT_NOT_FOUND
+    except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
     if not quiet:
         print(f"Scaffolded a draft skill from task {task_id!r}:")
         print(f"  {dest / 'SKILL.md'}")
@@ -1800,10 +1819,11 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     if sub is None:
         print(
             "Usage: ... task <create|list|show|resume|advance|complete|pin|"
-            "gc|hold|unhold|wait|block|unwait|wake|to-skill>"
+            "gc|hold|unhold|wait|block|unwait|wake|to-skill>",
+            file=sys.stderr,
         )
-        return 0
-    return {
+        return EXIT_USAGE
+    handler = {
         "create": _cmd_task_create,
         "list": _cmd_task_list,
         "show": _cmd_task_show,
@@ -1819,7 +1839,22 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "unwait": _cmd_task_park,
         "wake": _cmd_task_wake,
         "to-skill": _cmd_task_to_skill,
-    }.get(sub, lambda _: 0)(args)
+    }.get(sub)
+    if handler is None:
+        print(f"error: unknown task command {sub!r}", file=sys.stderr)
+        return EXIT_USAGE
+    # Safety net so no error path falls back to a traceback (exit 1).
+    try:
+        return handler(args)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except (FileExistsError, _tl.TaskStateError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    except ValueError as e:  # e.g. an invalid task id
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_command") -> None:

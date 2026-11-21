@@ -117,6 +117,12 @@ hermes-memory-lancedb-pro task to-skill --list         # list tasks that could b
 hermes-memory-lancedb-pro task to-skill --search "kw"  # find candidate tasks by keyword
 ```
 
+The `task` commands exit `0` on success, `2` for a usage or configuration
+error (unknown flag or command, missing required option, invalid task id,
+bad `MEMORY_TASK_GC_MODE`), and `4` when the task is not found or the change
+is refused (already exists, completed task parked, `unwait` on a running
+task).
+
 Inside a running Hermes session, prefer the in-host form `hermes lancedb_pro
 task …`, which the host dispatches in-process — no PATH lookup, so it works
 even when the agent's shell PATH does not include the plugin's console script.

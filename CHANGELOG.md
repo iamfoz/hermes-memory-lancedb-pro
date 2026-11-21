@@ -38,6 +38,17 @@ minor versions; breaking changes are called out under **Changed** and
   creating a directory. This release is the first with the lock: point a
   version check (such as a heartbeat's `ledger_flock_min_version`) at it.
 
+### Changed
+- **`task` commands exit `2` for usage/config errors and `4` for
+  not-found/refused, instead of `1`.** Not found, already exists, and a
+  state change the task does not allow are `4`; an unknown flag or command
+  (argparse already used `2`), a missing required option, an invalid task
+  id, a bad `--max-wakes` or `MEMORY_TASK_GC_MODE`, and `task` with no
+  subcommand (which used to exit `0`) are `2`. Error paths that raised a
+  traceback (an invalid task id) now report the error instead. Scripts that
+  test for exit code `1` from `task` commands need updating; the other
+  commands are unchanged.
+
 ### Fixed
 - **`last_successful_iteration` is now only moved by a passing advance.**
   Every `task advance` used to set it to the counter's value *before* the
