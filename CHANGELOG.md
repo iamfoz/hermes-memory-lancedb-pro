@@ -29,6 +29,15 @@ minor versions; breaking changes are called out under **Changed** and
 - **`task list --json`** prints a JSON array of every task's `state.json`
   object, sorted by `task_id` (`[]` when there are none).
 
+### Fixed
+- **`last_successful_iteration` is now only moved by a passing advance.**
+  Every `task advance` used to set it to the counter's value *before* the
+  advance, whatever the result — so a failing iteration was recorded as
+  successful, and after one passing iteration it read `0`. A `--result pass`
+  advance now sets it to the new `current_iteration` (one pass → `1`); a
+  `--result fail` advance leaves it unchanged. `results.jsonl` entries are
+  unchanged (`iteration` there is still the pre-advance counter).
+
 ---
 
 ## [0.15.1] — 2026-11-09

@@ -148,7 +148,22 @@ class TestAdvanceIteration:
     def test_increments_counter(self, task_root, simple_task):
         state = advance_iteration("test-task-001", root=task_root)
         assert state["current_iteration"] == 1
-        assert state["last_successful_iteration"] == 0
+        assert state["last_successful_iteration"] == 1
+
+    def test_fail_leaves_last_successful_iteration(self, task_root, simple_task):
+        state = advance_iteration("test-task-001", result="fail", root=task_root)
+        assert state["current_iteration"] == 1
+        assert state["last_successful_iteration"] is None
+        advance_iteration("test-task-001", result="pass", root=task_root)
+        state = advance_iteration("test-task-001", result="fail", root=task_root)
+        assert state["current_iteration"] == 3
+        assert state["last_successful_iteration"] == 2
+        assert load_state("test-task-001", root=task_root)["last_successful_iteration"] == 2
+
+    def test_pass_after_fail_moves_last_successful_iteration(self, task_root, simple_task):
+        advance_iteration("test-task-001", result="fail", root=task_root)
+        state = advance_iteration("test-task-001", result="pass", root=task_root)
+        assert state["last_successful_iteration"] == 2
 
     def test_next_action_auto_generated(self, task_root, simple_task):
         state = advance_iteration("test-task-001", root=task_root)

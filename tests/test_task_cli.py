@@ -210,6 +210,22 @@ class TestListJson:
 
 
 # ---------------------------------------------------------------------------
+# advance --result fail
+# ---------------------------------------------------------------------------
+
+
+class TestAdvanceFail:
+    def test_fail_keeps_last_ok(self, task_root, monkeypatch, capsys):
+        cli(monkeypatch, "task", "create", "--id", "t", "-q")
+        assert cli(monkeypatch, "task", "advance", "t", "--result", "pass", "-q") == 0
+        assert show(monkeypatch, capsys, "t")["last_successful_iteration"] == 1
+        assert cli(monkeypatch, "task", "advance", "t", "--result", "fail", "-q") == 0
+        state = show(monkeypatch, capsys, "t")
+        assert state["last_successful_iteration"] == 1
+        assert state["current_iteration"] == 2
+
+
+# ---------------------------------------------------------------------------
 # The heartbeat's ledger-caps probe, verbatim (subprocess + HERMES_TASK_ROOT)
 # ---------------------------------------------------------------------------
 
@@ -258,3 +274,11 @@ class TestProbeContract:
         assert r.returncode == 0, r.stderr
         tasks = json.loads(r.stdout)
         assert isinstance(tasks, list) and "probe" in [t["task_id"] for t in tasks]
+
+    def test_fail_keeps_last_ok(self, tmp_path):
+        root = tmp_path / "scratch"
+        assert _probe_cli(root, "create", "--id", "probe", "-q").returncode == 0
+        assert _probe_cli(root, "advance", "probe", "--result", "pass", "-q").returncode == 0
+        assert _probe_show(root, "probe")["last_successful_iteration"] == 1
+        assert _probe_cli(root, "advance", "probe", "--result", "fail", "-q").returncode == 0
+        assert _probe_show(root, "probe")["last_successful_iteration"] == 1

@@ -271,11 +271,17 @@ def advance_iteration(
     *next_action* defaults to a generic "Run iteration N+1." string derived
     from the new counter value, or "All iterations complete." once
     *target_iterations* is reached.
+
+    Only a ``"pass"`` result moves ``last_successful_iteration``, to the new
+    counter value (the iteration just finished, counted from 1). Any other
+    result leaves it where it was, so it always names the last iteration
+    that actually succeeded.
     """
     state = load_state(task_id, root)
     current = int(state.get("current_iteration") or 0)
-    state["last_successful_iteration"] = current
     state["current_iteration"] = current + 1
+    if result == "pass":
+        state["last_successful_iteration"] = current + 1
 
     if next_action is not None:
         state["next_action"] = next_action
