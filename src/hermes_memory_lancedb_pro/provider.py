@@ -264,6 +264,8 @@ Run this BEFORE any other action or text:
 Decision tree:
 - Status = running  → `task resume <id>`, then continue from next_action
 - Status = complete → report the task results to the user now; do not re-run
+- Status = complete, reported → results were already reported; do not repeat
+  them unless asked, and do not re-run
 - No tasks listed   → respond directly to the user's message; no greeting
 
 ## Creating a task ledger (for multi-step work)
@@ -786,7 +788,18 @@ def _refresh_active_task_memories(
             # present the results — critical because the recall block can
             # appear as injected context that the model mistakes for
             # user-provided data ("payload attached to your message").
-            if state.get("status") in ("complete", "completed"):
+            if state.get("status") in ("complete", "completed") and state.get("reported"):
+                # Results already reported (`task reported`): stop asking
+                # the model to present them, but keep the anti-greeting /
+                # do-not-re-run guard.
+                obj = state.get("objective", "unknown task")
+                control_text = (
+                    f"YOU completed this task in a previous session: {obj}\n"
+                    "Its results have already been reported to the user. Do NOT present "
+                    "them again unless the user asks.\n"
+                    "Do NOT greet. Do NOT re-run the task."
+                )
+            elif state.get("status") in ("complete", "completed"):
                 obj = state.get("objective", "unknown task")
                 summary = (state.get("completion_summary") or state.get("recent_summary") or "").strip()
                 control_text = (

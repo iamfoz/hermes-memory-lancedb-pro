@@ -98,8 +98,8 @@ compaction. Ledgers live under `~/.hermes/workspace/tasks/` by default
 (`--task-root` to override).
 
 ```bash
-hermes-memory-lancedb-pro task create --id TASK_ID [--objective TEXT] [--iterations N]
-hermes-memory-lancedb-pro task list
+hermes-memory-lancedb-pro task create --id TASK_ID [--objective TEXT] [--iterations N] [--max-wakes N]
+hermes-memory-lancedb-pro task list [--json]          # --json: array of every state.json
 hermes-memory-lancedb-pro task show TASK_ID
 hermes-memory-lancedb-pro task resume TASK_ID          # prints the control block
 hermes-memory-lancedb-pro task advance TASK_ID --result pass --next-action "..."
@@ -107,11 +107,22 @@ hermes-memory-lancedb-pro task complete TASK_ID [--summary TEXT]
 hermes-memory-lancedb-pro task pin TASK_ID             # store as an always-recalled memory
 hermes-memory-lancedb-pro task hold TASK_ID            # exempt from garbage collection
 hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
+hermes-memory-lancedb-pro task wait TASK_ID --reason TEXT [--ref REF] [--clears-when TEXT]
+hermes-memory-lancedb-pro task block TASK_ID --reason TEXT
+hermes-memory-lancedb-pro task unwait TASK_ID          # waiting/blocked -> running
+hermes-memory-lancedb-pro task wake TASK_ID            # wake_count += 1
+hermes-memory-lancedb-pro task reported TASK_ID        # completed results were reported
 hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
 hermes-memory-lancedb-pro task to-skill [TASK_ID]      # scaffold a skill draft from a task
 hermes-memory-lancedb-pro task to-skill --list         # list tasks that could become a skill
 hermes-memory-lancedb-pro task to-skill --search "kw"  # find candidate tasks by keyword
 ```
+
+The `task` commands exit `0` on success, `2` for a usage or configuration
+error (unknown flag or command, missing required option, invalid task id,
+bad `MEMORY_TASK_GC_MODE`), and `4` when the task is not found or the change
+is refused (already exists, completed task parked, `unwait` on a running
+task).
 
 Inside a running Hermes session, prefer the in-host form `hermes lancedb_pro
 task …`, which the host dispatches in-process — no PATH lookup, so it works
@@ -121,6 +132,33 @@ equivalent for use outside Hermes.
 
 `task pin` stores the control block as an `active_task` memory, which the
 recall path always surfaces first.
+
+`task wait` parks a task as `waiting` on something outside the model (a CI
+run, a release, a reply) and records a `waiting_on` object —
+`{reason, ref, since, clears_when}`, `since` being the ISO time it was set.
+`task block` parks it as `blocked` (the reason is kept in `waiting_on` too).
+`task unwait` returns either to `running` and clears `waiting_on`. A completed
+task cannot be parked, and `unwait` on a task that is not parked is refused.
+`task show` always includes `status` and `waiting_on`.
+
+`task wake` records one unattended wake of a task by a scheduler: it adds 1
+to `wake_count` (which starts at 0) and sets `last_woken_at`. `task create
+--max-wakes N` stores a wake budget in `max_wakes` (default `null`). The
+ledger records the budget but does not enforce it: a wake past it is still
+counted, with a warning, and the scheduler decides whether to stop.
+
+A pinned completed task asks the model to present its results on every turn
+until `task reported` marks them reported (`reported: true`, `false` at
+create). After that the pin only says the task is done and its results were
+already reported, so they are not repeated. Only a completed task can be
+marked reported.
+
+Every state write holds an exclusive `flock` on `<task dir>/.lock` from the
+read of `state.json` through its atomic replace, so the agent and an
+unattended scheduler can write the same ledger at once without losing
+updates. Code that edits `state.json` itself should hold the same lock
+(`task_lock(task_id)` in the library). On platforms without `fcntl`
+(Windows) writes stay atomic but are not locked.
 
 Completed task ledgers are garbage-collected automatically — archived under
 `<task-root>/archive/`, then hard-deleted after a grace period. Run

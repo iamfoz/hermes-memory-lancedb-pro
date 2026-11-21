@@ -1397,6 +1397,14 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Task ledger subcommands
 # ---------------------------------------------------------------------------
+# Exit codes, for scripts and schedulers that drive the task CLI:
+#   0  success
+#   2  usage or configuration error (argparse uses 2 for bad flags too)
+#   4  not found, or refused (the task's state does not allow the change,
+#      or the task already exists)
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 4
+EXIT_REFUSED = 4
 
 
 def _cmd_task_create(args: argparse.Namespace) -> int:
@@ -1404,14 +1412,20 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: --id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     objective = getattr(args, "objective", None) or ""
     iterations = getattr(args, "iterations", None)
+    max_wakes = getattr(args, "max_wakes", None)
+    if max_wakes is not None and max_wakes < 0:
+        print("error: --max-wakes must be 0 or more", file=sys.stderr)
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
-        state = _tl.create_task(task_id, objective, target_iterations=iterations, root=root)
+        state = _tl.create_task(
+            task_id, objective, target_iterations=iterations, max_wakes=max_wakes, root=root
+        )
         if not quiet:
             state_path = _tl._state_path(task_id, root)
             print(f"Created task {task_id!r}")
@@ -1419,10 +1433,15 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
             print(f"  Objective: {state['objective']}")
             if state["target_iterations"] is not None:
                 print(f"  Target iterations: {state['target_iterations']}")
+            if state["max_wakes"] is not None:
+                print(f"  Max wakes: {state['max_wakes']}")
         return 0
     except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 def _cmd_task_list(args: argparse.Namespace) -> int:
@@ -1430,6 +1449,10 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     tasks = _tl.list_tasks(root)
+    if getattr(args, "json", False):
+        tasks = sorted((_tl.state_view(t) for t in tasks), key=lambda t: str(t.get("task_id")))
+        print(json.dumps(tasks, indent=2, ensure_ascii=False))
+        return 0
     if not tasks:
         print("No tasks found.")
         return 0
@@ -1439,6 +1462,8 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
         target = t.get("target_iterations")
         iter_str = f"{current}/{target}" if target is not None else str(current)
         held = "  [held]" if t.get("gc_hold") else ""
+        if t.get("reported"):
+            status = f"{status}, reported"
         print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}{held}")
     return 0
 
@@ -1448,16 +1473,16 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     try:
         state = _tl.load_state(task_id, root)
-        print(json.dumps(state, indent=2))
+        print(json.dumps(_tl.state_view(state), indent=2))
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_resume(args: argparse.Namespace) -> int:
@@ -1465,7 +1490,7 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     try:
@@ -1480,7 +1505,7 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_complete(args: argparse.Namespace) -> int:
@@ -1488,7 +1513,7 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     summary = getattr(args, "summary", "") or ""
@@ -1500,7 +1525,7 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_pin(args: argparse.Namespace) -> int:
@@ -1513,7 +1538,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1521,7 +1546,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
         state = _tl.load_state(task_id, root)
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
     control_block = _tl.build_control_block(state)
     state_path = str(_tl._state_path(task_id, root))
@@ -1551,7 +1576,7 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     result = getattr(args, "result", "pass") or "pass"
@@ -1575,7 +1600,7 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
 
 
 def _cmd_task_gc(args: argparse.Namespace) -> int:
@@ -1607,6 +1632,11 @@ def _cmd_task_gc(args: argparse.Namespace) -> int:
             getattr(args, "archive_grace_days", None),
             "MEMORY_TASK_ARCHIVE_GRACE_DAYS", 90),
     )
+
+    if cfg.mode not in ("archive", "delete"):
+        print(f"error: task GC mode must be 'archive' or 'delete', not {cfg.mode!r} "
+              "(check MEMORY_TASK_GC_MODE)", file=sys.stderr)
+        return EXIT_USAGE
 
     result = _tgc.run_task_gc(root=root, config=cfg)
 
@@ -1655,7 +1685,7 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         print("error: task_id is required", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
@@ -1670,7 +1700,87 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
+        return EXIT_NOT_FOUND
+
+
+def _cmd_task_park(args: argparse.Namespace) -> int:
+    """Park a task (wait / block) or return it to running (unwait)."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return EXIT_USAGE
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    verb = getattr(args, "task_command", None)
+    try:
+        if verb == "wait":
+            state = _tl.wait_task(
+                task_id,
+                args.reason,
+                ref=getattr(args, "ref", None),
+                clears_when=getattr(args, "clears_when", None),
+                root=root,
+            )
+        elif verb == "block":
+            state = _tl.block_task(task_id, args.reason, root=root)
+        else:
+            state = _tl.unwait_task(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except _tl.TaskStateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    if not quiet:
+        waiting_on = state.get("waiting_on") or {}
+        reason = f" — {waiting_on['reason']}" if waiting_on.get("reason") else ""
+        print(f"Task {task_id!r} is now {state['status']}{reason}.")
+    return 0
+
+
+def _cmd_task_wake(args: argparse.Namespace) -> int:
+    """Record one unattended wake of a task (wake_count += 1)."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return EXIT_USAGE
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        state = _tl.wake_task(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if not quiet:
+        count, limit = state["wake_count"], state.get("max_wakes")
+        print(f"Task {task_id!r}: wake {count}" + (f" of {limit}" if limit is not None else ""))
+        if limit is not None and count >= limit:
+            print("  max_wakes reached — do not wake this task again.")
+    return 0
+
+
+def _cmd_task_reported(args: argparse.Namespace) -> int:
+    """Mark a completed task's results as reported to the user."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return EXIT_USAGE
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    try:
+        _tl.mark_reported(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except _tl.TaskStateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    if not quiet:
+        print(f"Task {task_id!r} marked reported — its pin no longer asks to present results.")
+    return 0
 
 
 def _cmd_task_to_skill(args: argparse.Namespace) -> int:
@@ -1712,10 +1822,13 @@ def _cmd_task_to_skill(args: argparse.Namespace) -> int:
         )
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
-        return 1
-    except (FileExistsError, ValueError) as e:
+        return EXIT_NOT_FOUND
+    except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
     if not quiet:
         print(f"Scaffolded a draft skill from task {task_id!r}:")
         print(f"  {dest / 'SKILL.md'}")
@@ -1730,10 +1843,11 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     if sub is None:
         print(
             "Usage: ... task <create|list|show|resume|advance|complete|pin|"
-            "gc|hold|unhold|to-skill>"
+            "gc|hold|unhold|wait|block|unwait|wake|reported|to-skill>",
+            file=sys.stderr,
         )
-        return 0
-    return {
+        return EXIT_USAGE
+    handler = {
         "create": _cmd_task_create,
         "list": _cmd_task_list,
         "show": _cmd_task_show,
@@ -1744,8 +1858,28 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "gc": _cmd_task_gc,
         "hold": _cmd_task_hold,
         "unhold": _cmd_task_hold,
+        "wait": _cmd_task_park,
+        "block": _cmd_task_park,
+        "unwait": _cmd_task_park,
+        "wake": _cmd_task_wake,
+        "reported": _cmd_task_reported,
         "to-skill": _cmd_task_to_skill,
-    }.get(sub, lambda _: 0)(args)
+    }.get(sub)
+    if handler is None:
+        print(f"error: unknown task command {sub!r}", file=sys.stderr)
+        return EXIT_USAGE
+    # Safety net so no error path falls back to a traceback (exit 1).
+    try:
+        return handler(args)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except (FileExistsError, _tl.TaskStateError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    except ValueError as e:  # e.g. an invalid task id
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_command") -> None:
@@ -1759,13 +1893,16 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
                           help="One-line task objective")
     p_create.add_argument("--iterations", type=int, default=None, metavar="N",
                           help="Target iteration count (optional)")
+    p_create.add_argument("--max-wakes", dest="max_wakes", type=int, default=None,
+                          metavar="N", help="Budget of unattended wakes (optional)")
     p_create.add_argument("--task-root", default=None, metavar="PATH",
                           help="Task root dir (default: ~/.hermes/workspace/tasks)")
     p_create.add_argument("-q", "--quiet", action="store_true")
 
-    tsubs.add_parser("list", help="List all task ledgers").add_argument(
-        "--task-root", default=None, metavar="PATH"
-    )
+    p_list = tsubs.add_parser("list", help="List all task ledgers")
+    p_list.add_argument("--json", action="store_true",
+                        help="Print a JSON array of every task's state, sorted by task_id")
+    p_list.add_argument("--task-root", default=None, metavar="PATH")
 
     p_show = tsubs.add_parser("show", help="Show task state as JSON")
     p_show.add_argument("task_id", metavar="TASK_ID")
@@ -1832,6 +1969,49 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_unhold.add_argument("task_id", metavar="TASK_ID")
     p_unhold.add_argument("--task-root", default=None, metavar="PATH")
     p_unhold.add_argument("-q", "--quiet", action="store_true")
+
+    p_wait = tsubs.add_parser(
+        "wait", help="Park a task as waiting on something outside the model"
+    )
+    p_wait.add_argument("task_id", metavar="TASK_ID")
+    p_wait.add_argument("--reason", required=True, metavar="TEXT",
+                        help="What the task is waiting on")
+    p_wait.add_argument("--ref", default=None, metavar="REF",
+                        help="Reference for the thing waited on (PR, job id, URL, ...)")
+    p_wait.add_argument("--clears-when", dest="clears_when", default=None, metavar="TEXT",
+                        help="Condition under which the wait clears")
+    p_wait.add_argument("--task-root", default=None, metavar="PATH")
+    p_wait.add_argument("-q", "--quiet", action="store_true")
+
+    p_block = tsubs.add_parser(
+        "block", help="Park a task as blocked until a person intervenes"
+    )
+    p_block.add_argument("task_id", metavar="TASK_ID")
+    p_block.add_argument("--reason", required=True, metavar="TEXT",
+                         help="Why the task is blocked")
+    p_block.add_argument("--task-root", default=None, metavar="PATH")
+    p_block.add_argument("-q", "--quiet", action="store_true")
+
+    p_unwait = tsubs.add_parser(
+        "unwait", help="Return a waiting or blocked task to running"
+    )
+    p_unwait.add_argument("task_id", metavar="TASK_ID")
+    p_unwait.add_argument("--task-root", default=None, metavar="PATH")
+    p_unwait.add_argument("-q", "--quiet", action="store_true")
+
+    p_wake = tsubs.add_parser(
+        "wake", help="Record one unattended wake of a task (wake_count += 1)"
+    )
+    p_wake.add_argument("task_id", metavar="TASK_ID")
+    p_wake.add_argument("--task-root", default=None, metavar="PATH")
+    p_wake.add_argument("-q", "--quiet", action="store_true")
+
+    p_reported = tsubs.add_parser(
+        "reported", help="Mark a completed task's results as reported to the user"
+    )
+    p_reported.add_argument("task_id", metavar="TASK_ID")
+    p_reported.add_argument("--task-root", default=None, metavar="PATH")
+    p_reported.add_argument("-q", "--quiet", action="store_true")
 
     p_skill = tsubs.add_parser(
         "to-skill",

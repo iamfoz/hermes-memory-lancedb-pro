@@ -13,6 +13,58 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Added
+- **Task statuses `waiting` and `blocked`.** `task wait <id> --reason R
+  [--ref REF] [--clears-when TEXT]` parks a task as `waiting` and records
+  `waiting_on = {reason, ref, since, clears_when}`; `task block <id> --reason
+  R` parks it as `blocked`; `task unwait <id>` returns either to `running` and
+  clears `waiting_on`. `task show` reports both fields (filling `waiting_on:
+  null` in for older ledgers), and the control block shows what a parked task
+  is waiting on. Library: `wait_task`, `block_task`, `unwait_task`,
+  `TaskStateError`.
+- **`wake_count` and `max_wakes`.** `task create --max-wakes N` stores a wake
+  budget (default `null`); `task wake <id>` adds 1 to `wake_count` (from 0)
+  and sets `last_woken_at`. `task show` reports both. The budget is recorded,
+  not enforced: the scheduler that wakes the task decides when to stop.
+- **`task list --json`** prints a JSON array of every task's `state.json`
+  object, sorted by `task_id` (`[]` when there are none).
+- **Locked state writes.** Every ledger state write holds an exclusive
+  `fcntl.flock` on `<task dir>/.lock` from the read of `state.json` through
+  the atomic replace (and the matching `results.jsonl` / `events.jsonl`
+  append), so concurrent writers — the agent, an unattended scheduler,
+  other processes — no longer lose each other's updates. `task_lock()` is
+  exported for code that edits `state.json` itself. It is not re-entrant,
+  and locking a missing task raises `FileNotFoundError` rather than
+  creating a directory. This release is the first with the lock: point a
+  version check (such as a heartbeat's `ledger_flock_min_version`) at it.
+- **`reported` flag.** New field `reported` (`false` at create); `task
+  reported <id>` sets it to `true` (and `reported_at`) on a completed task,
+  and is refused for any other status. A pinned completed task with
+  `reported: true` no longer asks the model to present its results — the
+  pin only says the task is done and was already reported, keeping the
+  do-not-greet / do-not-re-run guard. `task list` shows `[complete,
+  reported]`. Library: `mark_reported`.
+
+### Changed
+- **`task` commands exit `2` for usage/config errors and `4` for
+  not-found/refused, instead of `1`.** Not found, already exists, and a
+  state change the task does not allow are `4`; an unknown flag or command
+  (argparse already used `2`), a missing required option, an invalid task
+  id, a bad `--max-wakes` or `MEMORY_TASK_GC_MODE`, and `task` with no
+  subcommand (which used to exit `0`) are `2`. Error paths that raised a
+  traceback (an invalid task id) now report the error instead. Scripts that
+  test for exit code `1` from `task` commands need updating; the other
+  commands are unchanged.
+
+### Fixed
+- **`last_successful_iteration` is now only moved by a passing advance.**
+  Every `task advance` used to set it to the counter's value *before* the
+  advance, whatever the result — so a failing iteration was recorded as
+  successful, and after one passing iteration it read `0`. A `--result pass`
+  advance now sets it to the new `current_iteration` (one pass → `1`); a
+  `--result fail` advance leaves it unchanged. `results.jsonl` entries are
+  unchanged (`iteration` there is still the pre-advance counter).
+
 ---
 
 ## [0.15.1] — 2026-11-09
