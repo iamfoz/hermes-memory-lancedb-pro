@@ -1438,6 +1438,10 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
     root_str = getattr(args, "task_root", None)
     root = Path(root_str).expanduser() if root_str else None
     tasks = _tl.list_tasks(root)
+    if getattr(args, "json", False):
+        tasks = sorted((_tl.state_view(t) for t in tasks), key=lambda t: str(t.get("task_id")))
+        print(json.dumps(tasks, indent=2, ensure_ascii=False))
+        return 0
     if not tasks:
         print("No tasks found.")
         return 0
@@ -1835,9 +1839,10 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
                           help="Task root dir (default: ~/.hermes/workspace/tasks)")
     p_create.add_argument("-q", "--quiet", action="store_true")
 
-    tsubs.add_parser("list", help="List all task ledgers").add_argument(
-        "--task-root", default=None, metavar="PATH"
-    )
+    p_list = tsubs.add_parser("list", help="List all task ledgers")
+    p_list.add_argument("--json", action="store_true",
+                        help="Print a JSON array of every task's state, sorted by task_id")
+    p_list.add_argument("--task-root", default=None, metavar="PATH")
 
     p_show = tsubs.add_parser("show", help="Show task state as JSON")
     p_show.add_argument("task_id", metavar="TASK_ID")

@@ -99,7 +99,7 @@ compaction. Ledgers live under `~/.hermes/workspace/tasks/` by default
 
 ```bash
 hermes-memory-lancedb-pro task create --id TASK_ID [--objective TEXT] [--iterations N] [--max-wakes N]
-hermes-memory-lancedb-pro task list
+hermes-memory-lancedb-pro task list [--json]          # --json: array of every state.json
 hermes-memory-lancedb-pro task show TASK_ID
 hermes-memory-lancedb-pro task resume TASK_ID          # prints the control block
 hermes-memory-lancedb-pro task advance TASK_ID --result pass --next-action "..."

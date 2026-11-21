@@ -26,6 +26,8 @@ minor versions; breaking changes are called out under **Changed** and
   budget (default `null`); `task wake <id>` adds 1 to `wake_count` (from 0)
   and sets `last_woken_at`. `task show` reports both. The budget is recorded,
   not enforced: the scheduler that wakes the task decides when to stop.
+- **`task list --json`** prints a JSON array of every task's `state.json`
+  object, sorted by `task_id` (`[]` when there are none).
 
 ---
 

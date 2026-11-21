@@ -173,6 +173,43 @@ class TestWakes:
 
 
 # ---------------------------------------------------------------------------
+# list --json
+# ---------------------------------------------------------------------------
+
+
+class TestListJson:
+    def test_empty_root_is_empty_array(self, task_root, monkeypatch, capsys):
+        assert cli(monkeypatch, "task", "list", "--json") == 0
+        assert json.loads(capsys.readouterr().out) == []
+
+    def test_every_state_sorted_by_task_id(self, task_root, monkeypatch, capsys):
+        for tid in ("beta", "alpha", "Gamma-2", "gamma.1"):
+            _tl.create_task(tid, f"objective {tid}")
+        _tl.complete_task("beta")
+        capsys.readouterr()
+        assert cli(monkeypatch, "task", "list", "--json") == 0
+        tasks = json.loads(capsys.readouterr().out)
+        ids = [t["task_id"] for t in tasks]
+        assert ids == sorted(ids) and set(ids) == {"alpha", "beta", "Gamma-2", "gamma.1"}
+        by_id = {t["task_id"]: t for t in tasks}
+        assert by_id["beta"] == _tl.load_state("beta")
+        assert by_id["alpha"]["objective"] == "objective alpha"
+
+    def test_skips_archive_and_unreadable(self, task_root, monkeypatch, capsys):
+        _tl.create_task("ok", "o")
+        (task_root / "archive").mkdir()
+        (task_root / "broken").mkdir()
+        (task_root / "broken" / "state.json").write_text("{not json")
+        capsys.readouterr()
+        assert cli(monkeypatch, "task", "list", "--json") == 0
+        assert [t["task_id"] for t in json.loads(capsys.readouterr().out)] == ["ok"]
+
+    def test_plain_list_unchanged(self, task_root, monkeypatch, capsys):
+        assert cli(monkeypatch, "task", "list") == 0
+        assert capsys.readouterr().out.strip() == "No tasks found."
+
+
+# ---------------------------------------------------------------------------
 # The heartbeat's ledger-caps probe, verbatim (subprocess + HERMES_TASK_ROOT)
 # ---------------------------------------------------------------------------
 
@@ -213,3 +250,11 @@ class TestProbeContract:
             assert _probe_cli(root, "wake", "probe").returncode == 0
         s = _probe_show(root, "probe")
         assert s["wake_count"] == 2 and s["max_wakes"] == 3
+
+    def test_list_json(self, tmp_path):
+        root = tmp_path / "scratch"
+        assert _probe_cli(root, "create", "--id", "probe", "-q").returncode == 0
+        r = _probe_cli(root, "list", "--json")
+        assert r.returncode == 0, r.stderr
+        tasks = json.loads(r.stdout)
+        assert isinstance(tasks, list) and "probe" in [t["task_id"] for t in tasks]
