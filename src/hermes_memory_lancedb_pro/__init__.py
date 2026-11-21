@@ -95,9 +95,11 @@ from .smart_metadata import (  # noqa: F401
 )
 from .task_ledger import (  # noqa: F401
     TASK_ROOT,
+    TaskStateError,
     advance_iteration,
     append_jsonl,
     atomic_write_json,
+    block_task,
     build_control_block,
     complete_task,
     create_task,
@@ -105,6 +107,8 @@ from .task_ledger import (  # noqa: F401
     load_state,
     looks_like_reset,
     save_state,
+    unwait_task,
+    wait_task,
 )
 from .temporal_classifier import (  # noqa: F401
     TemporalType,
@@ -216,9 +220,11 @@ __all__ = [
     "reflection",
     # Task ledger — durable task state outside the context window
     "TASK_ROOT",
+    "TaskStateError",
     "advance_iteration",
     "append_jsonl",
     "atomic_write_json",
+    "block_task",
     "build_control_block",
     "complete_task",
     "create_task",
@@ -226,6 +232,8 @@ __all__ = [
     "load_state",
     "looks_like_reset",
     "save_state",
+    "unwait_task",
+    "wait_task",
     # Smart extractor + LLM client
     "AnthropicLlmClient",
     "DedupResult",

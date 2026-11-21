@@ -1453,7 +1453,7 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
     root = Path(root_str).expanduser() if root_str else None
     try:
         state = _tl.load_state(task_id, root)
-        print(json.dumps(state, indent=2))
+        print(json.dumps(_tl.state_view(state), indent=2))
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
@@ -1673,6 +1673,42 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_task_park(args: argparse.Namespace) -> int:
+    """Park a task (wait / block) or return it to running (unwait)."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    root_str = getattr(args, "task_root", None)
+    root = Path(root_str).expanduser() if root_str else None
+    quiet = bool(getattr(args, "quiet", False))
+    verb = getattr(args, "task_command", None)
+    try:
+        if verb == "wait":
+            state = _tl.wait_task(
+                task_id,
+                args.reason,
+                ref=getattr(args, "ref", None),
+                clears_when=getattr(args, "clears_when", None),
+                root=root,
+            )
+        elif verb == "block":
+            state = _tl.block_task(task_id, args.reason, root=root)
+        else:
+            state = _tl.unwait_task(task_id, root=root)
+    except FileNotFoundError:
+        print(f"error: task {task_id!r} not found", file=sys.stderr)
+        return 1
+    except _tl.TaskStateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not quiet:
+        waiting_on = state.get("waiting_on") or {}
+        reason = f" — {waiting_on['reason']}" if waiting_on.get("reason") else ""
+        print(f"Task {task_id!r} is now {state['status']}{reason}.")
+    return 0
+
+
 def _cmd_task_to_skill(args: argparse.Namespace) -> int:
     """Scaffold a draft skill from a task, or list candidate tasks."""
     from . import task_skill as _tsk
@@ -1730,7 +1766,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     if sub is None:
         print(
             "Usage: ... task <create|list|show|resume|advance|complete|pin|"
-            "gc|hold|unhold|to-skill>"
+            "gc|hold|unhold|wait|block|unwait|to-skill>"
         )
         return 0
     return {
@@ -1744,6 +1780,9 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "gc": _cmd_task_gc,
         "hold": _cmd_task_hold,
         "unhold": _cmd_task_hold,
+        "wait": _cmd_task_park,
+        "block": _cmd_task_park,
+        "unwait": _cmd_task_park,
         "to-skill": _cmd_task_to_skill,
     }.get(sub, lambda _: 0)(args)
 
@@ -1832,6 +1871,35 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_unhold.add_argument("task_id", metavar="TASK_ID")
     p_unhold.add_argument("--task-root", default=None, metavar="PATH")
     p_unhold.add_argument("-q", "--quiet", action="store_true")
+
+    p_wait = tsubs.add_parser(
+        "wait", help="Park a task as waiting on something outside the model"
+    )
+    p_wait.add_argument("task_id", metavar="TASK_ID")
+    p_wait.add_argument("--reason", required=True, metavar="TEXT",
+                        help="What the task is waiting on")
+    p_wait.add_argument("--ref", default=None, metavar="REF",
+                        help="Reference for the thing waited on (PR, job id, URL, ...)")
+    p_wait.add_argument("--clears-when", dest="clears_when", default=None, metavar="TEXT",
+                        help="Condition under which the wait clears")
+    p_wait.add_argument("--task-root", default=None, metavar="PATH")
+    p_wait.add_argument("-q", "--quiet", action="store_true")
+
+    p_block = tsubs.add_parser(
+        "block", help="Park a task as blocked until a person intervenes"
+    )
+    p_block.add_argument("task_id", metavar="TASK_ID")
+    p_block.add_argument("--reason", required=True, metavar="TEXT",
+                         help="Why the task is blocked")
+    p_block.add_argument("--task-root", default=None, metavar="PATH")
+    p_block.add_argument("-q", "--quiet", action="store_true")
+
+    p_unwait = tsubs.add_parser(
+        "unwait", help="Return a waiting or blocked task to running"
+    )
+    p_unwait.add_argument("task_id", metavar="TASK_ID")
+    p_unwait.add_argument("--task-root", default=None, metavar="PATH")
+    p_unwait.add_argument("-q", "--quiet", action="store_true")
 
     p_skill = tsubs.add_parser(
         "to-skill",

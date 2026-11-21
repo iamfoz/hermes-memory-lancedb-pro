@@ -13,6 +13,16 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Added
+- **Task statuses `waiting` and `blocked`.** `task wait <id> --reason R
+  [--ref REF] [--clears-when TEXT]` parks a task as `waiting` and records
+  `waiting_on = {reason, ref, since, clears_when}`; `task block <id> --reason
+  R` parks it as `blocked`; `task unwait <id>` returns either to `running` and
+  clears `waiting_on`. `task show` reports both fields (filling `waiting_on:
+  null` in for older ledgers), and the control block shows what a parked task
+  is waiting on. Library: `wait_task`, `block_task`, `unwait_task`,
+  `TaskStateError`.
+
 ---
 
 ## [0.15.1] — 2026-11-09

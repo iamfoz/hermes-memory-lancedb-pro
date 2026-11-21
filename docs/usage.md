@@ -107,6 +107,9 @@ hermes-memory-lancedb-pro task complete TASK_ID [--summary TEXT]
 hermes-memory-lancedb-pro task pin TASK_ID             # store as an always-recalled memory
 hermes-memory-lancedb-pro task hold TASK_ID            # exempt from garbage collection
 hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
+hermes-memory-lancedb-pro task wait TASK_ID --reason TEXT [--ref REF] [--clears-when TEXT]
+hermes-memory-lancedb-pro task block TASK_ID --reason TEXT
+hermes-memory-lancedb-pro task unwait TASK_ID          # waiting/blocked -> running
 hermes-memory-lancedb-pro task gc [--dry-run]          # collect old completed tasks
 hermes-memory-lancedb-pro task to-skill [TASK_ID]      # scaffold a skill draft from a task
 hermes-memory-lancedb-pro task to-skill --list         # list tasks that could become a skill
@@ -121,6 +124,14 @@ equivalent for use outside Hermes.
 
 `task pin` stores the control block as an `active_task` memory, which the
 recall path always surfaces first.
+
+`task wait` parks a task as `waiting` on something outside the model (a CI
+run, a release, a reply) and records a `waiting_on` object —
+`{reason, ref, since, clears_when}`, `since` being the ISO time it was set.
+`task block` parks it as `blocked` (the reason is kept in `waiting_on` too).
+`task unwait` returns either to `running` and clears `waiting_on`. A completed
+task cannot be parked, and `unwait` on a task that is not parked is refused.
+`task show` always includes `status` and `waiting_on`.
 
 Completed task ledgers are garbage-collected automatically — archived under
 `<task-root>/archive/`, then hard-deleted after a grace period. Run

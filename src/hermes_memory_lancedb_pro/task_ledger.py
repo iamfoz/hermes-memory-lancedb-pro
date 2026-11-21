@@ -142,6 +142,19 @@ def _validate_task_id(task_id: str) -> str:
     return task_id
 
 
+class TaskStateError(RuntimeError):
+    """A requested change the task's current state does not allow.
+
+    For example: waiting on a completed task, or ``unwait`` on a task that is
+    neither ``waiting`` nor ``blocked``. The CLI reports it as *refused*.
+    """
+
+
+# Statuses a task can be parked in until something outside the model clears it.
+PARKED_STATUSES: frozenset[str] = frozenset({"waiting", "blocked"})
+_DONE_STATUSES: frozenset[str] = frozenset({"complete", "completed"})
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -191,6 +204,7 @@ def create_task(
         "invariants": invariants if invariants is not None else list(_DEFAULT_INVARIANTS),
         "recent_summary": "",
         "blockers": [],
+        "waiting_on": None,
         "files": {
             "results": "results.jsonl",
             "events": "events.jsonl",
@@ -200,6 +214,22 @@ def create_task(
     }
     atomic_write_json(sp, state)
     return state
+
+
+# Fields added after a task format was first released. Ledgers written by an
+# older version lack them; ``state_view`` fills the defaults in so callers (and
+# ``task show``) always see every field.
+_FIELD_DEFAULTS: dict[str, Any] = {
+    "waiting_on": None,
+}
+
+
+def state_view(state: dict[str, Any]) -> dict[str, Any]:
+    """Return *state* with defaults for any later-added field it lacks.
+
+    Missing fields are appended after the stored ones; *state* is not mutated.
+    """
+    return {**state, **{k: v for k, v in _FIELD_DEFAULTS.items() if k not in state}}
 
 
 def load_state(task_id: str, root: Path | None = None) -> dict[str, Any]:
@@ -280,6 +310,77 @@ def complete_task(
     return state
 
 
+def _park_task(
+    task_id: str,
+    status: str,
+    waiting_on: dict[str, Any],
+    root: Path | None,
+) -> dict[str, Any]:
+    state = load_state(task_id, root)
+    if state.get("status") in _DONE_STATUSES:
+        raise TaskStateError(
+            f"task {task_id!r} is {state.get('status')}; cannot mark it {status}"
+        )
+    state["status"] = status
+    state["waiting_on"] = waiting_on
+    save_state(task_id, state, root)
+    append_jsonl(task_id, "events.jsonl", {"event": status, **waiting_on}, root=root)
+    return state
+
+
+def wait_task(
+    task_id: str,
+    reason: str,
+    *,
+    ref: str | None = None,
+    clears_when: str | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Park a task as ``waiting`` on something outside the model.
+
+    Records ``waiting_on = {reason, ref, since, clears_when}`` (``since`` is
+    now, ISO 8601). Raises ``TaskStateError`` for a completed task.
+    """
+    return _park_task(
+        task_id,
+        "waiting",
+        {"reason": reason, "ref": ref, "since": _now_iso(), "clears_when": clears_when},
+        root,
+    )
+
+
+def block_task(
+    task_id: str, reason: str, *, root: Path | None = None
+) -> dict[str, Any]:
+    """Park a task as ``blocked``: it cannot proceed until a person intervenes.
+
+    The reason is kept in ``waiting_on`` (``ref`` and ``clears_when`` are
+    ``None``). Raises ``TaskStateError`` for a completed task.
+    """
+    return _park_task(
+        task_id,
+        "blocked",
+        {"reason": reason, "ref": None, "since": _now_iso(), "clears_when": None},
+        root,
+    )
+
+
+def unwait_task(task_id: str, root: Path | None = None) -> dict[str, Any]:
+    """Return a ``waiting`` or ``blocked`` task to ``running`` and clear
+    ``waiting_on``. Raises ``TaskStateError`` for any other status."""
+    state = load_state(task_id, root)
+    previous = state.get("status")
+    if previous not in PARKED_STATUSES:
+        raise TaskStateError(
+            f"task {task_id!r} is {previous}, not waiting or blocked"
+        )
+    state["status"] = "running"
+    state["waiting_on"] = None
+    save_state(task_id, state, root)
+    append_jsonl(task_id, "events.jsonl", {"event": "unwait", "from": previous}, root=root)
+    return state
+
+
 def set_task_hold(
     task_id: str, hold: bool, root: Path | None = None
 ) -> dict[str, Any]:
@@ -340,6 +441,15 @@ def build_control_block(state: dict[str, Any]) -> str:
     ]
     if summary:
         lines += ["", f"Recent summary: {summary}"]
+    waiting_on = state.get("waiting_on")
+    if status in PARKED_STATUSES and isinstance(waiting_on, dict):
+        lines += ["", f"Waiting on:       {waiting_on.get('reason') or '(no reason given)'}"]
+        if waiting_on.get("ref"):
+            lines.append(f"  Ref:            {waiting_on['ref']}")
+        if waiting_on.get("since"):
+            lines.append(f"  Since:          {waiting_on['since']}")
+        if waiting_on.get("clears_when"):
+            lines.append(f"  Clears when:    {waiting_on['clears_when']}")
     if blockers:
         lines += ["", "Blockers:"] + [f"  - {b}" for b in blockers]
     if invariants:
