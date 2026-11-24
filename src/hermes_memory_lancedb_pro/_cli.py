@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -19,10 +20,10 @@ from . import task_ledger as _tl
 from ._sql import is_expired as _is_expired
 from ._sql import parse_metadata as _parse_metadata
 from .store import (
-    DEFAULT_DB_PATH,
     MAX_SCAN_ROWS,
     VECTOR_DIM,
     MemoryStore,
+    resolve_db_path,
 )
 
 PLUGIN_NAME = "lancedb_pro"
@@ -87,7 +88,7 @@ def _entry_id(r) -> str:
 
 def _open_store(args: argparse.Namespace) -> MemoryStore:
     """Open (or create) a MemoryStore at the path given by ``args.path``."""
-    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    db_path = resolve_db_path(getattr(args, "path", None))
     store = MemoryStore(db_path=db_path)
     store._initialise()
     return store
@@ -685,7 +686,7 @@ def _cmd_purge(
     what = "archived and expired memories" if include_expired else "archived memories"
 
     if not dry_run and not getattr(args, "yes", False):
-        db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+        db_path = resolve_db_path(getattr(args, "path", None))
         print(
             f"This will PERMANENTLY DELETE {what} older than "
             f"{grace_days} days at: {db_path}"
@@ -1291,7 +1292,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     Equivalent to ``scripts/memory_init.sh`` but runs in-process.
     """
-    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    db_path = resolve_db_path(getattr(args, "path", None))
     memory_md = getattr(args, "memory_md", None) or os.path.expanduser(
         os.environ.get("MEMORY_MD", "~/.hermes/memory/MEMORY.md")
     )
@@ -1368,7 +1369,7 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 
     Equivalent to ``scripts/memory_reset.sh`` but runs in-process.
     """
-    db_path = getattr(args, "path", None) or DEFAULT_DB_PATH
+    db_path = resolve_db_path(getattr(args, "path", None))
     quiet = bool(getattr(args, "quiet", False))
 
     if not getattr(args, "yes", False):
@@ -1551,6 +1552,9 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     control_block = _tl.build_control_block(state)
     state_path = str(_tl._state_path(task_id, root))
     store = _open_store(args)
+    # Re-pinning replaces the earlier pin: duplicates would each be injected
+    # into the system prompt.
+    replaced = _remove_task_pins(store, task_id)
     meta = {"task_id": task_id, "state_path": state_path, "priority": "must_include"}
     mem_id = store.store(
         text=control_block,
@@ -1562,6 +1566,38 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
     if not quiet:
         print(f"Pinned task {task_id!r} as memory {mem_id}")
         print("  Category: active_task (always recalled first)")
+        if replaced:
+            print(f"  Replaced {replaced} earlier pin(s) for this task.")
+    return 0
+
+
+def _remove_task_pins(store: MemoryStore, task_id: str) -> int:
+    """Delete every live `active_task` pin for *task_id*; returns the count."""
+    removed = 0
+    rows = store.list_memories(limit=5000, category="active_task", include_archived=False)
+    for row in rows:
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if meta.get("task_id") == task_id and store.forget(row["id"]):
+            removed += 1
+    return removed
+
+
+def _cmd_task_unpin(args: argparse.Namespace) -> int:
+    """Remove a task's pin so it is no longer injected into the system prompt.
+
+    The ledger itself is untouched; pin it again with ``task pin``."""
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        print("error: task_id is required", file=sys.stderr)
+        return EXIT_USAGE
+    _tl._validate_task_id(task_id)
+    quiet = bool(getattr(args, "quiet", False))
+    removed = _remove_task_pins(_open_store(args), task_id)
+    if not removed:
+        print(f"error: task {task_id!r} is not pinned", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if not quiet:
+        print(f"Unpinned task {task_id!r} ({removed} pin(s) removed).")
     return 0
 
 
@@ -1842,7 +1878,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
     sub = getattr(args, "task_command", None)
     if sub is None:
         print(
-            "Usage: ... task <create|list|show|resume|advance|complete|pin|"
+            "Usage: ... task <create|list|show|resume|advance|complete|pin|unpin|"
             "gc|hold|unhold|wait|block|unwait|wake|reported|to-skill>",
             file=sys.stderr,
         )
@@ -1855,6 +1891,7 @@ def _cmd_task_dispatch(args: argparse.Namespace) -> int:
         "advance": _cmd_task_advance,
         "complete": _cmd_task_complete,
         "pin": _cmd_task_pin,
+        "unpin": _cmd_task_unpin,
         "gc": _cmd_task_gc,
         "hold": _cmd_task_hold,
         "unhold": _cmd_task_hold,
@@ -1942,6 +1979,14 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
                        help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_pin.add_argument("--task-root", default=None, metavar="PATH")
     p_pin.add_argument("-q", "--quiet", action="store_true")
+
+    p_unpin = tsubs.add_parser(
+        "unpin", help="Remove a task's pin (the ledger is kept)"
+    )
+    p_unpin.add_argument("task_id", metavar="TASK_ID")
+    p_unpin.add_argument("--path", default=None, metavar="PATH",
+                         help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+    p_unpin.add_argument("-q", "--quiet", action="store_true")
 
     p_gc = tsubs.add_parser(
         "gc", help="Garbage-collect completed task ledgers past the retention window"
@@ -2266,12 +2311,10 @@ def _run(db_path) -> int:
         # whatever they are. Only ever forget rows this test wrote — by id,
         # or carrying the smoke prefix — never a bare search hit.
         for mem in created:
-            try:
-                # Raw delete by exact id: forget() follows the supersede
-                # chain and would leave the archived original behind.
+            # Raw delete by exact id: forget() follows the supersede chain
+            # and would leave the archived original behind.
+            with contextlib.suppress(Exception):
                 store._table.delete(f"id = '{_store_module._escape_sql(mem)}'")
-            except Exception:
-                pass
         for mode in ("vector", "bm25"):
             try:
                 existing = store.search(SMOKE_PREFIX, limit=50, mode=mode)

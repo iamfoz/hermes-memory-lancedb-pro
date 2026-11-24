@@ -33,6 +33,7 @@ from lancedb.pydantic import LanceModel, Vector
 if TYPE_CHECKING:  # pragma: no cover
     from sentence_transformers import SentenceTransformer
 
+from ._env import env_int
 from ._sql import (
     ARCHIVED_STATE,
 )
@@ -61,9 +62,34 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_DB_PATH: str = os.path.expanduser(
-    os.environ.get("MEMORY_DB_DIR", "~/.hermes/memory-lancedb")
-)
+def resolve_db_path(explicit: str | None = None, hermes_home: str | None = None) -> str:
+    """The memory database directory, resolved the same way everywhere.
+
+    Highest priority first:
+      1. *explicit* — a ``--path`` argument or a caller-supplied path.
+      2. ``MEMORY_DB_DIR`` — the documented override.
+      3. ``<hermes home>/memory-lancedb`` — *hermes_home* as passed by the
+         host, else ``$HERMES_HOME`` (set per ``hermes -p <profile>``), so
+         each profile keeps its own database.
+      4. ``~/.hermes/memory-lancedb``.
+
+    The provider and every CLI command call this, so the CLI always works on
+    the database the running agent uses.
+    """
+    if explicit and str(explicit).strip():
+        return os.path.expanduser(str(explicit))
+    env_dir = os.environ.get("MEMORY_DB_DIR", "").strip()
+    if env_dir:
+        return os.path.expanduser(env_dir)
+    home = (str(hermes_home).strip() if hermes_home else "") or os.environ.get(
+        "HERMES_HOME", ""
+    ).strip()
+    if home:
+        return os.path.join(os.path.expanduser(home), "memory-lancedb")
+    return os.path.expanduser("~/.hermes/memory-lancedb")
+
+
+DEFAULT_DB_PATH: str = resolve_db_path()
 DEFAULT_EMBEDDING_MODEL: str = "nomic-ai/nomic-embed-text-v1.5"
 VECTOR_DIM: int = 768
 
@@ -86,7 +112,7 @@ _ENCODE_LOCK = threading.Lock()
 
 # Reasonable upper bound for full-table scans inside the API. Configurable
 # via env var so users with very large stores can lift it.
-MAX_SCAN_ROWS: int = int(os.environ.get("MEMORY_MAX_SCAN_ROWS", "100000"))
+MAX_SCAN_ROWS: int = env_int("MEMORY_MAX_SCAN_ROWS", 100000)
 
 # Heuristic: when filtering archived rows post-fetch, fetch this many
 # multiples of `limit` to leave headroom.
@@ -105,7 +131,7 @@ VECTOR_INDEX_MIN_ROWS: int = 256
 # After this many fragment-creating writes the store runs `optimize()`, which
 # compacts the small fragments into a few large ones (and folds newly-written
 # rows into the FTS / vector indexes). Set to 0 to disable auto-compaction.
-AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256"))
+AUTO_OPTIMIZE_EVERY: int = env_int("MEMORY_AUTO_OPTIMIZE_EVERY", 256)
 
 # Hard upper bound on a single memory's `text`, in characters. A memory entry
 # is meant to be a distilled fact, not a document: beyond this size the
@@ -114,14 +140,14 @@ AUTO_OPTIMIZE_EVERY: int = int(os.environ.get("MEMORY_AUTO_OPTIMIZE_EVERY", "256
 # reject oversized text rather than letting it reach the embedder. Raise this
 # if you genuinely need larger entries — though the smart extractor is the
 # better place to summarise long content.
-MAX_TEXT_CHARS: int = int(os.environ.get("MEMORY_MAX_TEXT_CHARS", "8000"))
+MAX_TEXT_CHARS: int = env_int("MEMORY_MAX_TEXT_CHARS", 8000)
 
 # Soft open-file (file-descriptor) limit the store ensures for its process.
 # LanceDB opens a descriptor per on-disk fragment, so under sustained write
 # load a process started with a low soft limit (macOS shells default to 256)
 # can exhaust descriptors. `MemoryStore` raises the soft limit toward the hard
 # ceiling on construction — no privileges needed. Set 0 to disable.
-MEMORY_FD_LIMIT: int = int(os.environ.get("MEMORY_FD_LIMIT", "4096"))
+MEMORY_FD_LIMIT: int = env_int("MEMORY_FD_LIMIT", 4096)
 
 # "active_task" backs the durable-task pin: `task pin`, the recall-guardrail
 # active-task pinning, `_format_recall`, `_refresh_active_task_memories` and the
@@ -148,17 +174,13 @@ CROSS_SESSION_TIERS = frozenset({"core"})
 # every turn regardless of relevance. 5 minutes is long enough to break the
 # loop within a single conversation while still credit-scoring genuine
 # repeated use.
-ACCESS_COUNT_THROTTLE_SECONDS: int = int(
-    os.environ.get("MEMORY_ACCESS_COUNT_THROTTLE_S", "300")
-)
+ACCESS_COUNT_THROTTLE_SECONDS: int = env_int("MEMORY_ACCESS_COUNT_THROTTLE_S", 300)
 
 # Auto-promote a memory to cross_session=True after it's been recalled in
 # this many distinct session_ids. Closes a loop in the session-scoping
 # design: memories that are useful across many conversations earn the
 # cross-session flag without manual intervention. 0 disables auto-promotion.
-CROSS_SESSION_PROMOTION_THRESHOLD: int = int(
-    os.environ.get("MEMORY_CROSS_SESSION_PROMOTION_K", "3")
-)
+CROSS_SESSION_PROMOTION_THRESHOLD: int = env_int("MEMORY_CROSS_SESSION_PROMOTION_K", 3)
 
 # Hide memories whose metadata `valid_until` (epoch ms, inferred by the smart
 # extractor from phrases like "tomorrow" / "in 3 days") has passed from every

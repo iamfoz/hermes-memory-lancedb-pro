@@ -120,3 +120,240 @@ def test_list_memories_offset_pages_do_not_overlap(store):
     page3 = store.list_memories(limit=10, offset=20)
     seen = [r["id"] for r in page1 + page2 + page3]
     assert len(seen) == 30 and len(set(seen)) == 30
+
+
+# ---------------------------------------------------------------------------
+# active_task lookups must see every live row, however many anchors exist
+# ---------------------------------------------------------------------------
+
+
+def _anchors(store, conversation_id=None):
+    from hermes_memory_lancedb_pro import provider
+
+    rows = provider._list_active_task_rows(store)
+    return [
+        r for r in rows
+        if r["metadata"].get("auto_anchor")
+        and (conversation_id is None or r["metadata"].get("conversation_id") == conversation_id)
+    ]
+
+
+def test_auto_anchor_stays_idempotent_past_twenty_conversations(store):
+    from hermes_memory_lancedb_pro import provider
+
+    for i in range(30):
+        provider._auto_anchor_session_if_needed(f"hello {i}", f"s{i}", f"conv-{i}", store)
+    assert len(_anchors(store)) == 30
+    for _ in range(5):  # later turns of the newest conversation
+        provider._auto_anchor_session_if_needed("hello again", "s-new", "conv-new", store)
+    assert len(_anchors(store, "conv-new")) == 1
+    assert len(_anchors(store)) == 31
+
+
+def test_reset_archives_anchor_past_twenty_conversations(store):
+    from hermes_memory_lancedb_pro import provider
+
+    for i in range(30):
+        provider._auto_anchor_session_if_needed(f"hello {i}", f"s{i}", f"conv-{i}", store)
+    assert provider._archive_auto_anchors(store, "conv-29") == 1
+    assert _anchors(store, "conv-29") == []
+    assert len(_anchors(store)) == 29
+
+
+def test_formal_pin_visible_behind_many_anchors(store, tmp_path):
+    from hermes_memory_lancedb_pro import provider
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    for i in range(30):
+        provider._auto_anchor_session_if_needed(f"hello {i}", f"s{i}", f"conv-{i}", store)
+    tl.create_task("bench", "Benchmark the parser", root=tmp_path)
+    store.store(
+        text="pin", category="active_task", scope="global", importance=1.0,
+        metadata_extra={"task_id": "bench", "state_path": str(tl._state_path("bench", tmp_path))},
+    )
+    rows = provider._list_active_task_rows(store)
+    assert any(r["metadata"].get("task_id") == "bench" for r in rows)
+    # With a formal pin present no further anchor is written.
+    provider._auto_anchor_session_if_needed("hi", "s-x", "conv-x", store)
+    assert _anchors(store, "conv-x") == []
+
+
+def test_stale_auto_anchors_are_archived(store, monkeypatch):
+    import time
+
+    from hermes_memory_lancedb_pro import provider
+
+    provider._auto_anchor_session_if_needed("old chat", "s-old", "conv-old", store)
+    provider._auto_anchor_session_if_needed("recent chat", "s-recent", "conv-recent", store)
+    old = _anchors(store, "conv-old")[0]
+    aged = int(time.time() * 1000) - 30 * 86_400_000
+    store._table.update(where=f"id = '{old['id']}'", values={"timestamp": aged})
+
+    provider._auto_anchor_session_if_needed("new chat", "s-new", "conv-new", store)
+    assert _anchors(store, "conv-old") == []
+    assert len(_anchors(store, "conv-recent")) == 1
+    assert len(_anchors(store, "conv-new")) == 1
+
+    monkeypatch.setattr(provider, "_AUTO_ANCHOR_TTL_DAYS", 0)
+    recent = _anchors(store, "conv-recent")[0]
+    store._table.update(where=f"id = '{recent['id']}'", values={"timestamp": aged})
+    provider._auto_anchor_session_if_needed("another", "s-n2", "conv-n2", store)
+    assert len(_anchors(store, "conv-recent")) == 1  # TTL disabled
+
+
+# ---------------------------------------------------------------------------
+# A malformed numeric env var must not break import
+# ---------------------------------------------------------------------------
+
+
+def test_env_helpers_fall_back_on_bad_values(monkeypatch, caplog):
+    from hermes_memory_lancedb_pro._env import env_float, env_int
+
+    monkeypatch.setenv("X_INT", "five")
+    monkeypatch.setenv("X_FLOAT", "nan")
+    monkeypatch.setenv("X_OK", " 7 ")
+    monkeypatch.setenv("X_BLANK", "  ")
+    with caplog.at_level("WARNING"):
+        assert env_int("X_INT", 5) == 5
+        assert env_float("X_FLOAT", 0.25) == 0.25
+    assert "X_INT" in caplog.text and "X_FLOAT" in caplog.text
+    assert env_int("X_OK", 1) == 7 and env_float("X_OK", 1.0) == 7.0
+    assert env_int("X_BLANK", 3) == 3 and env_int("X_UNSET", 9) == 9
+
+
+def test_provider_imports_with_malformed_env(monkeypatch):
+    import importlib
+
+    from hermes_memory_lancedb_pro import provider
+
+    monkeypatch.setenv("MEMORY_PREFETCH_LIMIT", "lots")
+    monkeypatch.setenv("MEMORY_RECALL_CHAR_BUDGET", "")
+    try:
+        reloaded = importlib.reload(provider)
+        assert reloaded.DEFAULT_PREFETCH_LIMIT == 5
+        assert reloaded._RECALL_CHAR_BUDGET == 4800
+    finally:
+        monkeypatch.delenv("MEMORY_PREFETCH_LIMIT")
+        monkeypatch.delenv("MEMORY_RECALL_CHAR_BUDGET")
+        importlib.reload(provider)
+
+
+# ---------------------------------------------------------------------------
+# One database path for the provider and the CLI
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_db_path_precedence(monkeypatch, tmp_path):
+    from hermes_memory_lancedb_pro.store import resolve_db_path
+
+    monkeypatch.delenv("MEMORY_DB_DIR", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert resolve_db_path() == str(tmp_path / ".hermes" / "memory-lancedb")
+
+    profile = tmp_path / ".hermes" / "profiles" / "work"
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    assert resolve_db_path() == str(profile / "memory-lancedb")
+    # The host's hermes_home kwarg wins over the env var.
+    assert resolve_db_path(hermes_home=str(tmp_path / "other")) == str(
+        tmp_path / "other" / "memory-lancedb")
+
+    monkeypatch.setenv("MEMORY_DB_DIR", str(tmp_path / "custom"))
+    assert resolve_db_path() == str(tmp_path / "custom")
+    assert resolve_db_path(hermes_home=str(profile)) == str(tmp_path / "custom")
+    assert resolve_db_path(str(tmp_path / "explicit")) == str(tmp_path / "explicit")
+
+
+def test_cli_opens_the_profile_database(monkeypatch, tmp_path):
+    import argparse
+
+    profile = tmp_path / "profiles" / "work"
+    monkeypatch.delenv("MEMORY_DB_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    opened: list[str] = []
+
+    class FakeStore:
+        def __init__(self, db_path):
+            opened.append(db_path)
+
+        def _initialise(self):
+            pass
+
+    monkeypatch.setattr(_cli, "MemoryStore", FakeStore)
+    _cli._open_store(argparse.Namespace(path=None))
+    _cli._open_store(argparse.Namespace(path=str(tmp_path / "x")))
+    assert opened == [str(profile / "memory-lancedb"), str(tmp_path / "x")]
+
+
+# ---------------------------------------------------------------------------
+# task pin / unpin
+# ---------------------------------------------------------------------------
+
+
+def _task_pins(store, task_id):
+    rows = store.list_memories(limit=100, category="active_task")
+    return [r for r in rows if r["metadata"].get("task_id") == task_id]
+
+
+def test_repinning_replaces_the_pin_and_unpin_removes_it(store, monkeypatch, tmp_path, capsys):
+    import argparse
+
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    monkeypatch.setattr(_cli, "_open_store", lambda args: store)
+    tl.create_task("t", "objective", root=tmp_path)
+    ns = argparse.Namespace(task_id="t", task_root=str(tmp_path), path=None, quiet=True)
+    assert _cli._cmd_task_pin(ns) == 0
+    assert _cli._cmd_task_pin(ns) == 0
+    assert len(_task_pins(store, "t")) == 1
+
+    ns.task_command = "unpin"
+    assert _cli._cmd_task_dispatch(ns) == 0
+    assert _task_pins(store, "t") == []
+    assert _cli._cmd_task_dispatch(ns) == 4  # nothing left to unpin
+    assert tl.load_state("t", root=tmp_path)["status"] == "running"  # ledger untouched
+
+
+# ---------------------------------------------------------------------------
+# The cached system-prompt block must not call a parked task "running"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", ["waiting", "blocked"])
+def test_stable_block_for_parked_task(tmp_path, verb):
+    from hermes_memory_lancedb_pro import provider
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    tl.create_task("rel", "Ship release 1.2", root=tmp_path)
+    if verb == "waiting":
+        state = tl.wait_task("rel", "CI run", ref="PR#7", clears_when="CI is green", root=tmp_path)
+    else:
+        state = tl.block_task("rel", "need prod credentials", root=tmp_path)
+    block = provider._stable_task_block(state)
+    assert f"Status:    {verb}" in block and "running" not in block
+    assert "do NOT continue the work" in block
+    assert "task unwait rel" in block and "Do NOT greet" in block
+    if verb == "waiting":
+        assert "CI run" in block and "PR#7" in block and "CI is green" in block
+    else:
+        assert "need prod credentials" in block and "needs a person" in block
+
+
+def test_stable_block_for_running_task_unchanged_in_shape(tmp_path):
+    from hermes_memory_lancedb_pro import provider
+    from hermes_memory_lancedb_pro import task_ledger as tl
+
+    state = tl.create_task("t", "The objective", root=tmp_path)
+    block = provider._stable_task_block(state)
+    assert "Status:    running" in block and "task resume t" in block
+    # Stable across advances: nothing per-iteration is rendered.
+    assert provider._stable_task_block(tl.advance_iteration("t", root=tmp_path)) == block
+
+
+def test_protocol_text_covers_new_task_verbs():
+    from hermes_memory_lancedb_pro import provider
+
+    text = provider._TASK_PROTOCOL_TEXT
+    for needle in ("task reported", "task wait", "task block", "task unwait",
+                   "Status = waiting", "Status = blocked"):
+        assert needle in text

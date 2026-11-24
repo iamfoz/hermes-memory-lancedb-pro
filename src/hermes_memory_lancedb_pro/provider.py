@@ -38,6 +38,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from ._env import env_float, env_int
 from ._sql import ARCHIVED_STATE as _ARCHIVED_STATE
 from .decay import is_noise as _is_noise
 from .jmunch import JMUNCH_MODE_ENV, is_jmunch_in_use
@@ -48,7 +49,7 @@ from .memory_compactor import (
     should_run_compaction,
 )
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
-from .store import MemoryStore
+from .store import MemoryStore, resolve_db_path
 from .task_ledger import build_control_block as _build_task_control_block
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ PROVIDER_NAME = "lancedb_pro"
 
 # Default recall limit when prefetch fires. The hermes-agent prefetch path
 # currently doesn't pass an explicit limit, so we own the default.
-DEFAULT_PREFETCH_LIMIT: int = int(os.environ.get("MEMORY_PREFETCH_LIMIT", "5"))
+DEFAULT_PREFETCH_LIMIT: int = env_int("MEMORY_PREFETCH_LIMIT", 5)
 
 # ---------------------------------------------------------------------------
 # jmunch-mode recall configuration
@@ -72,12 +73,8 @@ DEFAULT_PREFETCH_LIMIT: int = int(os.environ.get("MEMORY_PREFETCH_LIMIT", "5"))
 # channel; when jmunch is detected, recall is widened to push more task
 # context back through it. These values apply ONLY in jmunch mode — off
 # jmunch the standard MEMORY_PREFETCH_LIMIT / min_score are left untouched.
-_JMUNCH_PREFETCH_LIMIT: int = int(
-    os.environ.get("MEMORY_JMUNCH_PREFETCH_LIMIT", "12")
-)
-_JMUNCH_MIN_RECALL_SCORE: float = float(
-    os.environ.get("MEMORY_JMUNCH_MIN_RECALL_SCORE", "0.0")
-)
+_JMUNCH_PREFETCH_LIMIT: int = env_int("MEMORY_JMUNCH_PREFETCH_LIMIT", 12)
+_JMUNCH_MIN_RECALL_SCORE: float = env_float("MEMORY_JMUNCH_MIN_RECALL_SCORE", 0.0)
 
 
 def _effective_recall_config(
@@ -105,14 +102,10 @@ def _effective_recall_config(
 # Purge cooldown: minimum hours between automatic purge runs.  Set 0 to
 # disable auto-purge entirely (you'll need to call purge_archived() manually
 # or use `hermes-memory doctor` to see the recommendation).
-_AUTO_PURGE_COOLDOWN_HOURS: int = int(
-    os.environ.get("MEMORY_AUTO_PURGE_COOLDOWN_HOURS", "24")
-)
+_AUTO_PURGE_COOLDOWN_HOURS: int = env_int("MEMORY_AUTO_PURGE_COOLDOWN_HOURS", 24)
 # Grace period: archived rows younger than this many days are left alone even
 # when a purge runs.  30 days gives a comfortable audit window.
-_AUTO_PURGE_GRACE_DAYS: int = int(
-    os.environ.get("MEMORY_PURGE_GRACE_DAYS", "30")
-)
+_AUTO_PURGE_GRACE_DAYS: int = env_int("MEMORY_PURGE_GRACE_DAYS", 30)
 # State-file name — lives alongside the database so it follows the store.
 _PURGE_STATE_FILENAME = ".purge-state.json"
 
@@ -121,14 +114,10 @@ _PURGE_STATE_FILENAME = ".purge-state.json"
 # ---------------------------------------------------------------------------
 # Char budget for the compressed transcript written on session end. Set 0 to
 # disable session-summary memory writes entirely.
-_SESSION_SUMMARY_MAX_CHARS: int = int(
-    os.environ.get("MEMORY_SESSION_SUMMARY_MAX_CHARS", "4000")
-)
+_SESSION_SUMMARY_MAX_CHARS: int = env_int("MEMORY_SESSION_SUMMARY_MAX_CHARS", 4000)
 # Minimum number of messages before a session summary is written. Skips
 # trivial one-turn sessions.
-_SESSION_SUMMARY_MIN_MESSAGES: int = int(
-    os.environ.get("MEMORY_SESSION_SUMMARY_MIN_MESSAGES", "2")
-)
+_SESSION_SUMMARY_MIN_MESSAGES: int = env_int("MEMORY_SESSION_SUMMARY_MIN_MESSAGES", 2)
 
 # ---------------------------------------------------------------------------
 # Auto-compaction configuration
@@ -136,9 +125,7 @@ _SESSION_SUMMARY_MIN_MESSAGES: int = int(
 # Hours between automatic compaction runs. Compaction clusters near-duplicate
 # old memories and merges each cluster into one consolidated entry. Defaults
 # to weekly; set 0 to disable.
-_AUTO_COMPACT_COOLDOWN_HOURS: int = int(
-    os.environ.get("MEMORY_AUTO_COMPACT_COOLDOWN_HOURS", "168")
-)
+_AUTO_COMPACT_COOLDOWN_HOURS: int = env_int("MEMORY_AUTO_COMPACT_COOLDOWN_HOURS", 168)
 _COMPACT_STATE_FILENAME = ".compact-state.json"
 
 # ---------------------------------------------------------------------------
@@ -147,19 +134,15 @@ _COMPACT_STATE_FILENAME = ".compact-state.json"
 # Hours between automatic task-ledger GC runs. GC archives (or deletes)
 # completed task directories past the retention window. Defaults to weekly;
 # set 0 to disable auto-GC entirely.
-_AUTO_TASK_GC_COOLDOWN_HOURS: int = int(
-    os.environ.get("MEMORY_TASK_GC_COOLDOWN_HOURS", "168")
-)
+_AUTO_TASK_GC_COOLDOWN_HOURS: int = env_int("MEMORY_TASK_GC_COOLDOWN_HOURS", 168)
 # Completed tasks older than this many days are archived (or deleted).
-_TASK_RETENTION_DAYS: int = int(os.environ.get("MEMORY_TASK_RETENTION_DAYS", "30"))
+_TASK_RETENTION_DAYS: int = env_int("MEMORY_TASK_RETENTION_DAYS", 30)
 # "archive" — move the dir under <task-root>/archive/, keeping the audit
 # trail — or "delete" — hard-delete the dir outright.
 _TASK_GC_MODE: str = os.environ.get("MEMORY_TASK_GC_MODE", "archive").strip().lower()
 # Archived task dirs older than retention + this are hard-deleted; 0 disables
 # that second stage.
-_TASK_ARCHIVE_GRACE_DAYS: int = int(
-    os.environ.get("MEMORY_TASK_ARCHIVE_GRACE_DAYS", "90")
-)
+_TASK_ARCHIVE_GRACE_DAYS: int = env_int("MEMORY_TASK_ARCHIVE_GRACE_DAYS", 90)
 
 # ---------------------------------------------------------------------------
 # Reflection configuration
@@ -171,9 +154,7 @@ _REFLECTION_ENABLED: bool = os.environ.get(
     "MEMORY_REFLECTION", "on"
 ).strip().lower() not in ("off", "0", "false", "no", "disabled")
 # Rows scanned when loading reflection slices for recall.
-_REFLECTION_SCAN_LIMIT: int = int(
-    os.environ.get("MEMORY_REFLECTION_SCAN_LIMIT", "200")
-)
+_REFLECTION_SCAN_LIMIT: int = env_int("MEMORY_REFLECTION_SCAN_LIMIT", 200)
 # Agent identity used for reflection ownership. Single-agent setups can leave
 # this at the default; multi-agent hosts pass `agent_id` to `initialize()`.
 _REFLECTION_AGENT_ID: str = os.environ.get(
@@ -198,9 +179,7 @@ _ADMISSION_PRESET_EXPLICIT: bool = "MEMORY_ADMISSION_PRESET" in os.environ
 # ---------------------------------------------------------------------------
 # Maximum LLM extraction calls per hour. When the cap is hit, sync_turn falls
 # back to legacy raw writes for the remainder of the hour. 0 disables the cap.
-_EXTRACTION_RATE_LIMIT: int = int(
-    os.environ.get("MEMORY_EXTRACTION_RATE_LIMIT", "0")
-)
+_EXTRACTION_RATE_LIMIT: int = env_int("MEMORY_EXTRACTION_RATE_LIMIT", 0)
 
 # ---------------------------------------------------------------------------
 # Recall guardrails
@@ -214,15 +193,13 @@ _RECALL_NEVER_CATEGORIES: frozenset[str] = frozenset(
 )
 # Approximate character budget for the full recall block injected each turn.
 # chars / 4 ≈ tokens, so the default 4800 ≈ 1200 tokens.  Set 0 to disable.
-_RECALL_CHAR_BUDGET: int = int(os.environ.get("MEMORY_RECALL_CHAR_BUDGET", "4800"))
+_RECALL_CHAR_BUDGET: int = env_int("MEMORY_RECALL_CHAR_BUDGET", 4800)
 # Hard per-memory cap for the recall block. A single recalled memory longer
 # than this is truncated. Without it, one oversized junk row — e.g. a whole
 # source file accidentally stored as a memory — floods the recall block, and
 # the model mistakes it for user-loaded context ("I see you have a massive
 # file loaded..."). A genuine memory is a fact or note, never a file.
-_RECALL_MAX_ITEM_CHARS: int = int(
-    os.environ.get("MEMORY_RECALL_MAX_ITEM_CHARS", "600")
-)
+_RECALL_MAX_ITEM_CHARS: int = env_int("MEMORY_RECALL_MAX_ITEM_CHARS", 600)
 # When True, memories with category="active_task" are pinned to the front of
 # the recall block and bypass the never-categories filter and char budget.
 # This ensures long-running task state is always in context.
@@ -263,6 +240,10 @@ Run this BEFORE any other action or text:
 
 Decision tree:
 - Status = running  → `task resume <id>`, then continue from next_action
+- Status = waiting  → parked on something external; check whether it has
+  cleared. If so `task unwait <id>` and continue; if not, say what it waits on
+- Status = blocked  → needs a person; tell the user what blocks it. Do not
+  continue until they resolve it, then `task unwait <id>`
 - Status = complete → report the task results to the user now; do not re-run
 - Status = complete, reported → results were already reported; do not repeat
   them unless asked, and do not re-run
@@ -301,11 +282,24 @@ One step = one advance. Do not attempt multiple iterations per response.
     hermes lancedb_pro task complete <task-id> --summary "<what was done>"
 
 Then immediately report all results to the user. Do not greet first.
+Once you have reported them, record that so they are not repeated:
+
+    hermes lancedb_pro task reported <task-id>
+
+## Parking a task
+
+When the task cannot proceed until something outside you happens:
+
+    hermes lancedb_pro task wait <task-id> --reason "<what>" \\
+      [--ref <PR/job/URL>] [--clears-when "<condition>"]
+    hermes lancedb_pro task block <task-id> --reason "<what a person must do>"
+    hermes lancedb_pro task unwait <task-id>      # back to running
 
 ## Recovery after context loss or reset
 
 1. Run `hermes lancedb_pro task list`
 2. Running task → `task resume <id>` and continue from next_action
+   Waiting/blocked task → do not continue it; see the decision tree above
 3. Complete task → report results; do NOT re-run the task
 4. No tasks → answer the user's message directly
 5. Never ask the user "what were we doing?" — the control block above and
@@ -720,18 +714,49 @@ def _apply_recall_guardrails(
 
 
 def _stable_task_block(state: dict[str, Any]) -> str:
-    """A running-task block built ONLY from immutable fields (task id,
-    objective). Safe to place in the cached system prompt: it does not
-    change on every ``task advance`` the way ``build_control_block`` does
-    (current iteration, next action, recent summary). The model fetches
-    live iteration state with ``task resume`` instead."""
+    """A task block built ONLY from fields that rarely change (task id,
+    objective, and — for a parked task — its status and what it waits on).
+    Safe to place in the cached system prompt: it does not change on every
+    ``task advance`` the way ``build_control_block`` does (current iteration,
+    next action, recent summary). The model fetches live iteration state
+    with ``task resume`` instead."""
     task_id = state.get("task_id", "unknown")
     objective = state.get("objective", "(none)")
+    status = state.get("status", "running")
+    if status in ("waiting", "blocked"):
+        waiting_on = state.get("waiting_on")
+        waiting_on = waiting_on if isinstance(waiting_on, dict) else {}
+        reason = waiting_on.get("reason") or "(no reason recorded)"
+        lines = [
+            "ACTIVE TASK — do NOT greet.",
+            f"Task ID:   {task_id}",
+            f"Objective: {objective}",
+            f"Status:    {status} — do NOT continue the work yet.",
+            f"{'Waiting on' if status == 'waiting' else 'Blocked by'}: {reason}",
+        ]
+        if waiting_on.get("ref"):
+            lines.append(f"Ref:       {waiting_on['ref']}")
+        if waiting_on.get("clears_when"):
+            lines.append(f"Clears when: {waiting_on['clears_when']}")
+        if status == "waiting":
+            lines.append(
+                "Check whether that has cleared. If it has, run:\n"
+                f"  hermes lancedb_pro task unwait {task_id}\n"
+                "and continue. If not, tell the user what the task is waiting on."
+            )
+        else:
+            lines.append(
+                "This needs a person. Tell the user what is blocking the task. "
+                "Only after they resolve it, run:\n"
+                f"  hermes lancedb_pro task unwait {task_id}"
+            )
+        lines.append("Do NOT greet, do NOT restart the task.")
+        return "\n".join(lines)
     return (
         "ACTIVE TASK — do NOT greet.\n"
         f"Task ID:   {task_id}\n"
         f"Objective: {objective}\n"
-        "Status:    running (you started this task in this conversation).\n"
+        "Status:    running (a task you started earlier).\n"
         "For the current iteration and next action, run:\n"
         f"  hermes lancedb_pro task resume {task_id}\n"
         "Then continue the task — do NOT greet, do NOT restart it."
@@ -867,6 +892,50 @@ def _maybe_auto_purge(store: MemoryStore) -> None:
         logger.warning("Auto-purge failed (will retry next session): %s", e)
 
 
+# Upper bound on live `active_task` rows read per lookup. Every reader must
+# see ALL of them: a small window silently hid the current conversation's
+# anchor and formal task pins once enough old anchors had accumulated.
+_ACTIVE_TASK_SCAN_LIMIT = 5000
+
+# Auto-anchors older than this many days are archived when a new one is
+# written, so one row per past conversation does not pile up forever.
+# 0 disables the clean-up.
+_AUTO_ANCHOR_TTL_DAYS: int = env_int("MEMORY_AUTO_ANCHOR_TTL_DAYS", 14)
+
+
+def _list_active_task_rows(store: MemoryStore) -> list[dict[str, Any]]:
+    """All live `active_task` rows (formal task pins and auto-anchors)."""
+    return store.list_memories(
+        limit=_ACTIVE_TASK_SCAN_LIMIT, category="active_task", include_archived=False
+    )
+
+
+def _expire_stale_auto_anchors(
+    store: MemoryStore, rows: list[dict[str, Any]], keep_conversation_id: str
+) -> int:
+    """Archive auto-anchors older than `_AUTO_ANCHOR_TTL_DAYS`; returns the count.
+
+    Formal pins and the anchor of `keep_conversation_id` are never touched."""
+    if _AUTO_ANCHOR_TTL_DAYS <= 0:
+        return 0
+    cutoff_ms = int(time.time() * 1000) - _AUTO_ANCHOR_TTL_DAYS * 86_400_000
+    archived = 0
+    for r in rows:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if not meta.get("auto_anchor") or meta.get("state_path"):
+            continue
+        if keep_conversation_id and meta.get("conversation_id", "") == keep_conversation_id:
+            continue
+        try:
+            if int(r.get("timestamp") or 0) >= cutoff_ms:
+                continue
+            store.update(r["id"], metadata_extra={"state": _ARCHIVED_STATE})
+            archived += 1
+        except Exception as exc:
+            logger.debug("lancedb_pro stale auto-anchor archive failed: %s", exc)
+    return archived
+
+
 def _soft_delete_task_pin(store: MemoryStore, task_id: str) -> None:
     """Remove the `active_task` pin memory for a garbage-collected task.
 
@@ -876,9 +945,7 @@ def _soft_delete_task_pin(store: MemoryStore, task_id: str) -> None:
     degrades gracefully), so a failure here is harmless.
     """
     try:
-        pins = store.list_memories(
-            limit=500, category="active_task", include_archived=False
-        )
+        pins = _list_active_task_rows(store)
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("task-pin cleanup for %s: list failed: %s", task_id, e)
         return
@@ -993,11 +1060,7 @@ def _auto_anchor_session_if_needed(
     rotations within one conversation), NOT by the raw session id. A genuine
     `/reset` clears it via `_archive_auto_anchors`."""
     try:
-        existing = store.list_memories(
-            limit=20,
-            category="active_task",
-            include_archived=False,
-        )
+        existing = _list_active_task_rows(store)
     except Exception as exc:
         logger.debug("lancedb_pro auto-anchor check failed: %s", exc)
         return
@@ -1018,6 +1081,9 @@ def _auto_anchor_session_if_needed(
         for r in existing
     ):
         return
+
+    # A new conversation is starting: retire anchors of long-gone ones.
+    _expire_stale_auto_anchors(store, existing, conversation_id)
 
     snippet = (user_content or "").strip()
     if len(snippet) > 200:
@@ -1066,9 +1132,7 @@ def _archive_auto_anchors(store: MemoryStore, conversation_id: str) -> int:
     fallback). Formal `task pin`s (with a `state_path`) are left untouched."""
     archived = 0
     try:
-        rows = store.list_memories(
-            limit=20, category="active_task", include_archived=False,
-        )
+        rows = _list_active_task_rows(store)
     except Exception as exc:
         logger.debug("lancedb_pro auto-anchor archive scan failed: %s", exc)
         return 0
@@ -1206,7 +1270,19 @@ def _build_provider_class():
                 self._agent_id = str(agent_id).strip()
             hermes_home = kwargs.get("hermes_home")
             if hermes_home and not self._explicit_store:
-                db_path = os.path.join(str(hermes_home), "memory-lancedb")
+                # Same resolution as the CLI (`resolve_db_path`), so
+                # `hermes lancedb_pro …` always works on this database:
+                # MEMORY_DB_DIR when set, else the profile's hermes_home.
+                db_path = resolve_db_path(hermes_home=str(hermes_home))
+                profile_db = os.path.join(str(hermes_home), "memory-lancedb")
+                if os.path.abspath(db_path) != os.path.abspath(profile_db) and os.path.isdir(
+                    profile_db
+                ):
+                    logger.warning(
+                        "lancedb_pro: MEMORY_DB_DIR points at %s; the database at %s "
+                        "is not used. Unset MEMORY_DB_DIR to use the profile database.",
+                        db_path, profile_db,
+                    )
                 self._store = MemoryStore.get_instance(db_path=db_path)
                 self._retriever = MemoryRetriever(self._store)
                 if self._auto_smart_extraction:
@@ -1337,11 +1413,7 @@ def _build_provider_class():
                 if _RECALL_TASK_PROTOCOL:
                     parts.append(_TASK_PROTOCOL_TEXT)
                 try:
-                    task_mems = self._store.list_memories(
-                        limit=20,
-                        category="active_task",
-                        include_archived=False,
-                    )
+                    task_mems = _list_active_task_rows(self._store)
                     # Scope to this conversation — formal pins stay global,
                     # auto-anchors from other conversations are dropped.
                     task_mems = [
@@ -1606,9 +1678,7 @@ def _build_provider_class():
             except Exception as exc:
                 logger.debug("lancedb_pro on_pre_compress anchor failed: %s", exc)
             try:
-                task_mems = self._store.list_memories(
-                    limit=20, category="active_task", include_archived=False,
-                )
+                task_mems = _list_active_task_rows(self._store)
                 task_mems = [
                     m for m in task_mems
                     if _anchor_belongs(m.get("metadata") or {}, self._conversation_id)

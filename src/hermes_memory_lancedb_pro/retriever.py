@@ -48,6 +48,7 @@ from typing import Any
 
 import requests
 
+from ._env import env_float, env_int
 from .decay import (
     ScoringPipeline,
     _coerce_metadata,
@@ -81,11 +82,9 @@ GOOGLE_RANKING_TIMEOUT = 15     # seconds
 # their defaults are always usable even if the env var isn't present yet.
 # ---------------------------------------------------------------------------
 
-TIER_EVAL_FREQUENCY = int(os.environ.get("MEMORY_TIER_EVAL_FREQUENCY", "10"))
-TIER_EVAL_BATCH = int(os.environ.get("MEMORY_TIER_EVAL_BATCH", "500"))
-DEFAULT_MIN_RECALL_SCORE: float = float(
-    os.environ.get("MEMORY_MIN_RECALL_SCORE", "0.0")
-)
+TIER_EVAL_FREQUENCY = env_int("MEMORY_TIER_EVAL_FREQUENCY", 10)
+TIER_EVAL_BATCH = env_int("MEMORY_TIER_EVAL_BATCH", 500)
+DEFAULT_MIN_RECALL_SCORE: float = env_float("MEMORY_MIN_RECALL_SCORE", 0.0)
 
 
 class MemoryRetriever:

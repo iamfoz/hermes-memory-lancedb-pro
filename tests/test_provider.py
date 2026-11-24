@@ -141,9 +141,12 @@ class TestNewHookOverrides:
 
         cls = provider.LanceDBProMemoryProvider
         assert "before_prompt_build" not in vars(cls)
-        # The observation hooks are still overridden.
-        assert cls.on_recall_used is not agent_mp.MemoryProvider.on_recall_used
-        assert cls.on_tool_call_observed is not agent_mp.MemoryProvider.on_tool_call_observed
+        # The observation hooks are defined by the plugin itself. They are
+        # non-standard: the host base class may not declare them at all.
+        base = agent_mp.MemoryProvider
+        for hook in ("on_recall_used", "on_tool_call_observed"):
+            assert hook in vars(cls)
+            assert getattr(cls, hook) is not getattr(base, hook, None)
 
     def test_prefetch_returns_recalled_memory(self, real_store):
         """prefetch is the host's real recall path; it returns the
