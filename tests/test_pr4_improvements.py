@@ -409,8 +409,9 @@ class TestReflectionRetryPlumbing:
             stats = extractor.extract_and_persist(
                 user_content="hello", assistant_content="ok",
             )
-            # Should have failed gracefully, no candidates extracted
-            assert stats.created == 0
+            # Failed gracefully: no retry, and no LLM-extracted candidates
+            # (the turn itself is handed to the legacy fallback).
+            assert stats.merged == 0 and stats.skipped == 0
             assert attempts["count"] == 1  # only one call
 
 

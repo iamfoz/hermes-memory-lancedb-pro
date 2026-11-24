@@ -203,14 +203,29 @@ class TestLlmPipelineNoCandidates:
         assert stats == ExtractionStats()
         assert llm.extract_calls == 1
 
-    def test_invalid_json_response_returns_empty_stats(self):
-        store = FakeStore()
-        llm = FakeLlm(extract=None)  # LLM returned None
-        extractor = SmartExtractor(store, llm=llm)
-        stats = extractor.extract_and_persist(
-            user_content="hello", assistant_content="hi",
+    def test_failed_extraction_call_falls_back_to_storing_the_turn(self):
+        # A failed or unparseable extraction call (None) must not drop the
+        # turn: it is stored the legacy way, as when no LLM is configured.
+        user = "Please remember that the staging database lives on host db-7."
+        assistant = "Noted: the staging database is on host db-7."
+        failing = FakeStore()
+        SmartExtractor(failing, llm=FakeLlm(extract=None)).extract_and_persist(
+            user_content=user, assistant_content=assistant,
         )
-        assert stats.created == 0
+        no_llm = FakeStore()
+        SmartExtractor(no_llm, llm=None).extract_and_persist(
+            user_content=user, assistant_content=assistant,
+        )
+        assert len(failing.stored) == len(no_llm.stored) > 0
+
+    def test_valid_empty_extraction_stores_nothing(self):
+        store = FakeStore()
+        extractor = SmartExtractor(store, llm=FakeLlm(extract={"memories": []}))
+        stats = extractor.extract_and_persist(
+            user_content="Please remember that the staging database lives on host db-7.",
+            assistant_content="Noted.",
+        )
+        assert stats.created == 0 and store.stored == []
 
 
 class TestLlmPipelineCreate:

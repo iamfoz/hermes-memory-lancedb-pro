@@ -1048,3 +1048,34 @@ def test_entity_boost_matches_whole_words_only():
     assert entry["_fusion_score"] == 1.0 and "_entity_matches" not in entry
     r._apply_entity_boost("is Go faster than R?", [entry])
     assert entry["_entity_matches"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Extraction: JSON parsing and dedup decisions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reply", [
+    '{"memories": [{"overview": "## Fix\\n```python\\ndf.merge(a, b)\\n```"}]}',
+    '{"memories": [{"content": "uses } to close a group and { to open one"}]}',
+    'Sure, here is the {result}: {"memories": []}',
+    'Thinking...\n```json\n{"memories": []}\n```\nDone.',
+    '  {"memories": []}  ',
+])
+def test_json_object_is_recovered_from_llm_replies(reply):
+    import json
+
+    from hermes_memory_lancedb_pro.llm_client import _extract_json_from_response
+
+    extracted = _extract_json_from_response(reply)
+    assert extracted is not None
+    assert "memories" in json.loads(extracted)
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (2, 2), ("2", 2), (" 3 ", 3), (2.0, 2), (2.5, None), (None, None), ("two", None), (True, None),
+])
+def test_match_index_coercion(value, expected):
+    from hermes_memory_lancedb_pro.smart_extractor import _coerce_match_index
+
+    assert _coerce_match_index(value) == expected

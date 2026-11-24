@@ -76,14 +76,45 @@ def _next_non_whitespace(text: str, start: int) -> str | None:
 
 
 def _extract_json_from_response(text: str) -> str | None:
-    """Extract a JSON object from *text*.
+    r"""Extract a JSON object from *text*.
 
-    Try ``\\`\\`\\`json … \\`\\`\\``` fences first; fall back to brace-matching from
-    the first ``{``.  Returns ``None`` when no balanced JSON object is found.
+    In order: the whole reply as JSON; a ``\`\`\``` fence whose content is
+    a JSON object; the first position from which a complete object decodes;
+    then, so the caller's repair step still gets something to work on, any
+    fence and finally brace-matching from the first ``{``. Returns ``None``
+    when nothing object-like is found.
+
+    The object is tried before fences because a valid unfenced reply often
+    CONTAINS a fenced code block inside a string value (normal for a coding
+    agent's memories); taking that fence first reduced the reply to the code
+    snippet. Decoding with the JSON parser, rather than counting braces,
+    keeps a ``{`` or ``}`` inside a string from ending the object early.
     """
-    # Try markdown fence first (with or without "json" language tag)
+    stripped = text.strip()
+    if _is_json_object(stripped):
+        return stripped
+
+    # A fence whose content is itself a JSON object is the answer, wherever
+    # it sits. (A fence holding anything else — a code sample inside a
+    # string value — is not.)
+    for fence in re.finditer(r"```(?:json)?\s*\n?([\s\S]*?)```", text):
+        if _is_json_object(fence.group(1).strip()):
+            return fence.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            return text[start:end]
+        start = text.find("{", start + 1)
+
+    # Nothing decodes cleanly: hand the most likely span to the repair step.
     fence_match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)```", text)
-    if fence_match:
+    if fence_match and "{" in fence_match.group(1):
         return fence_match.group(1).strip()
 
     first_brace = text.find("{")
@@ -105,6 +136,13 @@ def _extract_json_from_response(text: str) -> str | None:
     if last_brace == -1:
         return None
     return text[first_brace : last_brace + 1]
+
+
+def _is_json_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
 
 
 def _repair_common_json(text: str) -> str:
@@ -345,7 +383,9 @@ class AnthropicLlmClient:
                 "Install it with: pip install anthropic"
             ) from exc
 
-        self._client = _anthropic.Anthropic(api_key=api_key)
+        # Explicit timeout: the SDK default is about 10 minutes, and one hung
+        # call stalled the whole multi-call extraction pipeline.
+        self._client = _anthropic.Anthropic(api_key=api_key, timeout=30.0, max_retries=2)
         self.model = model
         self._max_tokens = max_tokens
         self._last_error: str | None = None

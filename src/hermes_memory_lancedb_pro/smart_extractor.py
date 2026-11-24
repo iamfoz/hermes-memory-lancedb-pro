@@ -71,6 +71,24 @@ _VALID_DECISIONS: frozenset[str] = frozenset({
     "support", "contextualize", "contradict",
 })
 _DESTRUCTIVE_DECISIONS: frozenset[str] = frozenset({"supersede", "contradict"})
+_PROFILE_SEARCH_LIMIT = 200
+
+
+class _ExtractionUnavailable(Exception):
+    """The extraction LLM call failed or returned nothing usable."""
+
+
+def _coerce_match_index(value: Any) -> int | None:
+    """An LLM's ``match_index`` as an int: accepts 2, 2.0 and "2"."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 @dataclass
@@ -374,13 +392,27 @@ class SmartExtractor:
         if self._rate_limiter is not None:
             self._rate_limiter.record_extraction()
 
-        return self._run_llm_pipeline(
-            conversation_text=conversation_text,
-            session_key=session_key,
-            target_scope=target_scope,
-            scope_filter=effective_filter,
-            context=context,
-        )
+        try:
+            return self._run_llm_pipeline(
+                conversation_text=conversation_text,
+                session_key=session_key,
+                target_scope=target_scope,
+                scope_filter=effective_filter,
+                context=context,
+            )
+        except _ExtractionUnavailable:
+            # A bad key, a timeout or an unparseable reply used to drop the
+            # turn silently. Store it the legacy way instead, as the no-LLM
+            # and rate-limited paths already do.
+            logger.warning(
+                "smart-extractor: extraction call failed; storing the turn without it"
+            )
+            return self._legacy_fallback(
+                user_content=user_content,
+                assistant_content=assistant_content,
+                session_key=session_key,
+                scope=target_scope,
+            )
 
     # -- legacy fallback -------------------------------------------------------
 
@@ -562,6 +594,10 @@ class SmartExtractor:
         result = self._llm_complete_json_with_retry(
             prompt, label="extract-candidates",
         )
+        if result is None:
+            # The call failed or the reply was unusable — distinct from a
+            # valid reply with nothing worth keeping.
+            raise _ExtractionUnavailable
         if not result:
             return []
         memories = result.get("memories")
@@ -865,12 +901,14 @@ class SmartExtractor:
         if decision_raw not in _VALID_DECISIONS:
             return DedupResult(decision="create", reason=f"unknown decision: {decision_raw}")
 
-        idx = data.get("match_index")
-        has_valid_index = isinstance(idx, int) and 1 <= idx <= len(similar)
-        match_entry = similar[idx - 1] if has_valid_index else (similar[0] if similar else None)
+        idx = _coerce_match_index(data.get("match_index"))
+        has_valid_index = idx is not None and 1 <= idx <= len(similar)
+        match_entry = similar[idx - 1] if has_valid_index else None
 
-        # Destructive decisions without a valid match_index → degrade to create
-        if decision_raw in _DESTRUCTIVE_DECISIONS and not has_valid_index:
+        # Any decision that acts on an existing memory needs to say which
+        # one. Without a valid match_index it used to fall back to the
+        # nearest neighbour, so a merge rewrote an unrelated memory.
+        if decision_raw not in ("create", "skip") and not has_valid_index:
             return DedupResult(
                 decision="create",
                 reason=f"{decision_raw} degraded: missing match_index",
@@ -919,8 +957,11 @@ class SmartExtractor:
 
         scope = scope_filter[0] if scope_filter else None
         try:
+            # Wide net: the profile row is picked out of the results below.
+            # With limit=5 any five nearer non-profile rows hid it, and a
+            # duplicate profile row was created instead of merging.
             similar = self._store.search_by_vector(
-                vector or [], limit=5, scope=scope, keep_vector=False,
+                vector or [], limit=_PROFILE_SEARCH_LIMIT, scope=scope, keep_vector=False,
             )
         except Exception as e:
             logger.warning("smart-extractor: profile search failed: %s", e)
@@ -998,6 +1039,14 @@ class SmartExtractor:
         )
         merged = self._llm_complete_json_with_retry(prompt, label="merge-memory")
         if not merged:
+            # The merge call failed: keep the new fact as its own memory
+            # rather than dropping it (it was still counted as merged).
+            self._store_candidate(
+                candidate,
+                vector=self._store.encode(f"{candidate.abstract} {candidate.content}") or [],
+                session_key="merge-fallback", target_scope=target_scope,
+                admission_audit=admission_audit,
+            )
             return
 
         merged_abstract = (merged.get("abstract") or "").strip()
