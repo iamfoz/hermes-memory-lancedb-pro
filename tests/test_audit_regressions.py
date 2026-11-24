@@ -357,3 +357,207 @@ def test_protocol_text_covers_new_task_verbs():
     for needle in ("task reported", "task wait", "task block", "task unwait",
                    "Status = waiting", "Status = blocked"):
         assert needle in text
+
+
+# ---------------------------------------------------------------------------
+# on_memory_write: replace and remove must reach the mirrored copy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mem_provider(store, monkeypatch):
+    from hermes_memory_lancedb_pro import provider
+
+    class FakeBase:
+        pass
+
+    monkeypatch.setattr(provider, "_load_memory_provider_base", lambda: FakeBase)
+    monkeypatch.setattr(provider, "_spawn_warmup", lambda store: None)
+    p = provider._build_provider_class()(store=store, auto_smart_extraction=False)
+    p.initialize("sess-1")
+    return p
+
+
+def _live_texts(store):
+    return sorted(r["text"] for r in store.list_memories(limit=100))
+
+
+def test_memory_write_replace_supersedes_and_remove_deletes(mem_provider, store):
+    p = mem_provider
+    p.on_memory_write("add", "user", "User's favourite editor is Vim")
+    p.on_memory_write("add", "user", "User lives in Leeds")
+    assert _live_texts(store) == ["User lives in Leeds", "User's favourite editor is Vim"]
+
+    p.on_memory_write(
+        "replace", "user", "User's favourite editor is Emacs",
+        metadata={"old_text": "editor", "previous_content": "User's favourite editor is Vim"},
+    )
+    assert _live_texts(store) == ["User lives in Leeds", "User's favourite editor is Emacs"]
+
+    p.on_memory_write(
+        "remove", "user", "",
+        metadata={"old_text": "editor", "previous_content": "User's favourite editor is Emacs"},
+    )
+    assert _live_texts(store) == ["User lives in Leeds"]
+
+
+def test_memory_write_falls_back_to_unambiguous_old_text(mem_provider, store):
+    p = mem_provider
+    p.on_memory_write("add", "memory", "Build server is ci-01")
+    p.on_memory_write("add", "memory", "Deploy server is prod-02")
+    # Ambiguous fragment: matches both, so nothing is removed.
+    p.on_memory_write("remove", "memory", "", metadata={"old_text": "server is"})
+    assert len(_live_texts(store)) == 2
+    p.on_memory_write("remove", "memory", "", metadata={"old_text": "ci-01"})
+    assert _live_texts(store) == ["Deploy server is prod-02"]
+
+
+def test_memory_write_never_touches_other_sources_or_targets(mem_provider, store):
+    p = mem_provider
+    own = store.store(text="User's favourite editor is Vim", category="preference")
+    p.on_memory_write("add", "memory", "User's favourite editor is Vim")
+    p.on_memory_write(
+        "remove", "user", "", metadata={"previous_content": "User's favourite editor is Vim"})
+    # Neither the hand-written row nor the `memory`-target mirror is removed.
+    assert store.has_id(own) and len(_live_texts(store)) == 2
+
+
+def test_memory_write_replace_without_a_match_just_stores(mem_provider, store):
+    mem_provider.on_memory_write(
+        "replace", "user", "User prefers tea", metadata={"previous_content": "never mirrored"})
+    assert _live_texts(store) == ["User prefers tea"]
+
+
+# ---------------------------------------------------------------------------
+# export -> import keeps ids; init/reset never destroy data by surprise
+# ---------------------------------------------------------------------------
+
+
+def _ns(**kw):
+    import argparse
+
+    return argparse.Namespace(**kw)
+
+
+def _second_store():
+    d = tempfile.mkdtemp(prefix="hermes-audit-b-")
+    s = MemoryStore(db_path=d)
+    s._embedder = StubEmbedder()
+    s._initialise()
+    return s, d
+
+
+def test_export_import_round_trip_keeps_ids_and_chains(store, tmp_path):
+    a = store.store(text="colour is blue", category="preference")
+    b = store.update(a, text="colour is green")
+    c = store.store(text="lives in Leeds", category="fact")
+    out = tmp_path / "e.jsonl"
+    assert _cli._cmd_export(_ns(out=str(out), limit=100_000, include_archived=True,
+                                salvage=False, quiet=True), _store=store) == 0
+
+    target, d = _second_store()
+    try:
+        args = _ns(input=str(out), allow_existing=False, reembed=False, quiet=True)
+        assert _cli._cmd_import(args, _store=target) == 0
+        rows = target.list_memories(limit=50, include_archived=True)
+        assert {r["id"] for r in rows} == {a, b, c}
+        # The supersede chain still resolves: the old id leads to the live row.
+        assert target.get_by_id(a)["id"] == b
+        assert target.has_id(b) and not target.has_id(a)
+
+        # Importing the same file again refuses, and with --allow-existing
+        # skips every row (archived ones included) instead of duplicating.
+        assert _cli._cmd_import(args, _store=target) == 1
+        args.allow_existing = True
+        assert _cli._cmd_import(args, _store=target) == 0
+        assert len(target.list_memories(limit=50, include_archived=True)) == 3
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_import_skips_rows_an_older_version_imported_under_a_new_id(store, tmp_path):
+    import json
+
+    old_id = "11111111-2222-3333-4444-555555555555"
+    store.store(text="imported long ago", category="fact",
+                metadata_extra={"source_id": old_id})
+    line = {"id": old_id, "text": "imported long ago", "category": "fact", "scope": "global",
+            "importance": 0.5, "timestamp": 1, "vector": [0.1] * VECTOR_DIM, "metadata": "{}"}
+    f = tmp_path / "old.jsonl"
+    f.write_text(json.dumps(line) + "\n")
+    args = _ns(input=str(f), allow_existing=True, reembed=False, quiet=True)
+    assert _cli._cmd_import(args, _store=store) == 0
+    assert len(store.list_memories(limit=50)) == 1
+
+
+def test_store_raw_rejects_a_taken_id(store):
+    mem = store.store(text="original", category="fact")
+    with pytest.raises(ValueError, match="already exists"):
+        store.store_raw(text="clash", vector=[0.1] * VECTOR_DIM, category="fact",
+                        scope="global", importance=0.5, metadata={}, mem_id=mem)
+
+
+def test_init_sets_an_unreadable_database_aside(store, monkeypatch, capsys):
+    import os
+
+    mem = store.store(text="precious", category="fact")
+    db_path = store.db_path
+    real_stats = MemoryStore.stats
+    calls = {"n": 0}
+
+    def flaky_stats(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(24, "Too many open files")
+        return real_stats(self)
+
+    def fake_store(db_path):
+        s = MemoryStore.__new__(MemoryStore)
+        MemoryStore.__init__(s, db_path=db_path)
+        s._embedder = StubEmbedder()
+        return s
+
+    monkeypatch.setattr(MemoryStore, "stats", flaky_stats)
+    monkeypatch.setattr(_cli, "MemoryStore", fake_store)
+    rc = _cli._cmd_init(_ns(path=db_path, memory_md=str(db_path) + "/nope.md",
+                            yes=True, quiet=True))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "Too many open files" in err and "Nothing was deleted" in err
+    parent = os.path.dirname(db_path.rstrip(os.sep))
+    aside = [n for n in os.listdir(parent)
+             if n.startswith(os.path.basename(db_path) + ".unreadable-")]
+    assert len(aside) == 1
+    try:
+        saved = MemoryStore(db_path=os.path.join(parent, aside[0]))
+        saved._embedder = StubEmbedder()
+        saved._initialise()
+        assert saved.has_id(mem)  # the original rows are intact
+    finally:
+        shutil.rmtree(os.path.join(parent, aside[0]), ignore_errors=True)
+
+
+def test_reset_refuses_a_directory_that_is_not_a_memory_db(tmp_path, capsys):
+    victim = tmp_path / "documents"
+    victim.mkdir()
+    (victim / "thesis.txt").write_text("irreplaceable")
+    assert _cli._cmd_reset(_ns(path=str(victim), yes=True, quiet=True, memory_md=None)) == 1
+    assert (victim / "thesis.txt").read_text() == "irreplaceable"
+    assert "does not look like a memory database" in capsys.readouterr().err
+
+
+def test_default_seed_file_is_the_hosts_memory_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMORY_MD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    host = tmp_path / "hh" / "memories" / "MEMORY.md"
+    assert _cli._default_memory_md() == str(host.resolve())
+    legacy = tmp_path / ".hermes" / "memory" / "MEMORY.md"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("x")
+    assert _cli._default_memory_md() == str(legacy)  # only the legacy file exists
+    host.parent.mkdir(parents=True)
+    host.write_text("y")
+    assert _cli._default_memory_md() == str(host.resolve())
+    monkeypatch.setenv("MEMORY_MD", str(tmp_path / "custom.md"))
+    assert _cli._default_memory_md() == str(tmp_path / "custom.md")

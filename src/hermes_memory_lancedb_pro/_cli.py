@@ -222,16 +222,38 @@ def _cmd_export(
 # ---------------------------------------------------------------------------
 
 
+def _id_already_imported(store: MemoryStore, source_id: str) -> bool:
+    """True if *source_id* is taken in *store*: a row with that id (live or
+    archived), or a row an older version imported under a fresh id and
+    tagged with ``metadata.source_id``."""
+    if store.row_exists(source_id):
+        return True
+    safe = _store_module._escape_sql(str(source_id))
+    rows = (
+        store._table.search()
+        .where(
+            f"(metadata LIKE '%\"source_id\": \"{safe}\"%' OR "
+            f"metadata LIKE '%\"source_id\":\"{safe}\"%')"
+        )
+        .limit(1)
+        .to_list()
+    )
+    return bool(rows)
+
+
 def _cmd_import(
     args: argparse.Namespace,
     _store: MemoryStore | None = None,
 ) -> int:
     """Import memories from a JSONL file produced by ``export``.
 
-    By default refuses to import a row whose ``id`` is already present
-    (non-archived) in the target store. Pass ``--allow-existing`` to skip
-    duplicates silently. Pass ``--reembed`` to re-encode ``text`` with the
-    current embedder instead of using the stored vector.
+    Rows keep their exported ``id``, so supersede links between rows stay
+    valid and importing the same file twice cannot duplicate anything. By
+    default the import refuses a row whose ``id`` is already present in the
+    target store — live or archived, or imported earlier under a new id
+    (``metadata.source_id``, written by versions before 0.16.1). Pass
+    ``--allow-existing`` to skip those rows instead. Pass ``--reembed`` to
+    re-encode ``text`` with the current embedder instead of the stored vector.
 
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
@@ -259,7 +281,7 @@ def _cmd_import(
             source_id = record.get("id", "")
 
             # Duplicate check
-            if source_id and store.has_id(source_id):
+            if source_id and _id_already_imported(store, source_id):
                 if allow_existing:
                     skipped += 1
                     continue
@@ -288,8 +310,6 @@ def _cmd_import(
                 vector = store.encode(text)
                 re_embedded += 1
 
-            # Preserve the source id via metadata_extra so traceability is
-            # maintained without modifying MemoryStore.store_raw's signature.
             meta_str = record.get("metadata", "{}")
             if isinstance(meta_str, dict):
                 meta_str = json.dumps(meta_str)
@@ -297,7 +317,8 @@ def _cmd_import(
                 meta_dict = json.loads(meta_str)
             except (json.JSONDecodeError, TypeError):
                 meta_dict = {}
-            meta_dict["source_id"] = source_id
+            if not isinstance(meta_dict, dict):
+                meta_dict = {}
             final_meta_str = json.dumps(meta_dict)
 
             store.store_raw(
@@ -308,6 +329,9 @@ def _cmd_import(
                 importance=float(record.get("importance", 0.5)),
                 metadata=final_meta_str,
                 timestamp=record.get("timestamp"),
+                # Keep the exported id: supersedes / superseded_by links in
+                # the metadata refer to it.
+                mem_id=str(source_id) if source_id else None,
             )
             imported += 1
 
@@ -915,7 +939,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_init.add_argument("--path", default=None, metavar="PATH",
                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
-                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+                        help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_init.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompt")
     p_init.add_argument("-q", "--quiet", action="store_true",
@@ -977,7 +1001,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_reset.add_argument("--path", default=None, metavar="PATH",
                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
-                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+                         help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_reset.add_argument("-y", "--yes", action="store_true",
                          help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",
@@ -1293,9 +1317,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     Equivalent to ``scripts/memory_init.sh`` but runs in-process.
     """
     db_path = resolve_db_path(getattr(args, "path", None))
-    memory_md = getattr(args, "memory_md", None) or os.path.expanduser(
-        os.environ.get("MEMORY_MD", "~/.hermes/memory/MEMORY.md")
-    )
+    memory_md = getattr(args, "memory_md", None) or _default_memory_md()
     quiet = bool(getattr(args, "quiet", False))
 
     if not getattr(args, "yes", False):
@@ -1314,18 +1336,29 @@ def _cmd_init(args: argparse.Namespace) -> int:
     try:
         store._initialise()
         store.stats()
+        existing = store.list_memories(limit=1)
         if not quiet:
             print("  ✓ Connection established")
     except Exception as e:
-        if not quiet:
-            print(f"  ⚠ DB corrupted ({e}) — auto-recovering...")
-        shutil.rmtree(db_path, ignore_errors=True)
+        # The failure may not be corruption at all (file-descriptor
+        # exhaustion, permissions, a LanceDB version mismatch), so never
+        # delete: set the directory aside and start a fresh database.
+        aside = _set_aside(db_path)
+        print(f"  ⚠ Could not open the database ({e}).", file=sys.stderr)
+        if aside is None:
+            print("  Nothing was changed. Fix the error above and run init again.",
+                  file=sys.stderr)
+            return 1
+        print(f"  The existing database was moved to: {aside}", file=sys.stderr)
+        print("  Nothing was deleted. To recover rows from it, run:\n"
+              f"    hermes-memory-lancedb-pro export --salvage --path {aside} -o backup.jsonl",
+              file=sys.stderr)
         store = MemoryStore(db_path=db_path)
         store._initialise()
+        existing = store.list_memories(limit=1)
         if not quiet:
-            print("  ✓ Recovered (fresh DB created)")
+            print("  ✓ Fresh database created")
 
-    existing = store.list_memories(limit=1)
     if existing:
         total = store.stats().get("total_memories", 0)
         if not quiet:
@@ -1364,6 +1397,48 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_memory_md() -> str:
+    """Seed file for ``init``: ``$MEMORY_MD``, else the host's built-in
+    memory file (``<hermes home>/memories/MEMORY.md``), else the legacy
+    ``~/.hermes/memory/MEMORY.md`` when only that one exists."""
+    env = os.environ.get("MEMORY_MD", "").strip()
+    if env:
+        return os.path.expanduser(env)
+    host = _resolve_hermes_home(None) / "memories" / "MEMORY.md"
+    legacy = Path.home() / ".hermes" / "memory" / "MEMORY.md"
+    if not host.exists() and legacy.exists():
+        return str(legacy)
+    return str(host)
+
+
+def _set_aside(db_path: str) -> str | None:
+    """Rename a database directory to ``<path>.unreadable-<timestamp>``.
+
+    Returns the new path, or None when there was nothing to move or the
+    rename failed (the directory is then left exactly as it was)."""
+    if not os.path.isdir(db_path):
+        return None
+    base = f"{db_path.rstrip(os.sep)}.unreadable-{time.strftime('%Y%m%d-%H%M%S')}"
+    aside, n = base, 1
+    while os.path.exists(aside):
+        n += 1
+        aside = f"{base}-{n}"
+    try:
+        os.rename(db_path, aside)
+    except OSError:
+        return None
+    return aside
+
+
+def _looks_like_memory_db(db_path: str) -> bool:
+    """True for an empty directory or one holding a LanceDB table."""
+    try:
+        names = os.listdir(db_path)
+    except OSError:
+        return False
+    return not names or any(n.endswith(".lance") for n in names)
+
+
 def _cmd_reset(args: argparse.Namespace) -> int:
     """Wipe the memory database and reinitialise from MEMORY.md.
 
@@ -1371,6 +1446,11 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     """
     db_path = resolve_db_path(getattr(args, "path", None))
     quiet = bool(getattr(args, "quiet", False))
+
+    if os.path.isdir(db_path) and not _looks_like_memory_db(db_path):
+        print(f"error: {db_path} does not look like a memory database "
+              "(no LanceDB table inside); refusing to delete it.", file=sys.stderr)
+        return 1
 
     if not getattr(args, "yes", False):
         print(f"This will WIPE ALL MEMORIES at: {db_path}")
@@ -2105,7 +2185,7 @@ def main() -> int:
     p_init.add_argument("--path", default=None, metavar="PATH",
                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
-                        help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+                        help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_init.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompt")
     p_init.add_argument("-q", "--quiet", action="store_true",
@@ -2123,7 +2203,7 @@ def main() -> int:
     p_reset.add_argument("--path", default=None, metavar="PATH",
                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
-                         help="Seed file (default: $MEMORY_MD or ~/.hermes/memory/MEMORY.md)")
+                         help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_reset.add_argument("-y", "--yes", action="store_true",
                          help="Skip confirmation prompt")
     p_reset.add_argument("-q", "--quiet", action="store_true",

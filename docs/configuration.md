@@ -12,7 +12,8 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMORY_DB_DIR` | `~/.hermes/memory-lancedb` | Database directory. |
+| `MEMORY_DB_DIR` | `<hermes home>/memory-lancedb` | Database directory, for the agent and every CLI command alike. Unset, each Hermes profile uses its own `$HERMES_HOME/memory-lancedb` (`~/.hermes/memory-lancedb` for the default profile). Setting it makes every profile share that one database. |
+| `MEMORY_AUTO_ANCHOR_TTL_DAYS` | `14` | Session auto-anchors older than this many days are archived when a new conversation starts. `0` disables. |
 | `MEMORY_MAX_SCAN_ROWS` | `100000` | Upper bound on full-table scans (`stats`, `purge_archived`). |
 | `MEMORY_AUTO_OPTIMIZE_EVERY` | `256` | Fragment-creating writes between automatic on-disk compactions. Each write creates a LanceDB fragment; compaction merges them so a high-volume store never exhausts the file-descriptor limit. `0` disables. |
 | `MEMORY_MAX_TEXT_CHARS` | `8000` | Upper bound on a single memory's `text`, in characters. `store()` and `store_many()` reject oversized text rather than passing it to the embedder (where very large inputs can exhaust GPU / MPS memory). |
@@ -138,7 +139,7 @@ Google backend disables itself with an actionable warning.
 |---|---|---|
 | `HERMES_HOME` | `~/.hermes` | Hermes home directory. Resolution order: `--hermes-home` flag → `HERMES_HOME` → `~/.hermes`. |
 | `HERMES_TASK_ROOT` | `~/.hermes/workspace/tasks` | Root directory for durable task ledgers. |
-| `MEMORY_MD` | `~/.hermes/memory/MEMORY.md` | Seed file for `init`. |
+| `MEMORY_MD` | `<hermes home>/memories/MEMORY.md` | Seed file for `init`. Defaults to the host's built-in memory file; the legacy `~/.hermes/memory/MEMORY.md` is used when only that exists. |
 | `HF_TOKEN` | *(none)* | HuggingFace token; avoids rate limits when first downloading the embedding model. |
 
 ## Non-configurable constants

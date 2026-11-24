@@ -148,7 +148,7 @@ the defaults are production-ready. The most common ones:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMORY_DB_DIR` | `~/.hermes/memory-lancedb` | Database directory |
+| `MEMORY_DB_DIR` | `<hermes home>/memory-lancedb` | Database directory (agent and CLI) |
 | `MEMORY_PREFETCH_LIMIT` | `5` | Memories recalled per turn |
 | `MEMORY_MIN_RECALL_SCORE` | `0.0` | Score floor for recall (raise to ~0.2 to drop weak matches) |
 | `MEMORY_ADMISSION_PRESET` | `balanced` | Admission gate: `balanced` / `conservative` / `high-recall` / `off` |

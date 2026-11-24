@@ -816,6 +816,22 @@ class MemoryStore:
         self._table_add(prepared)
         return ids
 
+    def row_exists(self, mem_id: str) -> bool:
+        """True if a row with exactly this id is stored — live OR archived.
+
+        Unlike `has_id()` (live rows only) and `get_by_id()` (follows the
+        supersede chain), this answers "is this id taken?"."""
+        if not mem_id:
+            return False
+        self._checkout_latest()
+        rows = (
+            self._table.search()
+            .where(f"id = '{_escape_sql(str(mem_id))}'")
+            .limit(1)
+            .to_list()
+        )
+        return bool(rows)
+
     def store_raw(
         self,
         *,
@@ -826,6 +842,7 @@ class MemoryStore:
         importance: float,
         metadata: str | dict[str, Any],
         timestamp: int | None = None,
+        mem_id: str | None = None,
     ) -> str:
         """Low-level write: caller supplies the encoded vector AND the
         full metadata JSON string. Bypasses `_build_metadata` so callers
@@ -838,6 +855,10 @@ class MemoryStore:
             reflection items, with their own decay / quality / item_kind
             fields)
 
+        Pass `mem_id` to keep an existing id (restoring an export, so
+        supersede links between rows stay valid). Raises `ValueError` if a
+        row with that id already exists, archived or not.
+
         For ordinary writes, prefer `store()` / `store_many()`."""
         if not text or not str(text).strip():
             raise ValueError("MemoryStore.store_raw: `text` must be non-empty")
@@ -849,7 +870,14 @@ class MemoryStore:
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
 
-        mem_id = str(uuid.uuid4())
+        if mem_id is None:
+            mem_id = str(uuid.uuid4())
+        else:
+            mem_id = str(mem_id).strip()
+            if not mem_id:
+                raise ValueError("MemoryStore.store_raw: `mem_id` must be non-empty")
+            if self.row_exists(mem_id):
+                raise ValueError(f"MemoryStore.store_raw: id {mem_id!r} already exists")
         ts = int(time.time() * 1000) if timestamp is None else int(timestamp)
         importance = max(0.0, min(1.0, float(importance)))
 

@@ -47,9 +47,13 @@ summary — this is what lets a long task survive compaction.
 
 ### `on_memory_write`
 
-Mirrors the host's built-in `memory` tool. When the agent invokes that tool
-with `action=add` or `action=replace`, the same write is reflected into this
-store so built-in memory and recall stay in sync. (`remove` is not mirrored.)
+Mirrors the host's built-in `memory` tool, so built-in memory and recall stay
+in sync. `add` stores the new entry. `replace` (and `patch`, which the host
+forwards as `replace`) supersedes the mirrored copy of the prior entry with the
+new text. `remove` deletes the mirrored copy. The prior entry is found from the
+`previous_content` the host supplies, falling back to `old_text` when exactly
+one mirrored entry contains it; only rows this hook itself mirrored for the
+same target are ever touched.
 
 ### `on_session_switch`
 

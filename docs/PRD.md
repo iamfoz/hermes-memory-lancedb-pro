@@ -242,7 +242,7 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
 - **FR-70** ✅ Console scripts `hermes-memory-lancedb-pro` and alias
   `hermes-memory`; in-host `hermes lancedb_pro <cmd>`; smoke entry point
   `hermes-memory-smoke [--ephemeral]`.
-- **FR-71** ✅ `init` (seed from MEMORY.md, corrupt-DB auto-recovery),
+- **FR-71** ✅ `init` (seed from MEMORY.md; an unreadable DB is set aside, never deleted),
   `reset`, `doctor` (counts, tier/category breakdown, orphan-chain and
   stale-row anomalies, recommendations **that reference real commands**),
   `export` (JSONL; strict-fail on corrupt store; `--salvage` recovery scan),
@@ -269,7 +269,7 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
   log-and-continue. `system_prompt_block` never raises.
 - **NFR-3 — Corruption-safe.** A corrupt store must never masquerade as an
   empty one (`export` strict-fails); salvage recovers what is readable;
-  `init` auto-recovers.
+  `init` sets an unreadable store aside and starts fresh, deleting nothing.
 - **NFR-4 — Thread-safe.** Singleton, embedder, optimize, sync-thread,
   pending-ledger, and reflection caches are lock-guarded; ledger writes are
   atomic (`os.replace`).
@@ -385,7 +385,7 @@ Gaps identified in the 2026-07 review, with disposition:
 | Memory as prompt-injection vector | Write guard + reflection sanitiser + envelope stripping (NFR-9) |
 | Host hook API evolution | Capability-sniffing registration (`register_cli_command` optional; non-standard hooks inert) |
 | Index/FD exhaustion on write-heavy use | Auto-optimize cadence + FD-limit raise + EMFILE detection |
-| Silent store corruption | Doctor anomaly scan; export strict-fail; salvage; init auto-recovery |
+| Silent store corruption | Doctor anomaly scan; export strict-fail; salvage; init sets an unreadable DB aside |
 
 ---
 

@@ -1980,39 +1980,89 @@ def _build_provider_class():
             """Mirror built-in memory tool writes into our store so the
             built-in memory and our recall stay in sync.
 
-            Contract (see hermes-agent `agent/tool_executor.py`): the host
-            calls this ONLY for ``add`` and ``replace`` actions — ``remove``
-            is intentionally not forwarded. Both arrive with just the NEW
-            ``content``; the host does not pass the replaced entry's old
-            text, so a ``replace`` cannot be turned into a targeted
-            supersede. Both are therefore mirrored the same way — the new
-            content is stored as a fact and the store's own dedup /
-            auto-compaction collapses near-duplicates over time.
+            The host forwards ``add``, ``replace`` and ``remove`` (a ``patch``
+            arrives as ``replace``). For ``replace`` and ``remove`` it passes
+            the full prior entry as ``metadata["previous_content"]`` and the
+            caller's search text as ``metadata["old_text"]``:
+
+            - ``add``     — store the new content.
+            - ``replace`` — supersede the mirrored copy of the prior entry
+              with the new content (or just store it when no copy is found).
+            - ``remove``  — delete the mirrored copy of the prior entry.
+
+            Without this a fact the user deleted or corrected through the
+            built-in memory tool kept being recalled in every later session.
 
             ``target`` is the built-in namespace: ``user`` (profile facts —
             stored as a preference) or ``memory`` (environment facts)."""
-            if action not in ("add", "replace"):
+            if action not in ("add", "replace", "remove"):
                 return
             text = (content or "").strip()
-            if not text:
+            if action != "remove" and not text:
                 return
             is_user = target == "user"
+            category = "preference" if is_user else "other"
+            extra = {
+                "source": f"hermes_{target}",
+                "memory_write_action": action,
+                # Built-in memory writes are user-curated and should
+                # surface across sessions.
+                "cross_session": True,
+            }
             try:
+                previous = (
+                    self._mirrored_rows(category, f"hermes_{target}", metadata or {})
+                    if action in ("replace", "remove")
+                    else []
+                )
+                if action == "remove":
+                    for row in previous:
+                        self._store.forget(row["id"])
+                    return
+                if previous:
+                    head, *rest = previous
+                    if head["text"].strip() != text:
+                        self._store.update(head["id"], text=text, metadata_extra=extra)
+                    for row in rest:
+                        self._store.forget(row["id"])
+                    return
                 self._store.store(
                     text=text,
-                    category="preference" if is_user else "other",
+                    category=category,
                     scope="user" if is_user else "agent",
                     importance=0.6,
-                    # Built-in memory writes are user-curated and should
-                    # surface across sessions.
-                    metadata_extra={
-                        "source": f"hermes_{target}",
-                        "memory_write_action": action,
-                        "cross_session": True,
-                    },
+                    metadata_extra=extra,
                 )
             except Exception as e:
                 logger.warning("lancedb_pro on_memory_write failed: %s", e)
+
+        def _mirrored_rows(
+            self, category: str, source: str, metadata: dict[str, Any]
+        ) -> list[dict[str, Any]]:
+            """Live rows mirrored from the built-in memory tool that hold the
+            entry a ``replace`` / ``remove`` refers to.
+
+            Matches the host's ``previous_content`` exactly. Failing that,
+            falls back to ``old_text`` as a substring — but only when exactly
+            one mirrored row contains it, so an ambiguous fragment never
+            deletes the wrong memory."""
+            previous = str(metadata.get("previous_content") or "").strip()
+            old_text = str(metadata.get("old_text") or "").strip()
+            if not previous and not old_text:
+                return []
+            rows = [
+                r for r in self._store.list_memories(limit=5000, category=category)
+                if isinstance(r.get("metadata"), dict) and r["metadata"].get("source") == source
+            ]
+            if previous:
+                exact = [r for r in rows if r["text"].strip() == previous]
+                if exact:
+                    return exact
+            if old_text:
+                partial = [r for r in rows if old_text in r["text"]]
+                if len(partial) == 1:
+                    return partial
+            return []
 
         def on_session_end(self, messages: list) -> None:
             """Called by hermes-agent at conversation end (not process exit).

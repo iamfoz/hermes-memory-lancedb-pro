@@ -120,11 +120,15 @@ def main():
         store.stats()
         print("  ✓ Connection established")
     except Exception as e:
-        print(f"  ⚠ DB corrupted ({e}) — auto-recovering...")
-        shutil.rmtree(db_dir, ignore_errors=True)
+        # Never delete: the failure may not be corruption. Set it aside.
+        import time
+        aside = f"{db_dir.rstrip(os.sep)}.unreadable-{time.strftime('%Y%m%d-%H%M%S')}"
+        print(f"  ⚠ Could not open the database ({e}).")
+        os.rename(db_dir, aside)
+        print(f"  Moved it to {aside} (nothing deleted); creating a fresh database.")
         store = MemoryStore(db_path=db_dir)
         store._initialise()
-        print("  ✓ Recovered (fresh DB created)")
+        print("  ✓ Fresh database created")
 
     existing = store.list_memories(limit=1)
     if existing:
