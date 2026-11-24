@@ -434,7 +434,19 @@ def _cmd_doctor(
     expired_ids: list[str] = []  # active rows whose valid_until has passed
 
     # First pass — collect all ids
-    for row in store._scan_all(limit=_DOCTOR_MAX_SCAN):
+    # A fail-soft scan turns a corrupt dataset (a missing fragment file) into
+    # an empty one, and doctor would then report "No anomalies detected".
+    # Scan strictly: an unreadable store is the finding.
+    try:
+        scanned_rows = list(store._scan_all(limit=_DOCTOR_MAX_SCAN, strict=True))
+    except Exception as e:
+        print("\n--- Store is unreadable ---")
+        print(f"  The full table scan failed: {e}")
+        print("  The counts above are not reliable. To recover whatever is still")
+        print("  readable, run:")
+        print("    hermes-memory-lancedb-pro export --salvage -o backup.jsonl")
+        return 1
+    for row in scanned_rows:
         rid = row.get("id")
         if rid:
             all_ids.add(rid)
@@ -758,6 +770,16 @@ def _cmd_compact(
     quiet = getattr(args, "quiet", False)
     dry_run = bool(getattr(args, "dry_run", False))
 
+    similarity = getattr(args, "similarity", 0.88)
+    if not 0 < similarity <= 1:
+        # 0 or less puts every row of a scope in one cluster and merges
+        # unrelated memories into a single row.
+        _stderr(f"error: --similarity must be in (0, 1], got {similarity}")
+        return 2
+    if getattr(args, "min_age_days", 7) < 0 or getattr(args, "max_scan", 200) <= 0:
+        _stderr("error: --min-age-days must be >= 0 and --max-scan must be > 0")
+        return 2
+
     cfg = CompactionConfig(
         min_age_days=getattr(args, "min_age_days", 7),
         similarity_threshold=getattr(args, "similarity", 0.88),
@@ -784,10 +806,17 @@ def _cmd_compact(
         return 0
 
     _stderr(
-        f"scanned {result.scanned} memories: merged {result.clusters_found} "
-        f"cluster(s), -{result.memories_deleted} +{result.memories_created}",
+        f"scanned {result.scanned} memories: merged {result.memories_created} of "
+        f"{result.clusters_found} cluster(s), -{result.memories_deleted} "
+        f"+{result.memories_created}",
         quiet,
     )
+    if result.memories_created < result.clusters_found:
+        _stderr(
+            f"error: {result.clusters_found - result.memories_created} cluster(s) "
+            "could not be merged (see the log); their memories are unchanged."
+        )
+        return 1
     return 0
 
 

@@ -1524,8 +1524,12 @@ def _build_provider_class():
             if session_id:
                 try:
                     existing_ids = {r.get("id") for r in results}
-                    first_anchors = self._store.first_for_session(session_id, limit=2)
-                    recent_anchors = self._store.recent_for_session(session_id, limit=2)
+                    # strict: only rows written in THIS session. Otherwise the
+                    # anchors are the store's oldest/newest global rows.
+                    first_anchors = self._store.first_for_session(
+                        session_id, limit=2, strict=True)
+                    recent_anchors = self._store.recent_for_session(
+                        session_id, limit=2, strict=True)
                     seen: set[str | None] = set(existing_ids)
                     extra_anchors = []
                     for m in first_anchors + recent_anchors:

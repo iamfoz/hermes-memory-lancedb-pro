@@ -105,6 +105,7 @@ hermes-memory-lancedb-pro task resume TASK_ID          # prints the control bloc
 hermes-memory-lancedb-pro task advance TASK_ID --result pass --next-action "..."
 hermes-memory-lancedb-pro task complete TASK_ID [--summary TEXT]
 hermes-memory-lancedb-pro task pin TASK_ID             # store as an always-recalled memory
+hermes-memory-lancedb-pro task unpin TASK_ID           # remove the pin, keep the ledger
 hermes-memory-lancedb-pro task hold TASK_ID            # exempt from garbage collection
 hermes-memory-lancedb-pro task unhold TASK_ID          # release the hold
 hermes-memory-lancedb-pro task wait TASK_ID --reason TEXT [--ref REF] [--clears-when TEXT]
@@ -131,7 +132,8 @@ The `hermes-memory-lancedb-pro task …` script shown above is the standalone
 equivalent for use outside Hermes.
 
 `task pin` stores the control block as an `active_task` memory, which the
-recall path always surfaces first.
+recall path always surfaces first. Pinning again replaces the earlier pin;
+`task unpin` removes it and leaves the ledger alone.
 
 `task wait` parks a task as `waiting` on something outside the model (a CI
 run, a release, a reply) and records a `waiting_on` object —

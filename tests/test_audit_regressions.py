@@ -724,3 +724,48 @@ def test_rewind_drops_pending_recall_credit(mem_provider):
         p._pending_used_ids["sess-1"] = ["a", "b"]
     p.on_session_switch("sess-1", rewound=True)
     assert "sess-1" not in p._pending_used_ids
+
+
+# ---------------------------------------------------------------------------
+# Session anchors and compact
+# ---------------------------------------------------------------------------
+
+
+def test_strict_session_anchors_ignore_global_rows(store):
+    for i in range(3):
+        store.store(text=f"old global fact {i}", category="fact",
+                    metadata_extra={"cross_session": True})
+    mine = [store.store(text=f"this session turn {i}", category="fact",
+                        metadata_extra={"source_session": "S"}) for i in range(3)]
+    first = store.first_for_session("S", limit=2, strict=True)
+    recent = store.recent_for_session("S", limit=2, strict=True)
+    assert {r["id"] for r in first + recent} <= set(mine) and len(first) == 2
+    # Default (non-strict) behaviour is unchanged: global rows still match.
+    assert any("old global" in r["text"] for r in store.first_for_session("S", limit=2))
+
+
+@pytest.mark.parametrize("kw", [{"similarity": 0}, {"similarity": -1}, {"similarity": 1.5},
+                                {"min_age_days": -1}, {"max_scan": 0}])
+def test_compact_rejects_out_of_range_options(store, kw, capsys):
+    store.store(text="alpha", category="fact")
+    store.store(text="beta", category="fact")
+    args = {"similarity": 0.88, "min_age_days": 0, "max_scan": 200, "dry_run": False,
+            "quiet": True, "scope": None, **kw}
+    assert _cli._cmd_compact(_ns(**args), _store=store) == 2
+    assert "error:" in capsys.readouterr().err
+    assert len(store.list_memories(limit=10)) == 2
+
+
+def test_doctor_reports_an_unreadable_store(store, monkeypatch, capsys):
+    store.store(text="a row", category="fact")
+
+    def broken_scan(self, limit=0, *, strict=False):
+        if strict:
+            raise RuntimeError("lance error: Not found: data/abc.lance")
+        return iter(())
+
+    monkeypatch.setattr(MemoryStore, "_scan_all", broken_scan)
+    assert _cli._cmd_doctor(_ns(path=None, quiet=False), _store=store) == 1
+    out = capsys.readouterr().out
+    assert "Store is unreadable" in out and "export --salvage" in out
+    assert "No anomalies detected" not in out

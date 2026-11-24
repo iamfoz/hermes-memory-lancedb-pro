@@ -13,6 +13,92 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Fixed — data loss
+- **`hermes-memory-smoke` deleted real memories.** Its final cleanup forgot
+  every vector-search hit for the smoke prefix without checking the text;
+  vector search has no relevance floor, so each run against a real store
+  hard-deleted up to 50 unrelated memories while reporting success. Cleanup
+  now removes only rows the test wrote.
+- **`init` wiped the database on any error.** Any exception while opening the
+  store (file-descriptor exhaustion, permissions, a LanceDB version mismatch)
+  was treated as corruption and the directory deleted without asking. An
+  unreadable database is now renamed to `<path>.unreadable-<timestamp>` and a
+  fresh one created; nothing is deleted.
+- **`reset` deleted whatever directory `--path` named.** It now refuses a
+  non-empty directory that holds no LanceDB table.
+- **Import duplicated or orphaned memories.** Rows were written under fresh
+  ids, so importing a backup twice doubled every memory, `--allow-existing`
+  skipped nothing, and supersede links pointed at ids that no longer existed.
+  Rows keep their exported id, and the duplicate check covers archived rows
+  and rows an older version imported under a new id.
+- **`update(text="")` destroyed a memory.** The supersede path skipped the
+  empty-text and `MEMORY_MAX_TEXT_CHARS` guards; it now validates before the
+  old row is archived.
+- **Counting an access through a superseded id un-archived the old version**
+  and never counted the access on the live row.
+
+### Fixed — recall
+- **Task pins and session anchors disappeared on long-lived installs.** Every
+  reader listed only the first 20 `active_task` rows, and one auto-anchor per
+  past conversation accumulated forever. After about 20 conversations the
+  current anchor and any formal `task pin` dropped out of the system prompt
+  and the compression summary, a new anchor was written every turn, and
+  `/reset` stopped archiving. All readers now see every live row, and
+  auto-anchors older than `MEMORY_AUTO_ANCHOR_TTL_DAYS` (default 14) are
+  archived.
+- **`list_memories` came back short or empty** when many archived or
+  other-session rows preceded the wanted ones.
+- **The CLI and the agent used different databases under a profile.** The
+  provider used `<hermes_home>/memory-lancedb`; the CLI used `$MEMORY_DB_DIR`
+  or `~/.hermes/memory-lancedb`. `task pin` wrote where the agent never read,
+  and `stats`, `doctor`, `reset` and `purge` acted on the wrong database. Both
+  now resolve the path the same way: `--path`, then `MEMORY_DB_DIR`, then
+  `<hermes home>/memory-lancedb`. **The provider now honours `MEMORY_DB_DIR`,
+  as documented** — if you have it set, check it points where your memories
+  are (a warning is logged when it leaves an existing profile database
+  unused).
+- **Deleted or corrected built-in memories kept being recalled.**
+  `on_memory_write` ignored `remove` and stored a `replace` as a second row.
+  `replace` now supersedes the mirrored copy and `remove` deletes it, earlier
+  wordings included.
+- **A waiting or blocked task was shown as "running".** The cached
+  system-prompt block told the model to continue it. It now says what the
+  task is parked on and not to continue; the task protocol text covers
+  `waiting`, `blocked`, `task wait/block/unwait` and `task reported`, and the
+  completed-task notice says how to mark results reported.
+- **`/resume` and `/branch` showed the previous conversation's state.** Only a
+  compression switch keeps the conversation id now.
+- **Session "first memories" were the store's oldest global rows**, in every
+  session. The session anchors now use only rows written in that session.
+- Concurrent updates lost access counts and could leave several live versions
+  of one memory; store read-modify-write paths are now serialised.
+
+### Fixed — robustness and security
+- **Untrusted text in the system prompt.** The auto-anchor quoted the first
+  user message raw; a message containing newlines and the block delimiter
+  could close the ACTIVE TASK block and plant instructions. It is reduced to
+  one plain line and labelled as quoted, not an instruction.
+- **A malformed numeric `MEMORY_*` setting crashed the plugin at import.** It
+  now logs a warning and uses the default.
+- **Subagent, cron and flush contexts wrote to the user's memory.** The
+  provider reads the host's `agent_context` and only the primary agent
+  writes. The host's `agent_identity` is accepted as the agent id.
+- `doctor` reported a corrupt store as healthy and empty; it now reports the
+  scan failure, points to `export --salvage`, and exits 1.
+- `compact` rejects an out-of-range `--similarity` (0 merged everything into
+  one row), reports how many clusters were actually merged, and exits 1 when
+  some could not be.
+- `init`'s default seed file is the host's `<hermes home>/memories/MEMORY.md`
+  (the old `~/.hermes/memory/MEMORY.md` is still used when only that exists).
+
+### Added
+- **`task unpin <id>`** removes a task's pin without touching its ledger, and
+  `task pin` replaces an earlier pin for the same task instead of adding a
+  duplicate.
+- `MemoryStore.forget(id, purge_history=True)` also deletes every earlier
+  version; `MemoryStore.row_exists(id)`; `store_raw(mem_id=...)`;
+  `resolve_db_path()`; `MEMORY_AUTO_ANCHOR_TTL_DAYS`.
+
 ---
 
 ## [0.16.0] — 2026-11-21

@@ -63,6 +63,18 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+def _session_anchor_match(metadata: dict[str, Any], session_id: str, strict: bool) -> bool:
+    """Session filter for `first_for_session` / `recent_for_session`.
+
+    `strict` keeps only rows written IN this session. The default also
+    admits cross-session and core-tier rows (`match_session`), which made
+    the "first memories of this session" the two oldest global rows of the
+    whole store, in every session, forever."""
+    if strict:
+        return metadata.get("source_session") == session_id
+    return _match_session(metadata, session_id)
+
+
 def _serialised(method):
     """Run a MemoryStore method under the store's write lock."""
 
@@ -1429,7 +1441,9 @@ class MemoryStore:
             fetch_limit = min(fetch_limit * 4, MAX_SCAN_ROWS)
         return rows[offset : offset + limit]
 
-    def recent_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
+    def recent_for_session(
+        self, session_id: str, limit: int = 2, *, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """Return the *limit* most recently written recallable (non-archived,
         non-expired) memories for *session_id*, ordered newest-first by
         timestamp.
@@ -1454,13 +1468,15 @@ class MemoryStore:
             d = self._row_to_dict(r)
             if _hidden_from_recall(d["metadata"], now_ms):
                 continue
-            if not _match_session(d["metadata"], session_id):
+            if not _session_anchor_match(d["metadata"], session_id, strict):
                 continue
             out.append(d)
         out.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
         return out[:limit]
 
-    def first_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
+    def first_for_session(
+        self, session_id: str, limit: int = 2, *, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """Return the *limit* oldest recallable (non-archived, non-expired)
         memories for *session_id*, ordered oldest-first by timestamp.
 
@@ -1484,7 +1500,7 @@ class MemoryStore:
             d = self._row_to_dict(r)
             if _hidden_from_recall(d["metadata"], now_ms):
                 continue
-            if not _match_session(d["metadata"], session_id):
+            if not _session_anchor_match(d["metadata"], session_id, strict):
                 continue
             out.append(d)
         out.sort(key=lambda x: x.get("timestamp", 0))  # ascending — oldest first
