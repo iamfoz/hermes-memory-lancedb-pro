@@ -965,7 +965,7 @@ def _soft_delete_task_pin(store: MemoryStore, task_id: str) -> None:
                 logger.debug("task-pin cleanup for %s: forget failed: %s", task_id, e)
 
 
-def _maybe_auto_task_gc(store: MemoryStore) -> None:
+def _maybe_auto_task_gc(store: MemoryStore, hermes_home: str | None = None) -> None:
     """Run task-ledger GC if the cooldown has elapsed since the last run.
 
     Archives (default) or deletes completed task directories past
@@ -977,6 +977,7 @@ def _maybe_auto_task_gc(store: MemoryStore) -> None:
     if _AUTO_TASK_GC_COOLDOWN_HOURS <= 0:
         return
 
+    from . import task_ledger as _task_ledger
     from .task_gc import (
         TASK_GC_STATE_FILENAME,
         TaskGCConfig,
@@ -984,14 +985,23 @@ def _maybe_auto_task_gc(store: MemoryStore) -> None:
         run_task_gc,
         should_run_task_gc,
     )
-    from .task_ledger import TASK_ROOT
 
-    state_file = os.path.join(str(TASK_ROOT), TASK_GC_STATE_FILENAME)
+    # The ledger of the profile this provider serves. The root computed at
+    # import time belongs, in a process serving several profiles, to
+    # whichever profile launched it — so use the host's hermes_home when the
+    # provider was given one.
+    task_root = (
+        _task_ledger._resolve_task_root(hermes_home)
+        if hermes_home
+        else _task_ledger.TASK_ROOT
+    )
+    state_file = os.path.join(str(task_root), TASK_GC_STATE_FILENAME)
     if not should_run_task_gc(state_file, cooldown_hours=_AUTO_TASK_GC_COOLDOWN_HOURS):
         return
 
     try:
         result = run_task_gc(
+            root=task_root,
             config=TaskGCConfig(
                 retention_days=_TASK_RETENTION_DAYS,
                 mode=_TASK_GC_MODE,
@@ -1228,6 +1238,7 @@ def _build_provider_class():
             self._prefetch_limit = prefetch_limit
             self._session_id: str = ""
             self._agent_context: str = "primary"
+            self._hermes_home: str | None = None
             # Stable per-conversation id. Unlike `_session_id` (which the host
             # rotates on every context compression) this only changes on a
             # genuine reset — so it cleanly scopes auto-anchors to one
@@ -1299,6 +1310,7 @@ def _build_provider_class():
             # not add turns, anchors or summaries to the user's memory.
             self._agent_context = str(kwargs.get("agent_context") or "primary").strip().lower()
             hermes_home = kwargs.get("hermes_home")
+            self._hermes_home = str(hermes_home) if hermes_home else None
             if hermes_home and not self._explicit_store:
                 # Same resolution as the CLI (`resolve_db_path`), so
                 # `hermes lancedb_pro …` always works on this database:
@@ -2168,7 +2180,7 @@ def _build_provider_class():
                 self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
             _maybe_auto_compact(self._store)
-            _maybe_auto_task_gc(self._store)
+            _maybe_auto_task_gc(self._store, self._hermes_home)
 
         def _maybe_write_reflection(self, texts: list[str]) -> None:
             """Generate a session reflection via the extractor's LLM and
@@ -2271,7 +2283,7 @@ def _build_provider_class():
                 self._reflection_cache.clear()
             _maybe_auto_purge(self._store)
             _maybe_auto_compact(self._store)
-            _maybe_auto_task_gc(self._store)
+            _maybe_auto_task_gc(self._store, self._hermes_home)
 
     return LanceDBProMemoryProvider
 

@@ -59,13 +59,21 @@ except ImportError:  # pragma: no cover
 # a `task` CLI subprocess spawned by the agent inherits them.
 
 
-def _resolve_task_root() -> Path:
+def _resolve_task_root(hermes_home: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve the task root (see the order above), as an absolute path.
+
+    *hermes_home* is the profile home the host passed to the provider; it
+    takes the place of ``$HERMES_HOME`` so a process serving several profiles
+    works on the right ledger. A relative root is made absolute: a pin stores
+    the ``state.json`` path, and the gateway reads it from another directory.
+    """
     task_root_env = os.environ.get("HERMES_TASK_ROOT", "").strip()
     if task_root_env:
-        return Path(task_root_env).expanduser()
-    hermes_home_env = os.environ.get("HERMES_HOME", "").strip()
-    if hermes_home_env:
-        return Path(hermes_home_env).expanduser() / "workspace" / "tasks"
+        return Path(task_root_env).expanduser().absolute()
+    home = str(hermes_home).strip() if hermes_home else ""
+    home = home or os.environ.get("HERMES_HOME", "").strip()
+    if home:
+        return Path(home).expanduser().absolute() / "workspace" / "tasks"
     return Path.home() / ".hermes" / "workspace" / "tasks"
 
 
@@ -133,6 +141,9 @@ def _state_path(task_id: str, root: Path | None = None) -> Path:
     return _task_dir(task_id, root) / "state.json"
 
 
+# Subdirectory of the task root holding garbage-collected (archived) ledgers.
+ARCHIVE_DIRNAME = "archive"
+
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -146,6 +157,10 @@ def _validate_task_id(task_id: str) -> str:
     """
     if not task_id or task_id in (".", "..") or not _TASK_ID_RE.match(task_id):
         raise ValueError(f"invalid task_id: {task_id!r}")
+    if task_id == ARCHIVE_DIRNAME:
+        # `<task root>/archive/` is where garbage collection keeps archived
+        # ledgers; a task of that name would be mistaken for it.
+        raise ValueError(f"invalid task_id: {task_id!r} is reserved")
     return task_id
 
 
@@ -155,6 +170,10 @@ class TaskStateError(RuntimeError):
     For example: waiting on a completed task, or ``unwait`` on a task that is
     neither ``waiting`` nor ``blocked``. The CLI reports it as *refused*.
     """
+
+
+class TaskCorruptError(TaskStateError):
+    """A task's ``state.json`` cannot be read as a JSON object."""
 
 
 # Statuses a task can be parked in until something outside the model clears it.
@@ -253,13 +272,20 @@ def state_view(state: dict[str, Any]) -> dict[str, Any]:
 def load_state(task_id: str, root: Path | None = None) -> dict[str, Any]:
     """Load and return task state.
 
-    Raises ``FileNotFoundError`` if the task does not exist and ``ValueError``
-    for an invalid *task_id*.
+    Raises ``FileNotFoundError`` if the task does not exist, ``ValueError``
+    for an invalid *task_id*, and ``TaskCorruptError`` when ``state.json``
+    is not a JSON object.
     """
     _validate_task_id(task_id)
     sp = _state_path(task_id, root)
     with sp.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            state = json.load(f)
+        except json.JSONDecodeError as e:
+            raise TaskCorruptError(f"task {task_id!r}: state.json is not valid JSON ({e})") from e
+    if not isinstance(state, dict):
+        raise TaskCorruptError(f"task {task_id!r}: state.json is not a JSON object")
+    return state
 
 
 LOCK_FILENAME = ".lock"
@@ -267,7 +293,11 @@ LOCK_FILENAME = ".lock"
 
 @contextmanager
 def task_lock(
-    task_id: str, root: Path | None = None, *, create: bool = False
+    task_id: str,
+    root: Path | None = None,
+    *,
+    create: bool = False,
+    blocking: bool = True,
 ) -> Iterator[None]:
     """Hold an exclusive ``fcntl.flock`` on ``<task dir>/.lock``.
 
@@ -280,7 +310,8 @@ def task_lock(
     The lock is per open file, so it is NOT re-entrant: do not call a
     locking function (``save_state``, ``advance_iteration``, ...) while
     holding it. Raises ``FileNotFoundError`` when the task directory does not
-    exist, unless *create* is true, so locking never creates a ledger.
+    exist, unless *create* is true, so locking never creates a ledger. With
+    ``blocking=False`` raises ``BlockingIOError`` when another holder has it.
     """
     _validate_task_id(task_id)
     task_dir = _task_dir(task_id, root)
@@ -291,14 +322,20 @@ def task_lock(
     fd = os.open(task_dir / LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         yield
     finally:
         os.close(fd)  # closing the descriptor releases the flock
 
 
 def _write_state(task_id: str, state: dict[str, Any], root: Path | None) -> None:
-    """Write ``state.json``; the caller holds ``task_lock``."""
+    """Write ``state.json``; the caller holds ``task_lock``.
+
+    Refuses when the task directory is gone (garbage-collected while the
+    caller waited for the lock): writing would recreate a partial ledger.
+    """
+    if not _task_dir(task_id, root).is_dir():
+        raise FileNotFoundError(f"Task {task_id!r} no longer exists")
     atomic_write_json(_state_path(task_id, root), state)
 
 
@@ -332,6 +369,10 @@ def advance_iteration(
     """
     with task_lock(task_id, root):
         state = load_state(task_id, root)
+        if state.get("status") in _DONE_STATUSES:
+            # Advancing would replace "Task complete." with "Run iteration
+            # N+1." and tell the model to carry on with a finished task.
+            raise TaskStateError(f"task {task_id!r} is complete; it cannot be advanced")
         current = int(state.get("current_iteration") or 0)
         state["current_iteration"] = current + 1
         if result == "pass":
@@ -369,8 +410,13 @@ def complete_task(
     """Mark task as complete and write a completion event."""
     with task_lock(task_id, root):
         state = load_state(task_id, root)
+        already_complete = state.get("status") in _DONE_STATUSES
         state["status"] = "complete"
-        state["completed_at"] = _now_iso()
+        # Completing twice keeps the first completion time: garbage
+        # collection measures retention from it.
+        if not (already_complete and state.get("completed_at")):
+            state["completed_at"] = _now_iso()
+        state["waiting_on"] = None  # a finished task waits on nothing
         state["next_action"] = "Task complete."
         if summary:
             state["recent_summary"] = summary
@@ -601,7 +647,11 @@ def list_tasks(root: Path | None = None) -> list[dict[str, Any]]:
         if sp.is_file():
             try:
                 with sp.open("r", encoding="utf-8") as f:
-                    tasks.append(json.load(f))
+                    state = json.load(f)
             except (json.JSONDecodeError, OSError):
-                pass
+                continue
+            if not isinstance(state, dict):
+                continue  # unreadable ledger: skip it, do not break the listing
+            state.setdefault("task_id", task_dir.name)
+            tasks.append(state)
     return tasks

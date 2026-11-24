@@ -26,7 +26,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .task_ledger import TASK_ROOT, _validate_task_id
+from .task_ledger import (
+    _DONE_STATUSES,
+    ARCHIVE_DIRNAME,
+    PARKED_STATUSES,
+    TASK_ROOT,
+    _validate_task_id,
+    task_lock,
+)
 
 __all__ = [
     "TASK_GC_LOG_FILENAME",
@@ -45,7 +52,7 @@ TASK_GC_LOG_FILENAME = ".task-gc-log.jsonl"
 
 # Subdirectory under the task root that holds archived tasks. The main scan
 # skips it; only the second stage ever hard-deletes from inside it.
-_ARCHIVE_DIRNAME = "archive"
+_ARCHIVE_DIRNAME = ARCHIVE_DIRNAME
 
 _DAY_MS = 24 * 60 * 60 * 1000
 
@@ -73,6 +80,7 @@ class TaskGCResult:
     held: list[str] = field(default_factory=list)
     skipped_running: int = 0
     skipped_recent: int = 0
+    skipped_busy: int = 0  # being written right now; retried next run
     skipped_unparseable: int = 0
     dry_run: bool = False
     errors: list[str] = field(default_factory=list)
@@ -177,7 +185,39 @@ def _log_action(base: Path, action: str, task_id: str) -> None:
 def _collect_task(
     task_dir: Path, base: Path, cfg: TaskGCConfig, task_id: str, result: TaskGCResult
 ) -> None:
-    """Archive or delete one completed, past-retention task directory."""
+    """Archive or delete one completed, past-retention task directory.
+
+    Runs under the task's lock, taken without waiting: a task someone is
+    writing right now is skipped until the next run. The state is re-read
+    under the lock, since it may have changed (un-held, re-opened) after the
+    unlocked scan decided to collect it.
+    """
+    try:
+        with task_lock(task_id, base, blocking=False):
+            fresh = _read_state(task_dir / "state.json")
+            if (
+                fresh is None
+                or fresh.get("gc_hold")
+                or fresh.get("status") not in _DONE_STATUSES
+            ):
+                result.skipped_recent += 1
+                return
+            _collect_locked(task_dir, base, cfg, task_id, result, state=fresh)
+    except BlockingIOError:
+        result.skipped_busy += 1
+    except OSError as e:
+        result.errors.append(f"{task_id}: {e}")
+
+
+def _collect_locked(
+    task_dir: Path,
+    base: Path,
+    cfg: TaskGCConfig,
+    task_id: str,
+    result: TaskGCResult,
+    *,
+    state: dict,
+) -> None:
     try:
         if cfg.mode == "delete":
             if not cfg.dry_run:
@@ -188,6 +228,15 @@ def _collect_task(
             if not cfg.dry_run:
                 archive_dir = base / _ARCHIVE_DIRNAME
                 archive_dir.mkdir(parents=True, exist_ok=True)
+                # Stamp the archive time: the grace period before the hard
+                # delete runs from here, not from when the task completed.
+                state["archived_at"] = datetime.now(UTC).astimezone().isoformat(
+                    timespec="seconds"
+                )
+                tmp = task_dir / "state.json.tmp"
+                tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8")
+                os.replace(tmp, task_dir / "state.json")
                 shutil.move(str(task_dir), str(_archive_dest(archive_dir, task_id)))
                 _log_action(base, "archived", task_id)
             result.archived.append(task_id)
@@ -216,14 +265,17 @@ def _gc_task(
         result.held.append(task_id)
         return
 
-    if state.get("status") != "complete":
-        # Running (or unknown) — never mutate; flag only if long-idle.
+    if state.get("status") not in _DONE_STATUSES:
+        # Running (or unknown) — never mutate; flag only if long-idle. A
+        # waiting or blocked task is parked on purpose, so it is not flagged.
         idle_ms = _epoch_ms(state.get("updated_at")) or _epoch_ms(
             state.get("created_at")
         )
-        if idle_ms is not None and (
-            now_ms - idle_ms
-        ) >= cfg.abandoned_running_days * _DAY_MS:
+        if (
+            state.get("status") not in PARKED_STATUSES
+            and idle_ms is not None
+            and (now_ms - idle_ms) >= cfg.abandoned_running_days * _DAY_MS
+        ):
             result.abandoned_running.append(task_id)
         result.skipped_running += 1
         return
@@ -253,9 +305,19 @@ def _purge_archive(
         if state.get("gc_hold"):
             result.held.append(arch.name)
             continue
-        comp_ms = _completion_ms(state)
-        if comp_ms is None or (now_ms - comp_ms) < purge_ms:
-            continue
+        # The grace period runs from when the ledger was archived. Archives
+        # made before `archived_at` existed fall back to completion time +
+        # retention, the earliest they could have been archived. Without
+        # this a long-completed task was archived and hard-deleted in the
+        # same run, and the audit trail the archive exists for was lost.
+        archived_ms = _epoch_ms(state.get("archived_at"))
+        if archived_ms is not None:
+            if (now_ms - archived_ms) < cfg.archive_grace_days * _DAY_MS:
+                continue
+        else:
+            comp_ms = _completion_ms(state)
+            if comp_ms is None or (now_ms - comp_ms) < purge_ms:
+                continue
         try:
             if not cfg.dry_run:
                 shutil.rmtree(arch)

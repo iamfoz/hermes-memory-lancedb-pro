@@ -17,6 +17,7 @@ skill under ``skills/``).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .task_ledger import TASK_ROOT, _validate_task_id
@@ -25,6 +26,14 @@ __all__ = ["list_skill_candidates", "scaffold_skill_from_task"]
 
 _LOG_EXCERPT_LIMIT = 4000
 _ARCHIVE_DIRNAME = "archive"
+
+
+def _skills_home() -> Path:
+    """``<hermes home>/skills`` — the profile's skill directory
+    (``$HERMES_HOME`` when set, else ``~/.hermes``)."""
+    home = os.environ.get("HERMES_HOME", "").strip()
+    base = Path(home).expanduser() if home else Path.home() / ".hermes"
+    return base / "skills"
 
 
 def _resolve_task_dir(task_id: str, root: Path | None = None) -> Path | None:
@@ -48,10 +57,11 @@ def _resolve_task_dir(task_id: str, root: Path | None = None) -> Path | None:
             if not sp.is_file():
                 continue
             try:
-                if json.loads(sp.read_text(encoding="utf-8")).get("task_id") == task_id:
-                    return d
+                archived = json.loads(sp.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
+            if isinstance(archived, dict) and archived.get("task_id") == task_id:
+                return d
     return None
 
 
@@ -67,6 +77,8 @@ def _count_results(task_dir: Path) -> tuple[int, int, int]:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
                     continue
                 total += 1
                 if rec.get("result") == "pass":
@@ -227,8 +239,10 @@ def scaffold_skill_from_task(
         state = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         raise FileNotFoundError(f"task {task_id!r}: unreadable state.json: {e}") from e
+    if not isinstance(state, dict):
+        raise FileNotFoundError(f"task {task_id!r}: state.json is not a JSON object")
 
-    dest = out_dir or (Path.home() / ".hermes" / "skills" / slug)
+    dest = out_dir or (_skills_home() / slug)
     if dest.exists() and any(dest.iterdir()) and not force:
         raise FileExistsError(
             f"{dest} already exists and is not empty — pass force=True to overwrite"

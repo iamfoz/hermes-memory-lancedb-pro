@@ -1530,7 +1530,7 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
         print("error: --max-wakes must be 0 or more", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
         state = _tl.create_task(
@@ -1557,7 +1557,7 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
 def _cmd_task_list(args: argparse.Namespace) -> int:
     """List all task ledgers."""
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     tasks = _tl.list_tasks(root)
     if getattr(args, "json", False):
         tasks = sorted((_tl.state_view(t) for t in tasks), key=lambda t: str(t.get("task_id")))
@@ -1574,7 +1574,7 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
         held = "  [held]" if t.get("gc_hold") else ""
         if t.get("reported"):
             status = f"{status}, reported"
-        print(f"  {t['task_id']:<40} [{status}]  iter {iter_str}{held}")
+        print(f"  {t.get('task_id', '?'):<40} [{status}]  iter {iter_str}{held}")
     return 0
 
 
@@ -1585,7 +1585,7 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     try:
         state = _tl.load_state(task_id, root)
         print(json.dumps(_tl.state_view(state), indent=2))
@@ -1602,16 +1602,18 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     try:
         state = _tl.load_state(task_id, root)
         print(_tl.build_control_block(state))
         results_path = _tl._task_dir(task_id, root) / "results.jsonl"
         if results_path.exists():
-            lines = results_path.read_text(encoding="utf-8").splitlines()
-            passed = sum(1 for ln in lines if json.loads(ln).get("result") == "pass")
-            failed = len(lines) - passed
-            print(f"Results so far: {len(lines)} (pass={passed}, fail={failed})")
+            # Tolerant of a blank or half-written line (a crash mid-append):
+            # resume must still print the control block and a count.
+            from .task_skill import _count_results
+
+            total, passed, failed = _count_results(_tl._task_dir(task_id, root))
+            print(f"Results so far: {total} (pass={passed}, fail={failed})")
         return 0
     except FileNotFoundError:
         print(f"error: task {task_id!r} not found", file=sys.stderr)
@@ -1625,7 +1627,7 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     summary = getattr(args, "summary", "") or ""
     quiet = bool(getattr(args, "quiet", False))
     try:
@@ -1650,7 +1652,7 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
         state = _tl.load_state(task_id, root)
@@ -1659,7 +1661,8 @@ def _cmd_task_pin(args: argparse.Namespace) -> int:
         return EXIT_NOT_FOUND
 
     control_block = _tl.build_control_block(state)
-    state_path = str(_tl._state_path(task_id, root))
+    # Absolute: the gateway that refreshes the pin runs in another directory.
+    state_path = os.path.abspath(_tl._state_path(task_id, root))
     store = _open_store(args)
     # Re-pinning replaces the earlier pin: duplicates would each be injected
     # into the system prompt.
@@ -1723,7 +1726,7 @@ def _cmd_task_advance(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     result = getattr(args, "result", "pass") or "pass"
     next_action = getattr(args, "next_action", None) or None
     summary = getattr(args, "summary", None) or None
@@ -1753,7 +1756,7 @@ def _cmd_task_gc(args: argparse.Namespace) -> int:
     from . import task_gc as _tgc
 
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
 
@@ -1806,6 +1809,8 @@ def _cmd_task_gc(args: argparse.Namespace) -> int:
                   f"{', '.join(result.abandoned_running)}")
         print(f"  Skipped — still running: {result.skipped_running}")
         print(f"  Skipped — too recent:    {result.skipped_recent}")
+        if result.skipped_busy:
+            print(f"  Skipped — in use:        {result.skipped_busy}")
         if result.skipped_unparseable:
             print(f"  Skipped — unreadable:    {result.skipped_unparseable}")
         for err in result.errors:
@@ -1832,7 +1837,7 @@ def _cmd_task_hold(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     hold = getattr(args, "task_command", "hold") != "unhold"
     try:
@@ -1855,7 +1860,7 @@ def _cmd_task_park(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     verb = getattr(args, "task_command", None)
     try:
@@ -1891,7 +1896,7 @@ def _cmd_task_wake(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
         state = _tl.wake_task(task_id, root=root)
@@ -1913,7 +1918,7 @@ def _cmd_task_reported(args: argparse.Namespace) -> int:
         print("error: task_id is required", file=sys.stderr)
         return EXIT_USAGE
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     try:
         _tl.mark_reported(task_id, root=root)
@@ -1934,7 +1939,7 @@ def _cmd_task_to_skill(args: argparse.Namespace) -> int:
 
     task_id = getattr(args, "task_id", None)
     root_str = getattr(args, "task_root", None)
-    root = Path(root_str).expanduser() if root_str else None
+    root = Path(root_str).expanduser().absolute() if root_str else None
     quiet = bool(getattr(args, "quiet", False))
     search = getattr(args, "search", None)
     list_mode = bool(getattr(args, "list", False)) or search is not None or not task_id
