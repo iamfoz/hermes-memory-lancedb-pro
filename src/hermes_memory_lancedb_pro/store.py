@@ -14,6 +14,7 @@ Schema:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -61,6 +62,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+def _serialised(method):
+    """Run a MemoryStore method under the store's write lock."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._write_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
 
 def resolve_db_path(explicit: str | None = None, hermes_home: str | None = None) -> str:
     """The memory database directory, resolved the same way everywhere.
@@ -394,6 +406,14 @@ class MemoryStore:
         self.embedding_model_name = embedding_model
         self._embedder: SentenceTransformer | None = None
         self._embedder_lock = threading.Lock()
+        # Serialises read-modify-write sequences on a row's metadata (update,
+        # supersede, access counting, forget). Without it concurrent callers
+        # — the provider's prefetch, sync and extraction threads share one
+        # store — lost counter updates, un-archived superseded rows, and
+        # produced several live versions of one memory. Re-entrant because
+        # these methods call each other. Always taken BEFORE the embedder
+        # locks, never after.
+        self._write_lock = threading.RLock()
         # Serialises every embedder call (encode, warmup, model load). torch's
         # MPS backend is not thread-safe, so concurrent encodes abort in Metal.
         # Shared by all stores in the process — see _ENCODE_LOCK.
@@ -924,6 +944,7 @@ class MemoryStore:
             if not _hidden_from_recall(r.get("metadata", ""), now_ms)
         ][:limit]
 
+    @_serialised
     def update(
         self,
         mem_id: str,
@@ -949,6 +970,17 @@ class MemoryStore:
         used the result as a boolean (`if store.update(...)`) keep working.
         Callers chaining the result (e.g. `new_id = store.update(id, text=...)`)
         now get the actual new ID."""
+        if text is not None:
+            # Same guards as store(): validate BEFORE the old row is archived,
+            # so a bad replacement can never destroy the existing memory.
+            if not str(text).strip():
+                raise ValueError("MemoryStore.update: `text` must be non-empty")
+            if len(text) > MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"MemoryStore.update: `text` is {len(text)} chars, exceeding the "
+                    f"{MAX_TEXT_CHARS}-char limit (MEMORY_MAX_TEXT_CHARS)."
+                )
+
         existing = self.get_by_id(mem_id)
         if existing is None:
             return None
@@ -1089,15 +1121,39 @@ class MemoryStore:
         )
         return new_id
 
-    def forget(self, mem_id: str) -> bool:
-        """Hard-delete a memory by ID. Returns True if the memory existed."""
+    @_serialised
+    def forget(self, mem_id: str, *, purge_history: bool = False) -> bool:
+        """Hard-delete a memory by ID. Returns True if the memory existed.
+
+        By default only the live version is deleted; earlier versions it
+        superseded stay archived until the archive purge removes them (the
+        compactor relies on this). Pass ``purge_history=True`` when a user
+        asks for a memory to be removed: it also deletes every earlier
+        wording, so none of them stays on disk or in an export."""
         existing = self.get_by_id(mem_id)
         if existing is None:
             return False
-        # get_by_id follows the supersede chain; use the resolved live ID so
-        # we delete the actual live row rather than an already-archived predecessor.
-        effective_id = existing["id"]
-        self._table.delete(f"id = '{_escape_sql(effective_id)}'")
+        if not purge_history:
+            # get_by_id follows the supersede chain; delete the resolved live
+            # row rather than an already-archived predecessor.
+            self._table.delete(f"id = '{_escape_sql(existing['id'])}'")
+            return True
+        # get_by_id follows the supersede chain forward to the live row;
+        # walk `supersedes` back from there to collect the whole lineage.
+        lineage: list[str] = [existing["id"]]
+        seen: set[str] = {existing["id"]}
+        row: dict[str, Any] | None = existing
+        while row is not None and len(lineage) < 1000:
+            prev_id = (row.get("metadata") or {}).get("supersedes")
+            if not prev_id or prev_id in seen:
+                break
+            seen.add(prev_id)
+            lineage.append(prev_id)
+            row = self.get_by_id(prev_id, follow_chain=False)
+        if mem_id not in seen:
+            lineage.append(mem_id)
+        id_list = ", ".join(f"'{_escape_sql(i)}'" for i in lineage)
+        self._table.delete(f"id IN ({id_list})")
         return True
 
     def delete(self, mem_id: str) -> bool:
@@ -1108,6 +1164,7 @@ class MemoryStore:
         live row, following the supersede chain to the current version."""
         return self.forget(mem_id)
 
+    @_serialised
     def increment_access_count(
         self,
         mem_id: str,
@@ -1156,6 +1213,7 @@ class MemoryStore:
         )
         return True
 
+    @_serialised
     def mark_recall_used(
         self,
         mem_ids: Sequence[str],
