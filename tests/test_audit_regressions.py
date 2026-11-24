@@ -1000,3 +1000,51 @@ def test_overlapping_compaction_passes_do_not_duplicate(store):
         mc._run_compaction_locked = real
     assert second.memories_created == 0 and results[0].memories_created == 1
     assert len(store.list_memories(limit=20)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retrieval: tier demotion, tier-evaluation coverage, entity boost
+# ---------------------------------------------------------------------------
+
+
+def test_a_stale_core_memory_can_be_demoted():
+    import time
+
+    from hermes_memory_lancedb_pro.decay import evaluate_all_tiers
+
+    ten_years_ms = 10 * 365 * 86_400_000
+    old = int(time.time() * 1000) - ten_years_ms
+    mem = {"id": "m", "text": "ancient", "importance": 0.1, "timestamp": old,
+           "metadata": {"tier": "core", "access_count": 0, "created_at": old,
+                        "last_accessed_at": old}}
+    assert evaluate_all_tiers([mem]).get("m") in ("working", "peripheral")
+
+
+def test_tier_evaluation_walks_the_whole_table(store, monkeypatch):
+    from hermes_memory_lancedb_pro import retriever as retriever_module
+
+    monkeypatch.setattr(retriever_module, "TIER_EVAL_BATCH", 10)
+    monkeypatch.setattr(retriever_module, "TIER_EVAL_FREQUENCY", 1)
+    seen: list[str] = []
+    monkeypatch.setattr(retriever_module, "evaluate_all_tiers",
+                        lambda mems: seen.extend(m["id"] for m in mems) or {})
+    ids = [store.store(text=f"row {i}", category="fact") for i in range(25)]
+    r = retriever_module.MemoryRetriever(store)
+    for _ in range(3):
+        r._lifecycle_call_count += 1
+        r._run_recall_lifecycle([])
+    assert set(seen) == set(ids)  # three batches of 10 cover all 25 rows
+    r._lifecycle_call_count += 1
+    r._run_recall_lifecycle([])
+    assert seen[-10:] == seen[:10]  # then it starts over
+
+
+def test_entity_boost_matches_whole_words_only():
+    from hermes_memory_lancedb_pro.retriever import MemoryRetriever
+
+    r = MemoryRetriever.__new__(MemoryRetriever)
+    entry = {"id": "a", "_fusion_score": 1.0, "metadata": {"entities": ["Go", "Al", "R"]}}
+    r._apply_entity_boost("how do I get good rest after a long day", [entry])
+    assert entry["_fusion_score"] == 1.0 and "_entity_matches" not in entry
+    r._apply_entity_boost("is Go faster than R?", [entry])
+    assert entry["_entity_matches"] == 2

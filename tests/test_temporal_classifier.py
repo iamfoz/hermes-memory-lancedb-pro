@@ -160,14 +160,14 @@ def test_word_boundary_no_false_positive_later() -> None:
 @pytest.mark.parametrize(
     "text, expected_offset_ms",
     [
-        ("Let's meet tomorrow", 24 * _MS_PER_HOUR),
-        ("day after tomorrow is free", 48 * _MS_PER_HOUR),
-        ("next week we'll finish", 7 * _MS_PER_DAY),
-        ("this week is busy", 3 * _MS_PER_DAY),
-        ("next month we'll launch", 30 * _MS_PER_DAY),
-        ("this month is packed", 15 * _MS_PER_DAY),
-        ("let's do it tonight", 12 * _MS_PER_HOUR),
-        ("we spoke today", 18 * _MS_PER_HOUR),
+        ("Let's meet tomorrow", 48 * _MS_PER_HOUR),
+        ("day after tomorrow is free", 72 * _MS_PER_HOUR),
+        ("next week we'll finish", 14 * _MS_PER_DAY),
+        ("this week is busy", 7 * _MS_PER_DAY),
+        ("next month we'll launch", 62 * _MS_PER_DAY),
+        ("this month is packed", 31 * _MS_PER_DAY),
+        ("let's do it tonight", 24 * _MS_PER_HOUR),
+        ("we spoke today", 24 * _MS_PER_HOUR),
     ],
 )
 def test_infer_expiry_en(text: str, expected_offset_ms: int) -> None:
@@ -183,14 +183,14 @@ def test_infer_expiry_en(text: str, expected_offset_ms: int) -> None:
 @pytest.mark.parametrize(
     "text, expected_offset_ms",
     [
-        ("明天见", 24 * _MS_PER_HOUR),
-        ("后天有空", 48 * _MS_PER_HOUR),
-        ("下周开会", 7 * _MS_PER_DAY),
-        ("这周很忙", 3 * _MS_PER_DAY),
-        ("下个月发布", 30 * _MS_PER_DAY),
-        ("这个月计划多", 15 * _MS_PER_DAY),
-        ("今晚有活动", 12 * _MS_PER_HOUR),
-        ("今天开心", 18 * _MS_PER_HOUR),
+        ("明天见", 48 * _MS_PER_HOUR),
+        ("后天有空", 72 * _MS_PER_HOUR),
+        ("下周开会", 14 * _MS_PER_DAY),
+        ("这周很忙", 7 * _MS_PER_DAY),
+        ("下个月发布", 62 * _MS_PER_DAY),
+        ("这个月计划多", 31 * _MS_PER_DAY),
+        ("今晚有活动", 24 * _MS_PER_HOUR),
+        ("今天开心", 24 * _MS_PER_HOUR),
     ],
 )
 def test_infer_expiry_zh(text: str, expected_offset_ms: int) -> None:
@@ -220,11 +220,11 @@ def test_infer_expiry_uses_provided_now_ms() -> None:
     """Offset must be added to provided now_ms, not the real clock."""
     custom_now = 1_600_000_000_000
     result = infer_expiry("tomorrow", now_ms=custom_now)
-    assert result == custom_now + 24 * _MS_PER_HOUR
+    assert result == custom_now + 48 * _MS_PER_HOUR
 
 
 def test_infer_expiry_different_now_ms_values() -> None:
-    offset = 7 * _MS_PER_DAY
+    offset = 14 * _MS_PER_DAY
     for base in (0, 1_000_000, 1_700_000_000_000, 9_999_999_999_999):
         assert infer_expiry("next week", now_ms=base) == base + offset
 
@@ -237,13 +237,13 @@ def test_infer_expiry_different_now_ms_values() -> None:
 def test_day_after_tomorrow_beats_tomorrow_rule() -> None:
     """'day after tomorrow' must match the 48h rule, not fall through to 24h."""
     result = infer_expiry("day after tomorrow", now_ms=NOW_MS)
-    assert result == NOW_MS + 48 * _MS_PER_HOUR
+    assert result == NOW_MS + 72 * _MS_PER_HOUR
 
 
 def test_zh_day_after_tomorrow_beats_tomorrow_rule() -> None:
     result = infer_expiry("后天明天", now_ms=NOW_MS)
     # 后天 appears first in rules (48h), so that should win
-    assert result == NOW_MS + 48 * _MS_PER_HOUR
+    assert result == NOW_MS + 72 * _MS_PER_HOUR
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +346,10 @@ def test_strong_signal_beats_habitual_marker() -> None:
         ("3天后出发", 3 * _MS_PER_DAY),
         ("2周后复查", 14 * _MS_PER_DAY),
         ("5小时后开会", 5 * _MS_PER_HOUR),
-        ("The review is next Friday", 7 * _MS_PER_DAY),
+        ("The review is next Friday", 8 * _MS_PER_DAY),
         ("We're hiking this weekend", 7 * _MS_PER_DAY),
         ("这个周末去爬山", 7 * _MS_PER_DAY),
-        ("Call me back this afternoon", 18 * _MS_PER_HOUR),
+        ("Call me back this afternoon", 24 * _MS_PER_HOUR),
     ],
 )
 def test_expanded_expiry(text: str, expected_offset_ms: int) -> None:
@@ -357,10 +357,27 @@ def test_expanded_expiry(text: str, expected_offset_ms: int) -> None:
 
 
 def test_fixed_rule_takes_precedence_over_variable() -> None:
-    assert infer_expiry("Tomorrow, then again in 5 days", now_ms=NOW_MS) == NOW_MS + 24 * _MS_PER_HOUR
+    assert infer_expiry("Tomorrow, then again in 5 days", now_ms=NOW_MS) == NOW_MS + 48 * _MS_PER_HOUR
 
 
 def test_british_spelling_is_static_keyword() -> None:
     from hermes_memory_lancedb_pro import temporal_classifier as tc
 
     assert any(p.search("My favourite colour") for p in tc._STATIC_PATTERNS_EN)
+
+
+@pytest.mark.parametrize(
+    ("text", "hours_until_event"),
+    [
+        ("Dentist tomorrow at 3pm", 29),          # written 10am, event 3pm next day
+        ("Team offsite next week", 9 * 24),       # written Monday, event Wednesday week
+        ("Visa appointment next month", 39 * 24),  # written on the 1st, event the 10th
+        ("Standup this afternoon", 8),
+        ("Release is this week", 4 * 24),
+    ],
+)
+def test_expiry_never_precedes_the_event(text: str, hours_until_event: int) -> None:
+    """The offset must cover the end of the referenced period."""
+    expiry = infer_expiry(text, now_ms=NOW_MS)
+    assert expiry is not None
+    assert expiry >= NOW_MS + hours_until_event * _MS_PER_HOUR

@@ -144,8 +144,9 @@ _STATIC_KEYWORDS_ZH: list[str] = [
 # ---------------------------------------------------------------------------
 # Expiry rules: ordered list of (patterns, offset_ms) pairs.
 # Order matters — more specific patterns (day after tomorrow) must come
-# before more general ones (tomorrow) to match correctly. Offsets round UP:
-# expiring an event late is harmless, expiring it early loses it.
+# before more general ones (tomorrow) to match correctly. Offsets round UP
+# to the end of the referenced period: expiring an event late is harmless,
+# expiring it early loses it.
 # ---------------------------------------------------------------------------
 
 _MS_PER_HOUR = 60 * 60 * 1000
@@ -153,59 +154,65 @@ _MS_PER_DAY = 24 * _MS_PER_HOUR
 _MS_PER_MINUTE = 60 * 1000
 
 _EXPIRY_RULES: list[tuple[list[re.Pattern[str]], int]] = [
-    # 后天 / day after tomorrow → +48h
+    # Each offset is the LATEST moment the phrase can refer to, measured
+    # from when it was written — the end of the referenced day, week or
+    # month — so an event is never hidden before it has happened. (They
+    # used to be the START of the period: "next week" expired in 7 days,
+    # before most of next week; "tomorrow at 3pm" written at 10am expired
+    # at 10am tomorrow.)
+    # 后天 / day after tomorrow → end of that day is at most +72h
     (
         [re.compile(r"后天"), re.compile(r"day after tomorrow", re.IGNORECASE)],
-        48 * _MS_PER_HOUR,
+        72 * _MS_PER_HOUR,
     ),
-    # 明天 / tomorrow → +24h
+    # 明天 / tomorrow → end of tomorrow is at most +48h
     (
         [re.compile(r"明天"), re.compile(r"\btomorrow\b", re.IGNORECASE)],
-        24 * _MS_PER_HOUR,
+        48 * _MS_PER_HOUR,
     ),
-    # next <day> → +7d (the latest that day can be)
+    # next <day> → that day ends at most +8d out
     (
         [re.compile(rf"\bnext (?:{_DAYS})\b", re.IGNORECASE)],
-        7 * _MS_PER_DAY,
+        8 * _MS_PER_DAY,
     ),
-    # 下周 / next week → +7d
+    # 下周 / next week → next week ends at most +14d out
     (
         [re.compile(r"下周"), re.compile(r"\bnext week\b", re.IGNORECASE)],
-        7 * _MS_PER_DAY,
+        14 * _MS_PER_DAY,
     ),
-    # 这个周末 / this weekend → +7d (said on a Monday, Sunday is 6 days out)
+    # 这个周末 / this weekend → +7d (said on a Monday, Sunday ends 7 days out)
     (
         [re.compile(r"这个周末"), re.compile(r"\bthis weekend\b", re.IGNORECASE)],
         7 * _MS_PER_DAY,
     ),
-    # 这周 / this week → +3d
+    # 这周 / this week → the week ends at most +7d out
     (
         [re.compile(r"这周"), re.compile(r"\bthis week\b", re.IGNORECASE)],
-        3 * _MS_PER_DAY,
+        7 * _MS_PER_DAY,
     ),
-    # 下个月 / next month → +30d
+    # 下个月 / next month → next month ends at most +62d out
     (
         [re.compile(r"下个月"), re.compile(r"\bnext month\b", re.IGNORECASE)],
-        30 * _MS_PER_DAY,
+        62 * _MS_PER_DAY,
     ),
-    # 这个月 / this month → +15d
+    # 这个月 / this month → the month ends at most +31d out
     (
         [re.compile(r"这个月"), re.compile(r"\bthis month\b", re.IGNORECASE)],
-        15 * _MS_PER_DAY,
+        31 * _MS_PER_DAY,
     ),
-    # 今晚 / tonight → +12h
+    # 今晚 / tonight → the night is over within +24h
     (
         [re.compile(r"今晚"), re.compile(r"\btonight\b", re.IGNORECASE)],
-        12 * _MS_PER_HOUR,
+        24 * _MS_PER_HOUR,
     ),
-    # 今天 / today / this afternoon / this evening → +18h
+    # 今天 / today / this afternoon / this evening → the day ends within +24h
     (
         [
             re.compile(r"今天"),
             re.compile(r"\btoday\b", re.IGNORECASE),
             re.compile(r"\bthis (?:afternoon|evening)\b", re.IGNORECASE),
         ],
-        18 * _MS_PER_HOUR,
+        24 * _MS_PER_HOUR,
     ),
 ]
 

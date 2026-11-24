@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -104,6 +105,7 @@ class MemoryRetriever:
         self.store = store
         self.scoring = ScoringPipeline()
         self._lifecycle_call_count = 0
+        self._tier_eval_offset = 0
 
         # -----------------------------------------------------------------
         # Read API keys HERE, not at module level.
@@ -334,9 +336,15 @@ class MemoryRetriever:
             stored_entities = meta.get("entities")
             if not isinstance(stored_entities, list):
                 continue
+            # Whole-word match: as a bare substring, a short entity such as
+            # "Go" or "AI" matched inside "good" or "maximum" and boosted
+            # unrelated memories.
             matches = sum(
                 1 for e in stored_entities
-                if isinstance(e, str) and e.strip().lower() in query_lower
+                if isinstance(e, str) and e.strip()
+                and re.search(
+                    r"(?<!\w)" + re.escape(e.strip().lower()) + r"(?!\w)", query_lower
+                )
             )
             if matches:
                 factor = 1.0 + 0.2 * min(matches, 3)
@@ -448,10 +456,19 @@ class MemoryRetriever:
             return
 
         try:
-            all_memories = self.store.list_memories(limit=TIER_EVAL_BATCH)
+            # Walk the table one batch per evaluation. Always reading the
+            # first batch re-evaluated the same oldest rows and never
+            # promoted or demoted anything newer.
+            all_memories = self.store.list_memories(
+                limit=TIER_EVAL_BATCH, offset=self._tier_eval_offset
+            )
         except Exception as e:
             logger.warning("Tier eval list_memories failed: %s", e)
             return
+        if len(all_memories) < TIER_EVAL_BATCH:
+            self._tier_eval_offset = 0  # reached the end: start over next time
+        else:
+            self._tier_eval_offset += TIER_EVAL_BATCH
 
         try:
             tier_changes = evaluate_all_tiers(all_memories)
@@ -797,8 +814,8 @@ class MemoryRetriever:
         Blend reranker scores into ``_final_score`` and re-sort.
 
         ``score_map`` maps candidate-list index → normalised relevance score.
-        Candidates without a score entry are penalised.  The tail of
-        ``results`` beyond ``candidate_count`` is preserved unchanged.
+        Candidates without a score entry are penalised, and so is the tail
+        of ``results`` beyond ``candidate_count``.
         """
         for i, entry in enumerate(candidates):
             existing = float(entry.get("_final_score", 0.0))
@@ -812,6 +829,12 @@ class MemoryRetriever:
 
         candidates.sort(key=lambda e: e.get("_final_score", 0.0), reverse=True)
         results[:candidate_count] = candidates
+        # Results the reranker never saw get the same penalty as candidates
+        # it left unscored. Left at their full score, the later re-sort put
+        # them above everything the reranker had just ordered.
+        for entry in results[candidate_count:]:
+            entry["_final_score"] = 0.3 * float(entry.get("_final_score", 0.0))
+            entry["_rerank_score"] = 0.0
         return results
 
 

@@ -12,6 +12,7 @@ Ported from CortexReach memory-lancedb-pro architecture:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -424,6 +425,8 @@ def evaluate_all_tiers(
     if tier_config is None:
         tier_config = TierConfig()
 
+    tier_decay_config = dataclasses.replace(decay_config, apply_tier_floor=False)
+
     changed: dict[str, str] = {}
     for mem in memories:
         metadata = _coerce_metadata(mem.get("metadata", {}))
@@ -431,7 +434,11 @@ def evaluate_all_tiers(
         if metadata.get("state") == "archived":
             continue
 
-        decay = compute_decay_score(mem, now_ms=now_ms, config=decay_config)
+        # Tier decisions use the UNFLOORED score. The tier floor exists for
+        # ranking; with it applied a core memory scored at least 0.45 and
+        # could never fall below the 0.2 demotion threshold, so demotion
+        # never happened and stale core rows surfaced in every session.
+        decay = compute_decay_score(mem, now_ms=now_ms, config=tier_decay_config)
         new_tier = evaluate_tier(mem, decay, config=tier_config, now_ms=now_ms)
         current_tier = metadata.get("tier", TIER_WORKING)
 

@@ -175,13 +175,16 @@ class TestApplyRerankScores:
         assert scored["_final_score"] > unscored["_final_score"]
         assert unscored["_rerank_score"] == 0.0
 
-    def test_tail_preserved_unchanged(self):
+    def test_tail_is_penalised_like_unscored_candidates(self):
+        # A row the reranker never saw must not keep its full score: the
+        # later re-sort would put it above everything the reranker ordered.
         c = self._candidates(2)
         tail = {"id": "tail", "text": "tail", "_final_score": 0.99}
         results = list(c) + [tail]
         out = MemoryRetriever._apply_rerank_scores(c, results, 2, {0: 0.5, 1: 0.8})
         assert out[-1]["id"] == "tail"
-        assert out[-1]["_final_score"] == 0.99
+        assert out[-1]["_final_score"] == pytest.approx(0.3 * 0.99)
+        assert out[-1]["_final_score"] < min(e["_final_score"] for e in out[:2])
 
     def test_blend_weights_70_30(self):
         c = [{"id": "0", "text": "x", "_final_score": 1.0}]
