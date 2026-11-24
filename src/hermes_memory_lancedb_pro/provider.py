@@ -49,6 +49,7 @@ from .memory_compactor import (
     should_run_compaction,
 )
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
+from .store import MAX_TEXT_CHARS as _STORE_MAX_TEXT_CHARS
 from .store import MemoryStore, resolve_db_path
 from .task_ledger import build_control_block as _build_task_control_block
 
@@ -2252,9 +2253,12 @@ def _build_provider_class():
             # message larger than the budget is preserved intact. Cap the
             # stored summary at 2x the budget so a degenerate session
             # can't write an unbounded blob.
-            hard_cap = _SESSION_SUMMARY_MAX_CHARS * 2
+            # Never exceed the store's text limit: store() rejects longer
+            # text and the whole summary was then silently dropped.
+            marker = "\n[...truncated]"
+            hard_cap = min(_SESSION_SUMMARY_MAX_CHARS * 2, _STORE_MAX_TEXT_CHARS - len(marker))
             if len(summary) > hard_cap:
-                summary = summary[:hard_cap] + "\n[...truncated]"
+                summary = summary[:hard_cap] + marker
             self._store.store(
                 text=summary,
                 category="other",

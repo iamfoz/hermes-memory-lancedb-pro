@@ -769,3 +769,94 @@ def test_doctor_reports_an_unreadable_store(store, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Store is unreadable" in out and "export --salvage" in out
     assert "No anomalies detected" not in out
+
+
+# ---------------------------------------------------------------------------
+# Compaction must not merge what a text merge would break
+# ---------------------------------------------------------------------------
+
+
+def _compact(store, **kw):
+    from hermes_memory_lancedb_pro.memory_compactor import CompactionConfig, run_compaction
+
+    cfg = CompactionConfig(min_age_days=0, similarity_threshold=-1.0, min_cluster_size=2)
+    return run_compaction(store, cfg, **kw)
+
+
+def test_compaction_leaves_task_pins_expiring_and_typed_rows_alone(store):
+    import time
+
+    past = int(time.time() * 1000) - 5 * 86_400_000
+    keep = [
+        store.store(text="pin one", category="active_task", scope="agent",
+                    metadata_extra={"task_id": "t1", "state_path": "/x/state.json"}),
+        store.store(text="pin two", category="active_task", scope="agent",
+                    metadata_extra={"task_id": "t2", "state_path": "/y/state.json"}),
+        store.store(text="dentist tomorrow at 3pm", category="fact", scope="agent",
+                    metadata_extra={"valid_until": past}),
+        store.store(text="session summary text", category="fact", scope="agent",
+                    metadata_extra={"metadata_type": "session-summary"}),
+    ]
+    a = store.store(text="likes tea", category="preference", scope="agent")
+    b = store.store(text="drinks tea daily", category="preference", scope="agent")
+    result = _compact(store)
+    assert result.memories_created == 1 and result.memories_deleted == 2
+    assert all(store.row_exists(i) for i in keep)
+    assert not store.row_exists(a) and not store.row_exists(b)
+    # Nothing expired came back to life.
+    merged = [r for r in store.list_memories(limit=50) if r["metadata"].get("compacted")]
+    assert len(merged) == 1 and "dentist" not in merged[0]["text"]
+
+
+def test_compaction_never_merges_across_scopes_or_sessions(store):
+    rows = [
+        store.store(text="user prefers tea", category="preference", scope="user"),
+        store.store(text="agent note: tea", category="preference", scope="agent"),
+        store.store(text="session A tea", category="preference", scope="agent",
+                    metadata_extra={"source_session": "A"}),
+        store.store(text="session B tea", category="preference", scope="agent",
+                    metadata_extra={"source_session": "B"}),
+    ]
+    result = _compact(store)
+    assert result.clusters_found == 0
+    assert all(store.row_exists(i) for i in rows)
+
+
+def test_compaction_keeps_the_shared_session_and_sums_counters(store):
+    for i in range(2):
+        mem = store.store(text=f"deploy note {i}", category="fact", scope="agent",
+                          metadata_extra={"source_session": "S"})
+        store.increment_access_count(mem, force=True)
+    _compact(store)
+    merged = [r for r in store.list_memories(limit=50) if r["metadata"].get("compacted")]
+    assert len(merged) == 1
+    assert merged[0]["metadata"]["source_session"] == "S"
+    assert merged[0]["metadata"]["access_count"] == 2
+    assert store.list_memories(limit=50, session_id="S") != []
+
+
+def test_clusters_never_exceed_the_text_limit():
+    from hermes_memory_lancedb_pro.memory_compactor import CompactionEntry, build_clusters
+
+    vec = [1.0] + [0.0] * 7
+    entries = [CompactionEntry(id=str(i), text="x" * 3500, vector=vec, category="fact",
+                               scope="agent", importance=0.5, timestamp=1, metadata="{}")
+               for i in range(3)]
+    plans = build_clusters(entries, 0.9, 2, max_merged_chars=8000)
+    assert [len(p.member_indices) for p in plans] == [2]
+    unbounded = build_clusters(entries, 0.9, 2)
+    assert [len(p.member_indices) for p in unbounded] == [3]
+
+
+def test_session_summary_is_capped_to_the_store_limit(mem_provider, store, monkeypatch):
+    from hermes_memory_lancedb_pro import provider
+    from hermes_memory_lancedb_pro import store as store_module
+
+    monkeypatch.setattr(provider, "_SESSION_SUMMARY_MAX_CHARS", 4000)
+    messages = [{"role": "user", "content": "hello there, please look at this"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "y" * 9500}]
+    mem_provider._write_session_summary(messages)
+    rows = [r for r in store.list_memories(limit=20)
+            if r["metadata"].get("metadata_type") == "session-summary"]
+    assert len(rows) == 1 and len(rows[0]["text"]) <= store_module.MAX_TEXT_CHARS

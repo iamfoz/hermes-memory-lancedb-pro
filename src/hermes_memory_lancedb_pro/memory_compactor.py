@@ -107,6 +107,7 @@ def build_clusters(
     entries: Sequence[CompactionEntry],
     threshold: float,
     min_cluster_size: int,
+    max_merged_chars: int | None = None,
 ) -> list[ClusterPlan]:
     """Greedy cluster expansion seeded by importance descending.
 
@@ -131,6 +132,10 @@ def build_clusters(
 
         cluster = [seed_idx]
         assigned[seed_idx] = True
+        # Upper bound on the merged text (member texts joined by newlines).
+        # A cluster that would not fit the store's text limit could never be
+        # written and was rediscovered, and failed, on every run.
+        merged_chars = len(entries[seed_idx].text)
 
         for j in range(n):
             if assigned[j]:
@@ -139,6 +144,10 @@ def build_clusters(
             if not other_vec:
                 continue
             if cosine_similarity(seed_vec, other_vec) >= threshold:
+                extra = len(entries[j].text) + 1
+                if max_merged_chars is not None and merged_chars + extra > max_merged_chars:
+                    continue  # left unassigned: it may seed or join another cluster
+                merged_chars += extra
                 cluster.append(j)
                 assigned[j] = True
 
@@ -179,6 +188,21 @@ def _merge_cluster_provenance(
         if meta.get("cross_session"):
             any_cross_session = True
     return best_tier, any_cross_session
+
+
+def _member_meta(member: CompactionEntry) -> dict:
+    try:
+        meta = json.loads(member.metadata) if isinstance(member.metadata, str) else member.metadata
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_merged_entry(members: Sequence[CompactionEntry]) -> ClusterMerged:
@@ -222,14 +246,26 @@ def build_merged_entry(members: Sequence[CompactionEntry]) -> ClusterMerged:
             category = top.category
 
     best_tier, any_cross_session = _merge_cluster_provenance(members)
-    metadata = json.dumps({
+    merged_meta: dict[str, object] = {
         "compacted": True,
         "source_count": len(members),
         "compacted_at": int(time.time() * 1000),
         "tier": best_tier,
         "cross_session": any_cross_session,
         "source": "compactor",
-    })
+    }
+    # Members are grouped by session before clustering, so they share one
+    # source_session. Keep it: a merged row with none is hidden from every
+    # session-filtered recall. Usage counters carry over as totals.
+    metas = [_member_meta(m) for m in members]
+    sessions = {str(meta.get("source_session") or "") for meta in metas}
+    if len(sessions) == 1 and "" not in sessions:
+        merged_meta["source_session"] = sessions.pop()
+    for counter in ("access_count", "bad_recall_count"):
+        total = sum(_as_int(meta.get(counter)) for meta in metas)
+        if total:
+            merged_meta[counter] = total
+    metadata = json.dumps(merged_meta)
 
     return ClusterMerged(
         text=text,
@@ -267,7 +303,28 @@ def run_compaction(
     if not valid:
         return CompactionResult(scanned=0, clusters_found=0, dry_run=cfg.dry_run)
 
-    plans = build_clusters(valid, cfg.similarity_threshold, cfg.min_cluster_size)
+    # Cluster only within one scope AND one session. Clustering across them
+    # moved user-scoped text into the agent scope (or the reverse) and
+    # produced rows belonging to no session.
+    from .store import MAX_TEXT_CHARS  # noqa: PLC0415 - store imports lancedb; keep this module light
+
+    groups: dict[tuple[str, str], list[int]] = {}
+    for idx, entry in enumerate(valid):
+        session = str(_member_meta(entry).get("source_session") or "")
+        groups.setdefault((entry.scope, session), []).append(idx)
+    plans: list[ClusterPlan] = []
+    for indices in groups.values():
+        group_plans = build_clusters(
+            [valid[i] for i in indices],
+            cfg.similarity_threshold,
+            cfg.min_cluster_size,
+            max_merged_chars=MAX_TEXT_CHARS,
+        )
+        for plan in group_plans:
+            plans.append(ClusterPlan(
+                member_indices=[indices[i] for i in plan.member_indices],
+                merged=plan.merged,
+            ))
 
     if cfg.dry_run:
         logger.info(
@@ -329,6 +386,33 @@ def run_compaction(
     )
 
 
+# Categories whose rows carry structure a text merge would destroy.
+_NEVER_COMPACT_CATEGORIES = frozenset({"active_task", "reflection"})
+
+
+def _mergeable(category: str, meta_raw: object) -> bool:
+    """False for rows compaction must leave alone.
+
+    - ``active_task`` pins and anchors: merging dropped ``state_path`` and
+      ``task_id``, turning a task pin into a plain fact (or fusing two tasks).
+    - rows with a ``valid_until``: the merged row has none, so an expired
+      memory hidden from recall came back as a permanent one.
+    - rows with a ``metadata_type`` (session summaries, reflection items):
+      the type, and the decay exemption that goes with it, was lost.
+    """
+    if category in _NEVER_COMPACT_CATEGORIES:
+        return False
+    try:
+        meta = _parse_metadata(meta_raw) if isinstance(meta_raw, str) else meta_raw
+    except Exception:
+        return True
+    if not isinstance(meta, dict):
+        return True
+    return not (
+        meta.get("valid_until") or meta.get("metadata_type") or meta.get("state_path")
+    )
+
+
 def _fetch_for_compaction(
     store: MemoryStore,
     cutoff_ms: int,
@@ -346,6 +430,8 @@ def _fetch_for_compaction(
             continue
         meta_raw = row.get("metadata", "")
         if _is_archived(meta_raw):
+            continue
+        if not _mergeable(row.get("category", ""), meta_raw):
             continue
         scope = row.get("scope", "")
         if scope_set is not None and scope not in scope_set:
