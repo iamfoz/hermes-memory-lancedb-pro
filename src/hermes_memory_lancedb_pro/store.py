@@ -273,7 +273,10 @@ def _check_injection_guard(text: str, *, where: str) -> str:
 
     # Lazy import to avoid coupling store.py module load to reflection/.
     try:
-        from .reflection.slices import is_unsafe_injectable_reflection_line
+        from .reflection.slices import (
+            _normalize_reflection_slice_line,
+            is_unsafe_injectable_reflection_line,
+        )
     except ImportError:
         return text
 
@@ -283,7 +286,16 @@ def _check_injection_guard(text: str, *, where: str) -> str:
     lines = text.split("\n")
     flagged: list[int] = []
     for i, line in enumerate(lines):
-        if line.strip() and is_unsafe_injectable_reflection_line(line):
+        # A bare reflection section label ("Invariants:", "Derived:")
+        # normalises to an empty line, which the reflection helper counts
+        # as unsafe — so every reflection write was flagged as suspicious.
+        # Skip only those; any line with content left is still checked
+        # against the injection patterns.
+        if (
+            line.strip()
+            and _normalize_reflection_slice_line(line)
+            and is_unsafe_injectable_reflection_line(line)
+        ):
             flagged.append(i)
 
     if not flagged:

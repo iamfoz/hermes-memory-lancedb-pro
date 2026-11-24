@@ -91,6 +91,94 @@ minor versions; breaking changes are called out under **Changed** and
 - `init`'s default seed file is the host's `<hermes home>/memories/MEMORY.md`
   (the old `~/.hermes/memory/MEMORY.md` is still used when only that exists).
 
+### Fixed — task ledger
+- **Garbage collection archived and hard-deleted in the same run.** The
+  archive grace period ran from the task's completion time, so a task
+  completed more than retention + grace days ago lost its audit trail at
+  once. Archiving now stamps `archived_at` and the grace period runs from it.
+- **GC raced task writers.** It moved or deleted a task directory without
+  taking the task lock; a writer then recreated a partial ledger. GC now takes
+  the lock without waiting (a busy task is skipped until the next run) and
+  re-reads the state under it; writers refuse to write into a directory that
+  has gone.
+- **A corrupt `state.json` raised a traceback from every verb** and broke
+  `task list` for all tasks. Every verb now exits 4, listings skip the bad
+  entry, and `task resume` tolerates bad `results.jsonl` lines.
+- Advancing a completed task is refused; completing a task clears
+  `waiting_on` and keeps the first completion time when repeated.
+- GC collects status `completed` like `complete`, no longer reports a waiting
+  or blocked task as abandoned, and `archive` is a reserved task id.
+- The provider's automatic GC used the task root computed at import time, so
+  a process serving several profiles collected another profile's ledger.
+- A relative `--task-root` / `HERMES_TASK_ROOT` was stored as a relative path
+  in the pin, which the gateway could not find, so the pin never refreshed.
+  Task roots are now absolute. `task to-skill` writes to the profile's
+  skills directory.
+
+### Fixed — compaction
+- **Compaction resurrected expired memories and destroyed task pins.** It
+  clustered every non-archived row by similarity and wrote the merged row
+  with fresh metadata: a row past its `valid_until` came back as a permanent
+  one, a task pin lost `state_path` and `task_id`, and a session summary
+  lost its type. Active-task and reflection rows, and rows with
+  `valid_until`, `metadata_type` or `state_path`, are now left alone.
+- **Compaction merged across scopes and sessions**, moving user-scoped text
+  to the agent scope and producing rows no session could see. Clustering
+  now stays within one scope and one session; the merged row keeps the
+  session and the summed access counts.
+- A cluster whose merged text exceeded `MEMORY_MAX_TEXT_CHARS` failed on
+  every run; clusters stop growing at the limit.
+- Overlapping compaction passes each wrote their own merged row. One pass
+  runs per store at a time.
+- The session summary exceeded the store's text limit by 15 characters when
+  truncated and was dropped; it is capped to the limit.
+
+### Fixed — retrieval and extraction
+- **Expiry dates hid events before they happened.** Offsets were measured to
+  the start of the referenced period (`next week` expired in 7 days). Each
+  now reaches the end of the period: tomorrow 48h, next week 14d, this week
+  7d, next month 62d, this month 31d, tonight/today 24h.
+- **Core memories could never be demoted.** Tier decisions used the floored
+  decay score, and the core floor is above the demotion threshold. They now
+  use the unfloored score.
+- **Tier evaluation only ever looked at the oldest rows.** It now walks the
+  table one batch per evaluation.
+- Results the reranker never saw kept their full score and overtook the
+  reranked rows; they get the same penalty as unscored candidates.
+- Entity boost matched names inside unrelated words (`Go` in `good`).
+- **Valid LLM output was discarded.** JSON recovery took the first code fence
+  in a reply, so an object containing a fenced code sample was reduced to the
+  sample; a brace inside a string ended the object early.
+- **A merge could rewrite an unrelated memory.** A merge, support or
+  contextualize decision with a missing or non-integer `match_index` fell
+  back to the nearest neighbour. It now becomes a create.
+- **A failed extraction call silently dropped the turn.** It is now stored
+  through the legacy fallback; a failed merge call keeps the new fact.
+- Profile merge missed the existing profile row on any real store and
+  created duplicates. The Anthropic client gets a 30s timeout.
+
+### Fixed — reflection
+- The reflection block read the oldest N rows and froze once more existed;
+  it reads the newest. Reflection rows no longer appear as ordinary recall
+  hits. The prompt now asks for phrasing the reflection filters accept
+  (nearly every line used to be discarded), and nothing is written when no
+  line survives. Section labels no longer trip the injection guard.
+
+### Fixed — security and packaging
+- **`save_config` could plant variables in `.env`.** A value with a line
+  break added arbitrary lines; the file was rewritten in place and
+  world-readable. Line breaks are refused and the file is written privately
+  and atomically.
+- The admission rejection log no longer stores conversation excerpts, is
+  private to the user, and rotates at 1 MB. It is now documented.
+- `scripts/memory_reset.sh` deleted any directory `MEMORY_DB_DIR` named; it
+  now has the same guard and confirmation as `reset`.
+- `lancedb` floor raised to 0.25.0: on 0.20–0.24 the full-text index needed
+  an undeclared package and BM25/hybrid search failed.
+- Docs: the durable-task skill covers the 0.16 task verbs; CLI help and
+  configuration describe the profile-relative defaults; `SECURITY.md`
+  supports 0.16.x.
+
 ### Added
 - **`task unpin <id>`** removes a task's pin without touching its ledger, and
   `task pin` replaces an earlier pin for the same task instead of adding a

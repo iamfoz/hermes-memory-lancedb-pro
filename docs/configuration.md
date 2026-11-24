@@ -42,7 +42,7 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMORY_ADMISSION_PRESET` | `balanced` | AMAC-v1 admission gate: `balanced` / `conservative` / `high-recall` / `off`. An unrecognised value falls back to `balanced`. When jmunch is detected and this is left unset, the default is raised to `high-recall`. |
+| `MEMORY_ADMISSION_PRESET` | `balanced` | AMAC-v1 admission gate: `balanced` / `conservative` / `high-recall` / `off`. An unrecognised value falls back to `balanced`. When jmunch is detected and this is left unset, the default is raised to `high-recall`. | Rejected candidates are logged to `admission-audit/rejections.jsonl` beside the database directory (candidate text and scores, no conversation text; private to the user, rotated at 1 MB). `reset` and `purge` do not remove it.
 
 ## Compaction and purge
 
@@ -91,7 +91,7 @@ The smart extractor needs an LLM. It resolves a client in this order: the full
 | `MEMORY_EXTRACTION_BASE_URL` | *(none)* | OpenAI-compatible base URL for a custom/self-hosted endpoint. |
 | `MEMORY_EXTRACTION_MODEL` | *(none)* | Model id for extraction. |
 | `MEMORY_EXTRACTION_PROVIDER` | *(none)* | `openai` (default behaviour) or `anthropic` to route the override through the Anthropic SDK. |
-| `MEMORY_EXTRACTION_RATE_LIMIT` | `0` | Maximum extraction LLM calls per hour. `0` disables the cap. |
+| `MEMORY_EXTRACTION_RATE_LIMIT` | `0` | Maximum extraction passes per hour (one per turn). Each pass makes one extraction call plus a dedup and an admission call per candidate, so the LLM call count is several times higher. `0` disables the cap. |
 | `OPENAI_API_KEY` | *(none)* | Fallback extraction LLM (OpenAI-compatible). |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for the OpenAI fallback. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model for the OpenAI fallback. |

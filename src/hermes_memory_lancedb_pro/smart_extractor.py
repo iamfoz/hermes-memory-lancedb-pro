@@ -1250,7 +1250,9 @@ class SmartExtractor:
                     "overview": candidate.overview,
                 },
                 audit=asdict(audit),
-                conversation_excerpt=conversation_text[-500:],
+                # No conversation excerpt: the log is kept outside the
+                # database, so reset, purge and forget do not reach it.
+                conversation_excerpt="",
             )
             append_rejection_audit(audit_path, entry)
         except Exception as e:

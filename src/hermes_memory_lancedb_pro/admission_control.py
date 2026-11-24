@@ -722,6 +722,10 @@ class AdmissionController:
 # Persistence helper
 # ---------------------------------------------------------------------------
 
+# Size at which the rejection audit log is rotated.
+REJECTION_AUDIT_MAX_BYTES = 1_000_000
+
+
 def append_rejection_audit(
     file_path: str,
     entry: AdmissionRejectionAuditEntry,
@@ -731,7 +735,15 @@ def append_rejection_audit(
     must not break the admission path)."""
     try:
         os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-        with open(file_path, "a", encoding="utf-8") as f:
+        # The log holds rejected memory text, so keep it private and
+        # bounded: one previous generation is kept as `<file>.1`.
+        try:
+            if os.path.getsize(file_path) >= REJECTION_AUDIT_MAX_BYTES:
+                os.replace(file_path, file_path + ".1")
+        except OSError:
+            pass
+        fd = os.open(file_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(entry), default=str))
             f.write("\n")
     except OSError as e:
