@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -290,6 +291,34 @@ def run_compaction(
     `scopes=None` scans all scopes. Set `config.dry_run=True` to report a
     plan without writing changes (useful for tuning the threshold)."""
     cfg = config or CompactionConfig()
+    # One pass per store at a time. Two overlapping passes (several sessions
+    # ending together share one store) each scanned the same rows and each
+    # wrote its own merged entry, leaving duplicate consolidated memories.
+    lock = _run_lock_for(getattr(store, "db_path", None))
+    if not lock.acquire(blocking=False):
+        logger.info("memory-compactor: a pass is already running; skipping this one")
+        return CompactionResult(dry_run=cfg.dry_run)
+    try:
+        return _run_compaction_locked(store, cfg, scopes)
+    finally:
+        lock.release()
+
+
+_RUN_LOCKS: dict[str, threading.Lock] = {}
+_RUN_LOCKS_GUARD = threading.Lock()
+
+
+def _run_lock_for(db_path: object) -> threading.Lock:
+    key = os.path.abspath(str(db_path)) if db_path else ""
+    with _RUN_LOCKS_GUARD:
+        return _RUN_LOCKS.setdefault(key, threading.Lock())
+
+
+def _run_compaction_locked(
+    store: MemoryStore,
+    cfg: CompactionConfig,
+    scopes: Sequence[str] | None,
+) -> CompactionResult:
     if cfg.min_age_hours is not None:
         cutoff_ms = int(time.time() * 1000) - cfg.min_age_hours * 3_600_000
     else:

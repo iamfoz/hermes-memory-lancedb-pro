@@ -30,10 +30,12 @@ That's all hermes-agent's plugin discovery needs. The provider:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -158,6 +160,9 @@ _REFLECTION_ENABLED: bool = os.environ.get(
 _REFLECTION_SCAN_LIMIT: int = env_int("MEMORY_REFLECTION_SCAN_LIMIT", 200)
 # Agent identity used for reflection ownership. Single-agent setups can leave
 # this at the default; multi-agent hosts pass `agent_id` to `initialize()`.
+# Hard ceiling on reflection rows read per recall before the newest
+# MEMORY_REFLECTION_SCAN_LIMIT are kept.
+_REFLECTION_MAX_ROWS = 20_000
 _REFLECTION_AGENT_ID: str = os.environ.get(
     "MEMORY_REFLECTION_AGENT_ID", "main"
 ).strip() or "main"
@@ -1404,11 +1409,20 @@ def _build_provider_class():
             if not values or not hermes_home:
                 return
             schema = {entry["key"]: entry["env_var"] for entry in self.get_config_schema()}
-            to_write = {
-                schema[key]: str(val)
-                for key, val in values.items()
-                if key in schema and val is not None and str(val).strip()
-            }
+            to_write: dict[str, str] = {}
+            for key, val in values.items():
+                if key not in schema or val is None or not str(val).strip():
+                    continue
+                value = str(val).strip()
+                if any(ch in value for ch in "\r\n\x00"):
+                    # A line break would plant extra variables in .env
+                    # (e.g. LD_PRELOAD=...). Refuse the value outright.
+                    logger.warning(
+                        "lancedb_pro save_config: %s contains a line break; not saved",
+                        schema[key],
+                    )
+                    continue
+                to_write[schema[key]] = value
             if not to_write:
                 return
             env_path = os.path.join(hermes_home, ".env")
@@ -1421,11 +1435,26 @@ def _build_provider_class():
                 line for line in existing
                 if not any(line.startswith(f"{var}=") for var in to_write)
             ]
+            if kept and not kept[-1].endswith("\n"):
+                kept[-1] += "\n"
             for env_var, value in to_write.items():
                 kept.append(f"{env_var}={value}\n")
             os.makedirs(hermes_home, exist_ok=True)
-            with open(env_path, "w", encoding="utf-8") as fh:
-                fh.writelines(kept)
+            # .env holds API keys: write a private temp file and rename it
+            # into place, so a crash cannot truncate it and it is never
+            # world-readable.
+            fd, tmp_path = tempfile.mkstemp(dir=hermes_home, prefix=".env.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.writelines(kept)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, env_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
 
         # ---- Read path ----------------------------------------------------
 
@@ -1497,6 +1526,10 @@ def _build_provider_class():
                     session_id=session_id or None,
                     min_score=min_score,
                     source="auto-recall",
+                    # Task state and reflection reach the model through
+                    # their own blocks; as recall candidates they took
+                    # slots and pushed out similar ordinary memories.
+                    exclude_categories=("active_task", "reflection"),
                 )
             except Exception as e:
                 logger.warning("lancedb_pro recall failed: %s", e)
@@ -1571,7 +1604,13 @@ def _build_provider_class():
             # Without this filter the auto-anchor (a recent session memory)
             # would also be pulled in here via `recent_for_session`, injecting
             # a second copy of the same block on every turn.
-            results = [r for r in results if r.get("category") != "active_task"]
+            # Reflection rows reach the model only through the reflection
+            # block, which applies agent ownership, the age cutoff and
+            # suppression. As ordinary recall hits they bypassed all three
+            # and injected raw event rows.
+            results = [
+                r for r in results if r.get("category") not in ("active_task", "reflection")
+            ]
 
             # Recall guardrails — drop never-categories, enforce char/token
             # budget. (Active-task pinning is a no-op here now that the
@@ -1628,9 +1667,15 @@ def _build_provider_class():
             lines. Best-effort: any failure yields an empty block."""
             try:
                 from .reflection import load_agent_reflection_slices_from_entries
+                # list_memories returns rows in insertion order (oldest
+                # first). Reading only the first N froze the block on the
+                # oldest sessions once more than N rows existed, so read
+                # them all and keep the newest N.
                 entries = self._store.list_memories(
-                    limit=_REFLECTION_SCAN_LIMIT, category="reflection"
+                    limit=_REFLECTION_MAX_ROWS, category="reflection"
                 )
+                entries.sort(key=lambda r: r.get("timestamp") or 0, reverse=True)
+                entries = entries[:max(0, _REFLECTION_SCAN_LIMIT)]
                 slices = load_agent_reflection_slices_from_entries(
                     entries=entries, agent_id=self._agent_id,
                 )
@@ -2211,7 +2256,18 @@ def _build_provider_class():
                 return
             invariants = _coerce_str_list(result.get("invariants"))
             derived = _coerce_str_list(result.get("derived"))
+            # The reflection layer keeps only rule-like invariants and
+            # action-like derived lines. Apply the same test here so a
+            # reply with nothing usable does not write an event-only row
+            # (which stored nothing useful and used up the recall window).
+            from .reflection.slices import (
+                _is_derived_delta_like,
+                _is_invariant_rule_like,
+            )
+            invariants = [line for line in invariants if _is_invariant_rule_like(line)]
+            derived = [line for line in derived if _is_derived_delta_like(line)]
             if not invariants and not derived:
+                logger.debug("lancedb_pro reflection: no usable lines; nothing written")
                 return
 
             from .reflection import (

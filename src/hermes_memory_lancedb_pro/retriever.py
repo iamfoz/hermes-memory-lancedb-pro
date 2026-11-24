@@ -44,6 +44,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import requests
@@ -157,6 +158,7 @@ class MemoryRetriever:
         *,
         session_id: str | None = None,
         min_score: float | None = None,
+        exclude_categories: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
         """Run the full hybrid retrieval pipeline.
 
@@ -172,6 +174,9 @@ class MemoryRetriever:
                 tier.
             min_score: drop final results below this threshold. Defaults to
                 ``DEFAULT_MIN_RECALL_SCORE`` (env ``MEMORY_MIN_RECALL_SCORE``).
+            exclude_categories: drop candidates in these categories before
+                scoring, so they neither take result slots nor suppress
+                similar rows in the diversity step.
         """
         if not query or not query.strip():
             return []
@@ -195,6 +200,9 @@ class MemoryRetriever:
 
         # 2. Vector-dominant fusion with BM25 confirmation bonus
         fused = self._vector_dominant_fusion(vector_results, bm25_results)
+        if exclude_categories:
+            excluded = set(exclude_categories)
+            fused = [e for e in fused if e.get("category") not in excluded]
         if not fused:
             return []
 

@@ -349,6 +349,14 @@ Produce two lists:
 # Rules
 
 - Each entry is ONE short sentence. No markdown, no bullet characters.
+- Phrase every invariant as a standing rule that begins with one of:
+  Always, Never, Prefer, Avoid, Only, Do not, When, If, Before, After.
+  Example: "Prefer tabs over spaces in this user's code."
+- Phrase every derived entry as an action that begins with one of:
+  Next run, This run, Going forward, Follow-up, Verify, Confirm, Re-check,
+  Retry, Keep, Watch, Change, Update, Adjust.
+  Example: "Next run, finish the migration script."
+  Entries phrased any other way are discarded.
 - At most 6 invariants, at most 8 derived.
 - Only include what the transcript actually supports — never invent.
 - If a list has nothing worth keeping, return it empty.

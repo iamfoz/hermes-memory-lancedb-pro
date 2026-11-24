@@ -860,3 +860,143 @@ def test_session_summary_is_capped_to_the_store_limit(mem_provider, store, monke
     rows = [r for r in store.list_memories(limit=20)
             if r["metadata"].get("metadata_type") == "session-summary"]
     assert len(rows) == 1 and len(rows[0]["text"]) <= store_module.MAX_TEXT_CHARS
+
+
+# ---------------------------------------------------------------------------
+# save_config, reflection recall, overlapping compaction
+# ---------------------------------------------------------------------------
+
+
+def test_save_config_refuses_line_breaks_and_writes_a_private_file(mem_provider, tmp_path):
+    import os
+    import stat
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("OTHER_KEY=keep-me")
+    schema = {e["key"]: e["env_var"] for e in mem_provider.get_config_schema()}
+    keys = list(schema)
+    assert len(keys) >= 2
+    mem_provider.save_config({keys[0]: "http://x/v1\nLD_PRELOAD=/tmp/evil.so",
+                              keys[1]: "  good-value  "}, str(home))
+    text = (home / ".env").read_text()
+    assert "LD_PRELOAD" not in text and schema[keys[0]] not in text
+    assert f"{schema[keys[1]]}=good-value\n" in text
+    assert "OTHER_KEY=keep-me\n" in text
+    assert stat.S_IMODE(os.stat(home / ".env").st_mode) == 0o600
+    assert [n for n in os.listdir(home) if n.endswith(".tmp")] == []
+
+
+def test_reflection_block_reads_the_newest_rows(mem_provider, store, monkeypatch):
+    from hermes_memory_lancedb_pro import provider
+
+    seen = {}
+
+    def fake_loader(entries, agent_id):
+        seen["texts"] = [e["text"] for e in entries]
+
+        class Slices:
+            invariants: list = []
+            derived: list = []
+
+        return Slices()
+
+    from hermes_memory_lancedb_pro import reflection
+
+    monkeypatch.setattr(reflection, "load_agent_reflection_slices_from_entries", fake_loader)
+    monkeypatch.setattr(provider, "_REFLECTION_SCAN_LIMIT", 5)
+    for i in range(12):
+        store.store(text=f"reflection row {i}", category="reflection", scope="agent")
+        store._table.update(where=f"text = 'reflection row {i}'", values={"timestamp": 1000 + i})
+    mem_provider._compute_reflection_block()
+    assert seen["texts"] == [f"reflection row {i}" for i in (11, 10, 9, 8, 7)]
+
+
+def test_reflection_rows_are_not_ordinary_recall_hits(mem_provider, store):
+    class SameVector:
+        """Every text maps to one vector, so every row is a perfect match."""
+
+        def encode(self, text, normalize_embeddings=False, show_progress_bar=False):
+            one = [1.0] + [0.0] * (VECTOR_DIM - 1)
+            return one if isinstance(text, str) else [one for _ in text]
+
+    store._embedder = SameVector()
+    store.store(text="reflection-event about the staging secret rotation",
+                category="reflection", scope="agent", metadata_extra={"cross_session": True})
+    store.store(text="the staging secret rotation happens monthly",
+                category="fact", scope="agent", metadata_extra={"cross_session": True})
+    block = mem_provider.prefetch("staging secret rotation", session_id="sess-1")
+    assert "happens monthly" in block
+    assert "reflection-event" not in block
+
+
+def test_reflection_with_no_usable_lines_writes_nothing(store, monkeypatch):
+    from hermes_memory_lancedb_pro import provider
+
+    class FakeBase:
+        pass
+
+    class Llm:
+        def complete_json(self, prompt, label=""):
+            return {"invariants": ["The user dislikes verbose explanations."],
+                    "derived": ["The flaky auth test still fails on CI."]}
+
+    class Extractor:
+        has_llm = True
+        llm = Llm()
+        _llm = llm
+
+    monkeypatch.setattr(provider, "_load_memory_provider_base", lambda: FakeBase)
+    monkeypatch.setattr(provider, "_spawn_warmup", lambda store: None)
+    monkeypatch.setattr(provider, "_REFLECTION_ENABLED", True)
+    p = provider._build_provider_class()(store=store, smart_extractor=Extractor(),
+                                         auto_smart_extraction=False)
+    p.initialize("sess-1")
+    p._maybe_write_reflection(["USER: hi", "ASSISTANT: hello", "USER: do the thing"])
+    assert store.list_memories(limit=20, category="reflection") == []
+
+
+def test_reflection_prompt_asks_for_phrasing_the_filters_accept():
+    from hermes_memory_lancedb_pro.extraction_prompts import build_reflection_prompt
+    from hermes_memory_lancedb_pro.reflection.slices import (
+        _is_derived_delta_like,
+        _is_invariant_rule_like,
+    )
+
+    prompt = build_reflection_prompt("USER: x")
+    assert "Prefer tabs over spaces" in prompt and "Next run, finish" in prompt
+    assert _is_invariant_rule_like("Prefer tabs over spaces in this user's code.")
+    assert _is_derived_delta_like("Next run, finish the migration script.")
+
+
+def test_overlapping_compaction_passes_do_not_duplicate(store):
+    import threading
+
+    from hermes_memory_lancedb_pro import memory_compactor as mc
+
+    for i in range(3):
+        store.store(text=f"user prefers dark mode variant {i}", category="preference",
+                    scope="user")
+    cfg = mc.CompactionConfig(min_age_days=0, similarity_threshold=-1.0, min_cluster_size=2)
+    real = mc._run_compaction_locked
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow(store_, cfg_, scopes):
+        entered.set()
+        release.wait(10)
+        return real(store_, cfg_, scopes)
+
+    mc._run_compaction_locked = slow
+    try:
+        results = []
+        first = threading.Thread(target=lambda: results.append(mc.run_compaction(store, cfg)))
+        first.start()
+        assert entered.wait(10)
+        second = mc.run_compaction(store, cfg)  # overlaps the first pass
+        release.set()
+        first.join(30)
+    finally:
+        mc._run_compaction_locked = real
+    assert second.memories_created == 0 and results[0].memories_created == 1
+    assert len(store.list_memories(limit=20)) == 1
