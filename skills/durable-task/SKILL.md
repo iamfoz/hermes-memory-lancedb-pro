@@ -99,7 +99,36 @@ If `current_iteration >= target_iterations`, or the objective is met:
 hermes lancedb_pro task complete <task-id> --summary "<what was done>"
 ```
 
-Then report results to the user.
+Then report results to the user. Once you have reported them, record that so
+they are not presented again on every later turn:
+
+```bash
+hermes lancedb_pro task reported <task-id>
+```
+
+### Step 7 — If the task cannot proceed
+
+When the task has to wait for something outside you (a CI run, a release, a
+reply), park it instead of advancing:
+
+```bash
+hermes lancedb_pro task wait <task-id> --reason "<what>" \
+  [--ref <PR/job/URL>] [--clears-when "<condition>"]
+```
+
+When it needs a person to act, block it and tell the user what is needed:
+
+```bash
+hermes lancedb_pro task block <task-id> --reason "<what a person must do>"
+```
+
+When the wait has cleared or the person has resolved it:
+
+```bash
+hermes lancedb_pro task unwait <task-id>      # back to running
+```
+
+A waiting or blocked task must NOT be continued until it is un-parked.
 
 ---
 
@@ -135,7 +164,13 @@ These rules apply for the entire lifetime of a running task:
 - Before each iteration: confirm state with `task resume`.
 - After each iteration: update state with `task advance`.
 - If `task list` shows a running task: continue it, do not start a new one.
-- If blockers appear: record them with `task advance --result fail` and report.
+- If `task list` shows a waiting or blocked task: do not continue it. Check
+  whether the wait has cleared (`task show`), then `task unwait`, or tell the
+  user what it is waiting on.
+- If the task cannot proceed: `task wait` (something external) or
+  `task block` (needs a person). Use `task advance --result fail` only for an
+  iteration that ran and failed.
+- After reporting a completed task's results: `task reported`.
 
 ---
 
@@ -175,3 +210,8 @@ hermes lancedb_pro task complete stress-test-<id> \
 | `task list` | List all tasks |
 | `task show <id>` | Full state as JSON |
 | `task complete <id> --summary <text>` | Mark done |
+| `task reported <id>` | Results were presented; stop re-presenting them |
+| `task wait <id> --reason <text> [--ref R] [--clears-when T]` | Park on something external |
+| `task block <id> --reason <text>` | Park until a person intervenes |
+| `task unwait <id>` | Waiting/blocked back to running |
+| `task unpin <id>` | Remove the pin, keep the ledger |

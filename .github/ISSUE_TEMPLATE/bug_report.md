@@ -37,5 +37,7 @@ is one.
 
 ## Additional context
 
-Logs (`MEMORY_LOG_LEVEL=DEBUG` if relevant), configuration, or anything else
-that might help.
+Logs (run Hermes with debug logging on — the plugin logs under
+`hermes_memory_lancedb_pro` — and include the relevant lines), the output of
+`hermes plugins doctor lancedb_pro` and `hermes lancedb_pro doctor`,
+configuration, or anything else that might help.

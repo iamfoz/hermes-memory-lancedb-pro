@@ -138,7 +138,7 @@ Google backend disables itself with an actionable warning.
 | Variable | Default | Purpose |
 |---|---|---|
 | `HERMES_HOME` | `~/.hermes` | Hermes home directory. Resolution order: `--hermes-home` flag → `HERMES_HOME` → `~/.hermes`. |
-| `HERMES_TASK_ROOT` | `~/.hermes/workspace/tasks` | Root directory for durable task ledgers. |
+| `HERMES_TASK_ROOT` | `<hermes home>/workspace/tasks` | Root directory for durable task ledgers. Unset, each Hermes profile uses `$HERMES_HOME/workspace/tasks` (`~/.hermes/workspace/tasks` for the default profile). A relative path is made absolute. |
 | `MEMORY_MD` | `<hermes home>/memories/MEMORY.md` | Seed file for `init`. Defaults to the host's built-in memory file; the legacy `~/.hermes/memory/MEMORY.md` is used when only that exists. |
 | `HF_TOKEN` | *(none)* | HuggingFace token; avoids rate limits when first downloading the embedding model. |
 

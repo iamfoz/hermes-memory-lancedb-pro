@@ -25,7 +25,10 @@ classifiers = [
 ]
 
 dependencies = [
-    "lancedb>=0.20.0",
+    # 0.25 is the first release whose full-text index needs no extra package;
+    # on 0.20-0.24 the index silently failed without `tantivy` and every
+    # BM25 / hybrid search then raised.
+    "lancedb>=0.25.0",
     "numpy>=1.24.0",
     "sentence-transformers>=3.0.0",
     "requests>=2.31.0",

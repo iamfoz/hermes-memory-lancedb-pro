@@ -834,7 +834,7 @@ def _add_store_admin_parsers(subs) -> None:
     p_stats.add_argument("--json", action="store_true",
                          help="Emit the raw stats dict as JSON")
     p_stats.add_argument("--path", default=None, metavar="PATH",
-                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                         help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
 
     p_search = subs.add_parser(
         "search",
@@ -861,7 +861,7 @@ def _add_store_admin_parsers(subs) -> None:
     p_search.add_argument("--json", action="store_true",
                           help="Emit result rows as JSON (vectors stripped)")
     p_search.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_search.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 
@@ -886,7 +886,7 @@ def _add_store_admin_parsers(subs) -> None:
     p_purge.add_argument("-y", "--yes", action="store_true",
                          help="Skip confirmation prompt")
     p_purge.add_argument("--path", default=None, metavar="PATH",
-                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                         help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_purge.add_argument("-q", "--quiet", action="store_true",
                          help="Suppress non-essential output")
 
@@ -912,7 +912,7 @@ def _add_store_admin_parsers(subs) -> None:
                            metavar="N",
                            help="Maximum rows to scan per pass (default: 200)")
     p_compact.add_argument("--path", default=None, metavar="PATH",
-                           help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                           help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_compact.add_argument("-q", "--quiet", action="store_true",
                            help="Suppress non-essential output")
 
@@ -966,7 +966,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         ),
     )
     p_init.add_argument("--path", default=None, metavar="PATH",
-                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                        help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                         help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_init.add_argument("-y", "--yes", action="store_true",
@@ -980,7 +980,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         description="Scan the store and report counts, anomalies, and recommendations.",
     )
     p_doctor.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_doctor.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 
@@ -996,7 +996,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
                           help="Maximum rows to export (default: 100000)")
     p_export.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
     p_export.add_argument("--salvage", action="store_true",
@@ -1015,7 +1015,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_import.add_argument("--allow-existing", action="store_true",
                           help="Skip rows whose id already exists rather than aborting")
     p_import.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_import.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 
@@ -1028,7 +1028,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         ),
     )
     p_reset.add_argument("--path", default=None, metavar="PATH",
-                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                         help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                          help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_reset.add_argument("-y", "--yes", action="store_true",
@@ -2047,7 +2047,8 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     p_create.add_argument("--max-wakes", dest="max_wakes", type=int, default=None,
                           metavar="N", help="Budget of unattended wakes (optional)")
     p_create.add_argument("--task-root", default=None, metavar="PATH",
-                          help="Task root dir (default: ~/.hermes/workspace/tasks)")
+                          help="Task root dir (default: $HERMES_TASK_ROOT, else "
+                               "<hermes home>/workspace/tasks)")
     p_create.add_argument("-q", "--quiet", action="store_true")
 
     p_list = tsubs.add_parser("list", help="List all task ledgers")
@@ -2090,7 +2091,7 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     )
     p_pin.add_argument("task_id", metavar="TASK_ID")
     p_pin.add_argument("--path", default=None, metavar="PATH",
-                       help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                       help="Memory DB dir (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_pin.add_argument("--task-root", default=None, metavar="PATH")
     p_pin.add_argument("-q", "--quiet", action="store_true")
 
@@ -2099,7 +2100,7 @@ def _add_task_subparsers(parent: argparse.ArgumentParser, dest: str = "task_comm
     )
     p_unpin.add_argument("task_id", metavar="TASK_ID")
     p_unpin.add_argument("--path", default=None, metavar="PATH",
-                         help="Memory DB dir (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                         help="Memory DB dir (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_unpin.add_argument("-q", "--quiet", action="store_true")
 
     p_gc = tsubs.add_parser(
@@ -2217,7 +2218,7 @@ def main() -> int:
         ),
     )
     p_init.add_argument("--path", default=None, metavar="PATH",
-                        help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                        help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_init.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                         help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_init.add_argument("-y", "--yes", action="store_true",
@@ -2235,7 +2236,7 @@ def main() -> int:
         ),
     )
     p_reset.add_argument("--path", default=None, metavar="PATH",
-                         help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                         help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_reset.add_argument("--memory-md", dest="memory_md", default=None, metavar="PATH",
                          help="Seed file (default: $MEMORY_MD or <hermes home>/memories/MEMORY.md)")
     p_reset.add_argument("-y", "--yes", action="store_true",
@@ -2263,7 +2264,7 @@ def main() -> int:
         description="Scan the store and report counts, anomalies, and recommendations.",
     )
     p_doctor.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_doctor.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 
@@ -2280,7 +2281,7 @@ def main() -> int:
     p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
                           help="Maximum rows to export (default: 100000)")
     p_export.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
     p_export.add_argument("--salvage", action="store_true",
@@ -2300,7 +2301,7 @@ def main() -> int:
     p_import.add_argument("--allow-existing", action="store_true",
                           help="Skip rows whose id already exists rather than aborting")
     p_import.add_argument("--path", default=None, metavar="PATH",
-                          help="DB directory (default: $MEMORY_DB_DIR or ~/.hermes/memory-lancedb)")
+                          help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_import.add_argument("-q", "--quiet", action="store_true",
                           help="Suppress non-essential output")
 

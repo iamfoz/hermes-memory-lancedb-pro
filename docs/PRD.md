@@ -57,9 +57,10 @@ Secondary failure modes this product must also solve:
 - **G5 — First-class operability.** A human (or an agent) can inspect,
   search, back up, restore, repair, and clean the store from the CLI without
   writing Python.
-- **G6 — Drop-in host integration.** Installing into hermes-agent is two
-  steps (pip install + one config line); the plugin degrades gracefully on
-  hosts missing newer hook APIs.
+- **G6 — Drop-in host integration.** Installing into hermes-agent is one
+  command (`hermes plugins install iamfoz/hermes-memory-lancedb-pro`) plus
+  one config line; the plugin degrades gracefully on hosts missing newer
+  hook APIs.
 
 ### Non-goals
 
@@ -95,7 +96,7 @@ Representative user stories:
 
 ## 5. Functional requirements
 
-Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9).
+Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9).
 
 ### 5.1 Storage & schema
 
@@ -206,7 +207,8 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
   atomically written, re-read every turn — context compaction cannot lose
   progress.
 - **FR-51** ✅ Full `task` CLI: create/list/show/resume/advance/complete/
-  pin/hold/unhold/gc/to-skill, available in both CLI surfaces. `task pin`
+  pin/unpin/hold/unhold/wait/block/unwait/wake/reported/gc/to-skill,
+  available in both CLI surfaces. `task pin`
   stores the control block as an always-recalled `active_task` memory.
 - **FR-52** ✅ Task GC: archive→grace→delete retention with `gc_hold`
   exemption, cooldown-gated auto-run + manual `task gc --dry-run`.
@@ -291,7 +293,7 @@ Status legend: ✅ shipped (0.14.x) · 🔶 partial · ⬜ planned (see §8/§9)
 - **NFR-9 — Injection-resistant.** Write guard on stores, sanitiser on
   reflection recall lines, envelope stripping before extraction.
 
-## 7. Current state (0.14.x)
+## 7. Current state (0.16.x)
 
 All FRs marked ✅ above are shipped and tested. Subsystem inventory:
 `store.py` (storage core), `retriever.py` (+ rerankers), `decay.py`
@@ -389,14 +391,15 @@ Gaps identified in the 2026-07 review, with disposition:
 
 ---
 
-## Appendix A — CLI surface (0.14.x + unreleased)
+## Appendix A — CLI surface (0.16.x + unreleased)
 
 ```
 hermes-memory[-lancedb-pro] [--version]
   init | reset | doctor | export | import
   stats [--json] | search QUERY [--mode|--limit|--category|--scope|--session-id|--min-score|--json]
   purge [--grace-days N] [--dry-run] [-y] | compact [--dry-run] [--scope]... [--min-age-days] [--similarity] [--max-scan]
-  task create|list|show|resume|advance|complete|pin|gc|hold|unhold|to-skill
+  task create|list [--json]|show|resume|advance|complete|pin|unpin|gc|hold|unhold
+       wait|block|unwait|wake|reported|to-skill
   install-plugin | uninstall-plugin
 hermes-memory-smoke [--path | --ephemeral]
 hermes lancedb_pro <everything above except install/uninstall-plugin>

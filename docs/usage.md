@@ -94,7 +94,7 @@ cannot install itself from inside hermes-agent). See
 
 A task ledger keeps multi-step task state (objective, iteration counter,
 `next_action`) on disk, outside the LLM context window, so it survives context
-compaction. Ledgers live under `~/.hermes/workspace/tasks/` by default
+compaction. Ledgers live under `<hermes home>/workspace/tasks/` by default
 (`--task-root` to override).
 
 ```bash
