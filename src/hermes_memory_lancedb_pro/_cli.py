@@ -2259,16 +2259,36 @@ def _run(db_path) -> int:
         failed += 1
         print(f"  FAIL: {msg}")
 
-    # Cleanup
-    for mode in ("vector", "bm25"):
-        try:
-            existing = store.search(SMOKE_PREFIX, limit=50, mode=mode)
-        except Exception:
-            existing = []
-        for r in existing:
-            if _entry_text(r).startswith(SMOKE_PREFIX):
-                store.forget(mem_id=_entry_id(r))
+    created: list[str] = []
 
+    def cleanup() -> None:
+        # Vector search has no relevance floor: it returns the nearest rows
+        # whatever they are. Only ever forget rows this test wrote — by id,
+        # or carrying the smoke prefix — never a bare search hit.
+        for mem in created:
+            try:
+                # Raw delete by exact id: forget() follows the supersede
+                # chain and would leave the archived original behind.
+                store._table.delete(f"id = '{_store_module._escape_sql(mem)}'")
+            except Exception:
+                pass
+        for mode in ("vector", "bm25"):
+            try:
+                existing = store.search(SMOKE_PREFIX, limit=50, mode=mode)
+            except Exception:
+                existing = []
+            for r in existing:
+                if _entry_text(r).startswith(SMOKE_PREFIX):
+                    store.forget(mem_id=_entry_id(r))
+
+    cleanup()  # leftovers from an interrupted earlier run
+    try:
+        return _run_checks(store, created, ok, fail, lambda: (passed, failed))
+    finally:
+        cleanup()
+
+
+def _run_checks(store, created, ok, fail, counts) -> int:
     print("=== TEST: Store ===")
     mem_id = store.store(
         text=f"{SMOKE_PREFIX}PRIMARY: end-to-end check.",
@@ -2276,6 +2296,8 @@ def _run(db_path) -> int:
         scope="global",
         importance=0.3,
     )
+    if mem_id:
+        created.append(mem_id)
     if mem_id and len(mem_id) == 36:
         ok(f"store() → {mem_id}")
     else:
@@ -2289,7 +2311,10 @@ def _run(db_path) -> int:
         else:
             fail(f"search(mode={mode!r}) missed entry ({len(results)} results)")
 
-    if store.update(mem_id, text=f"{SMOKE_PREFIX}UPDATED: superseded.", tier="core"):
+    updated = store.update(mem_id, text=f"{SMOKE_PREFIX}UPDATED: superseded.", tier="core")
+    if isinstance(updated, str):
+        created.append(updated)
+    if updated:
         ok("update() supersede succeeded")
     else:
         fail("update() returned False for an existing id")
@@ -2299,10 +2324,7 @@ def _run(db_path) -> int:
     else:
         fail("has_id() returned True for archived id")
 
-    # Cleanup
-    for r in store.search(SMOKE_PREFIX, limit=50, mode="vector"):
-        store.forget(mem_id=_entry_id(r))
-
+    passed, failed = counts()
     print(f"\nResults: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1
 

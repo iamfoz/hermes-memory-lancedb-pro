@@ -1097,8 +1097,11 @@ class MemoryStore:
 
         metadata["access_count"] = current_count + 1
         metadata["last_accessed_at"] = now_ms
+        # get_by_id follows the supersede chain, so `existing` may be the live
+        # successor of `mem_id`. Write to the row we read: writing its metadata
+        # onto the archived `mem_id` row would un-archive the stale version.
         self._table.update(
-            where=f"id = '{_escape_sql(mem_id)}'",
+            where=f"id = '{_escape_sql(existing['id'])}'",
             values={"metadata": json.dumps(metadata)},
         )
         return True
@@ -1290,24 +1293,32 @@ class MemoryStore:
                 f"metadata LIKE '%\"tier\":\"{safe_tier}\"%')"
             )
 
-        # Over-fetch when we'll filter archived/session rows post-query
+        # Archived and other-session rows are filtered in Python after the
+        # query, so a fixed over-fetch can come back short (or empty) when
+        # many such rows precede the wanted ones — e.g. a memory edited many
+        # times, or one large earlier session. Widen the window until enough
+        # rows survive the filter or the table is exhausted.
         post_filter = (not include_archived) or (session_id is not None)
-        fetch_limit = (
-            limit + offset + max(limit, 16) * 2 if post_filter else limit
-        )
+        wanted = max(0, limit) + max(0, offset)
+        fetch_limit = wanted + max(limit, 16) * 2 if post_filter else wanted
+        where_clause = _and_clauses(*clauses)
 
         self._checkout_latest()
-        query = self._table.search()
-        where_clause = _and_clauses(*clauses)
-        if where_clause:
-            query = query.where(where_clause)
-        results = query.limit(fetch_limit).to_list()
+        while True:
+            query = self._table.search()
+            if where_clause:
+                query = query.where(where_clause)
+            results = query.limit(fetch_limit).to_list()
 
-        rows = [self._row_to_dict(r) for r in results]
-        if not include_archived:
-            rows = [r for r in rows if r["metadata"].get("state") != ARCHIVED_STATE]
-        if session_id is not None:
-            rows = [r for r in rows if _match_session(r["metadata"], session_id)]
+            rows = [self._row_to_dict(r) for r in results]
+            if not include_archived:
+                rows = [r for r in rows if r["metadata"].get("state") != ARCHIVED_STATE]
+            if session_id is not None:
+                rows = [r for r in rows if _match_session(r["metadata"], session_id)]
+            exhausted = len(results) < fetch_limit
+            if len(rows) >= wanted or exhausted or fetch_limit >= MAX_SCAN_ROWS:
+                break
+            fetch_limit = min(fetch_limit * 4, MAX_SCAN_ROWS)
         return rows[offset : offset + limit]
 
     def recent_for_session(self, session_id: str, limit: int = 2) -> list[dict[str, Any]]:
