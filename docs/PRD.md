@@ -6,7 +6,7 @@
 | **Version** | 1.0 |
 | **Date** | 2026-07-08 |
 | **Owner** | Martyn Forryan (@iamfoz) |
-| **Product version covered** | 0.16.x |
+| **Product version covered** | 0.17.x |
 
 ---
 
@@ -96,7 +96,7 @@ Representative user stories:
 
 ## 5. Functional requirements
 
-Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9).
+Status legend: ✅ shipped (0.17.x) · 🔶 partial · ⬜ planned (see §8/§9).
 
 ### 5.1 Storage & schema
 
@@ -299,7 +299,7 @@ Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9)
 - **NFR-9 — Injection-resistant.** Write guard on stores, sanitiser on
   reflection recall lines, envelope stripping before extraction.
 
-## 7. Current state (0.16.x)
+## 7. Current state (0.17.x)
 
 All FRs marked ✅ above are shipped and tested. Subsystem inventory:
 `store.py` (storage core), `retriever.py` (+ rerankers), `decay.py`
@@ -398,7 +398,7 @@ Gaps identified in the 2026-07 review, with disposition:
 
 ---
 
-## Appendix A — CLI surface (0.16.x + unreleased)
+## Appendix A — CLI surface (0.17.x)
 
 ```
 hermes-memory[-lancedb-pro] [--version]

@@ -13,6 +13,30 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+---
+
+## [0.17.0] — 2026-11-25
+
+### Upgrade notes
+- **Back up first:** `hermes lancedb_pro export --include-archived -o backup.jsonl`.
+  Nothing in this release deletes or rewrites stored memories.
+- **Scores read higher.** Vector scores are now true cosine similarity (a match
+  that scored 0.4 now scores about 0.7). Result order is unchanged.
+- **`MEMORY_MIN_RECALL_SCORE` is now an absolute floor.** If you set it above
+  0 it filters more than before, and a message with no good match recalls
+  nothing. Lower it if recall looks thin.
+- **`MEMORY_DB_DIR` is now honoured by the agent**, as documented. Check it
+  points where your memories are.
+- **`MEMORY_ACTIVE_TASK_PIN` and `MEMORY_TASK_PROTOCOL` now take effect** if
+  set to `off`.
+- **`compact` asks for confirmation.** Add `-y` in scripts.
+- **Existing databases are reported as a legacy embedding scheme** and keep
+  working unchanged. `reembed` converts them; it is optional, and Hermes must
+  be stopped while it runs.
+- **Skills ship with the plugin** as `lancedb_pro:<name>`. Remove any copies of
+  `durable-task` and `task-to-skill` from `~/.hermes/skills/`.
+- **`lancedb` 0.25 or newer** is required.
+
 ### Fixed — data loss
 - **`hermes-memory-smoke` deleted real memories.** Its final cleanup forgot
   every vector-search hit for the smoke prefix without checking the text;
@@ -1192,7 +1216,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.14.3...v0.15.0

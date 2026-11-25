@@ -1569,13 +1569,12 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
                 f"Migration failed ({e}); installing fresh to {plugin_dir}.",
                 quiet=False,
             )
-    elif legacy_dir.exists():
-        if not quiet:
-            sys.stdout.write(
-                f"Note: stale plugin directory found at {legacy_dir}\n"
-                f"  hermes-agent does not scan that path — run "
-                f"`rm -rf {legacy_dir}` to clean it up.\n"
-            )
+    elif legacy_dir.exists() and not quiet:
+        sys.stdout.write(
+            f"Note: stale plugin directory found at {legacy_dir}\n"
+            f"  hermes-agent does not scan that path — run "
+            f"`rm -rf {legacy_dir}` to clean it up.\n"
+        )
 
     # Remove installs left under the old wrong default home (~/.hermes/hermes-agent).
     _cleanup_stale_home_roots(hermes_home, quiet)
