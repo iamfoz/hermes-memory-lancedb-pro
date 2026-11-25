@@ -86,7 +86,7 @@ a database at a mistyped `--path`. `doctor -q` prints only findings and errors.
 `search` is a recall-debugging tool: what it prints is what the agent can
 recall, including `--session-id` scoping. `stats --json` and `search --json`
 emit machine-readable output (search strips vectors). `doctor`, `stats`, and
-`--version` all report the package version for bug reports.
+`--version` all report the package version for bug reports. It reads the whole store; `--max-scan` (default 2000) caps how many eligible memories are compared in one pass.
 
 ### Plugin installation
 

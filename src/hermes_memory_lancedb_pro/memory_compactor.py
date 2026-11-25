@@ -56,7 +56,11 @@ class CompactionConfig:
     min_age_hours: int | None = None
     similarity_threshold: float = 0.88
     min_cluster_size: int = 2
-    max_memories_to_scan: int = 200
+    # Upper bound on the ELIGIBLE memories clustered in one pass (the whole
+    # store is always read; this caps the pairwise comparison). It used to be
+    # 200 raw rows read before filtering, so on a larger store most
+    # memories were never considered.
+    max_memories_to_scan: int = 2000
     dry_run: bool = False
     cooldown_hours: int = 24
 
@@ -104,6 +108,34 @@ class CompactionResult:
 # Clustering
 # ---------------------------------------------------------------------------
 
+def _similarity_rows(vectors: Sequence[Sequence[float]]):
+    """Return ``f(i) -> similarities of vector i to every vector``.
+
+    Uses numpy when it is importable and the vectors share one dimension:
+    clustering compares every pair, which in pure Python limits a pass to a
+    few hundred memories. The pure-Python path gives the same values."""
+    dims = {len(v) for v in vectors if v}
+    if len(dims) == 1:
+        try:
+            import numpy as np  # noqa: PLC0415 - optional speed-up
+
+            dim = dims.pop()
+            matrix = np.zeros((len(vectors), dim), dtype=np.float64)
+            for i, vec in enumerate(vectors):
+                if vec:
+                    matrix[i] = vec
+            norms = np.linalg.norm(matrix, axis=1)
+            norms[norms == 0.0] = 1.0  # zero / missing vectors stay all-zero
+            matrix /= norms[:, None]
+            return lambda i: matrix @ matrix[i]
+        except Exception:  # numpy missing or unusable: fall through
+            pass
+    return lambda i: [
+        cosine_similarity(list(vectors[i]), list(other)) if vectors[i] and other else 0.0
+        for other in vectors
+    ]
+
+
 def build_clusters(
     entries: Sequence[CompactionEntry],
     threshold: float,
@@ -118,6 +150,8 @@ def build_clusters(
     n = len(entries)
     if n < min_cluster_size:
         return []
+
+    similar_to = _similarity_rows([e.vector for e in entries])
 
     # Sort indices by importance desc; ties broken by original order
     order = sorted(range(n), key=lambda i: (-entries[i].importance, i))
@@ -138,13 +172,14 @@ def build_clusters(
         # written and was rediscovered, and failed, on every run.
         merged_chars = len(entries[seed_idx].text)
 
+        seed_sims = similar_to(seed_idx)
         for j in range(n):
             if assigned[j]:
                 continue
             other_vec = entries[j].vector
             if not other_vec:
                 continue
-            if cosine_similarity(seed_vec, other_vec) >= threshold:
+            if seed_sims[j] >= threshold:
                 extra = len(entries[j].text) + 1
                 if max_merged_chars is not None and merged_chars + extra > max_merged_chars:
                     continue  # left unassigned: it may seed or join another cluster
@@ -442,18 +477,36 @@ def _mergeable(category: str, meta_raw: object) -> bool:
     )
 
 
+def _all_rows(store: MemoryStore):
+    """Every row of the store. Falls back for stores (and test doubles)
+    whose `_scan_all` does not accept ``limit=None``."""
+    try:
+        return store._scan_all(limit=None)
+    except TypeError:
+        return store._scan_all()
+
+
 def _fetch_for_compaction(
     store: MemoryStore,
     cutoff_ms: int,
     scopes: Sequence[str] | None,
     limit: int,
 ) -> list[CompactionEntry]:
-    """Pull rows older than `cutoff_ms` (and not archived) with their
-    vectors intact. Hitting `_scan_all` is cheap on stores up to
-    MAX_SCAN_ROWS; very large stores should override this helper."""
+    """Pull the mergeable rows older than `cutoff_ms`, with their vectors.
+
+    The whole table is read (in pages) and `limit` caps the ELIGIBLE rows
+    kept, oldest first. Capping the raw read instead meant recent rows, task
+    pins and other excluded rows used up the window and most of a store
+    larger than the cap was never considered."""
     out: list[CompactionEntry] = []
     scope_set = set(scopes) if scopes else None
-    for row in store._scan_all(limit=limit):
+    for row in _all_rows(store):
+        if len(out) >= limit:
+            logger.info(
+                "memory-compactor: more than %d eligible memories; this pass "
+                "considers the first %d", limit, limit,
+            )
+            break
         ts = int(row.get("timestamp", 0) or 0)
         if ts > cutoff_ms:
             continue

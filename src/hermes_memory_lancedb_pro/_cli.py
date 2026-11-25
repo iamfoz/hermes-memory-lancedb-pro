@@ -532,7 +532,6 @@ def _reembed_advice(stats: dict[str, Any]) -> str | None:
 
 _ORPHAN_EXAMPLE_LIMIT = 5
 _OLD_PERIPHERAL_DAYS = 90
-_COMPACTION_MIN_AGE_DAYS = 7
 
 
 def _cmd_doctor(
@@ -618,7 +617,6 @@ def _cmd_doctor(
     # ---- Full scan for anomaly checks ----
     now_ms = int(time.time() * 1000)
     old_peripheral_cutoff = now_ms - (_OLD_PERIPHERAL_DAYS * 86_400_000)
-    compaction_cutoff = now_ms - (_COMPACTION_MIN_AGE_DAYS * 86_400_000)
 
     all_ids: set[str] = set()
     rows_by_id: dict[str, dict] = {}
@@ -627,7 +625,6 @@ def _cmd_doctor(
     old_peripheral_ids: list[str] = []
     cross_session_zero_access: list[str] = []
     archived_older_than_grace: int = 0
-    old_non_archived_count: int = 0
     expired_ids: list[str] = []  # active rows whose valid_until has passed
 
     # First pass — collect all ids
@@ -684,10 +681,6 @@ def _cmd_doctor(
             # Cross-session with zero access
             if cross_session and access_count == 0:
                 cross_session_zero_access.append(rid)
-
-            # Compaction candidates: old non-archived rows
-            if ts and ts < compaction_cutoff:
-                old_non_archived_count += 1
 
             # Past valid_until — hidden from recall when enforcement is on
             if _is_expired(meta, now_ms):
@@ -766,12 +759,15 @@ def _cmd_doctor(
             f"{archived_older_than_grace} archived rows older than 30 days."
         )
 
-    if old_non_archived_count > 0:
+    # Recommend compaction only when a dry run finds something to merge.
+    # (This used to fire whenever old rows existed, quoting their count as
+    # possible duplicates, and kept firing after every compaction.)
+    clusters, cluster_rows = _mergeable_clusters(store)
+    if clusters > 0:
         any_rec = True
         say(
             f"Run `hermes lancedb_pro compact --dry-run` to preview merging — "
-            f"{old_non_archived_count} old non-archived rows that may be "
-            "near-duplicates."
+            f"{clusters} cluster(s) of near-duplicate memories ({cluster_rows} rows)."
         )
 
     reembed_advice = _reembed_advice(stats)
@@ -784,6 +780,18 @@ def _cmd_doctor(
     say()
 
     return 0
+
+
+def _mergeable_clusters(store: MemoryStore) -> tuple[int, int]:
+    """(clusters, rows in them) a default `compact` would merge now; (0, 0)
+    when the check cannot run. Read-only."""
+    try:
+        from .memory_compactor import CompactionConfig, run_compaction
+
+        result = run_compaction(store, CompactionConfig(dry_run=True))
+        return result.clusters_found, sum(len(p.member_indices) for p in result.plans)
+    except Exception:
+        return 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -1002,7 +1010,7 @@ def _compact_args_error(args: argparse.Namespace) -> str | None:
         # 0 or less puts every row of a scope in one cluster and merges
         # unrelated memories into a single row.
         return f"--similarity must be in (0, 1], got {similarity}"
-    if getattr(args, "min_age_days", 7) < 0 or getattr(args, "max_scan", 200) <= 0:
+    if getattr(args, "min_age_days", 7) < 0 or getattr(args, "max_scan", 2000) <= 0:
         return "--min-age-days must be >= 0 and --max-scan must be > 0"
     return None
 
@@ -1090,7 +1098,7 @@ def _cmd_compact(
     cfg = CompactionConfig(
         min_age_days=getattr(args, "min_age_days", 7),
         similarity_threshold=getattr(args, "similarity", 0.88),
-        max_memories_to_scan=getattr(args, "max_scan", 200),
+        max_memories_to_scan=getattr(args, "max_scan", 2000),
         dry_run=True,
     )
     # Always plan first (no writes): the plan feeds both --dry-run and the
@@ -1272,9 +1280,10 @@ def _add_store_admin_parsers(subs) -> None:
                            help="Only consider rows older than N days (default: 7)")
     p_compact.add_argument("--similarity", type=float, default=0.88, metavar="X",
                            help="Cosine similarity threshold for clustering (default: 0.88)")
-    p_compact.add_argument("--max-scan", dest="max_scan", type=int, default=200,
+    p_compact.add_argument("--max-scan", dest="max_scan", type=int, default=2000,
                            metavar="N",
-                           help="Maximum rows to scan per pass (default: 200)")
+                           help="Maximum eligible memories compared per pass; the whole "
+                                "store is always read (default: 2000)")
     p_compact.add_argument("-y", "--yes", action="store_true",
                            help="Skip the confirmation prompt")
     p_compact.add_argument("--path", default=None, metavar="PATH",
