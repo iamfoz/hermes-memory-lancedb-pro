@@ -187,7 +187,7 @@ class TestAdminPathsStillSeeExpired:
         buf, old = io.StringIO(), sys.stdout
         sys.stdout = buf
         try:
-            assert _cmd_doctor(type("A", (), {"path": s.db_path, "quiet": True})(), _store=s) == 0
+            assert _cmd_doctor(type("A", (), {"path": s.db_path, "quiet": False})(), _store=s) == 0
         finally:
             sys.stdout = old
         out = buf.getvalue()

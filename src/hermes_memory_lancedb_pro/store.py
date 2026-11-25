@@ -14,6 +14,7 @@ Schema:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -21,9 +22,15 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Sequence
+import warnings
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:  # POSIX only; without it the in-use lock is a no-op.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 import lancedb
 from lancedb.pydantic import LanceModel, Vector
@@ -75,6 +82,13 @@ def _session_anchor_match(metadata: dict[str, Any], session_id: str, strict: boo
     return _match_session(metadata, session_id)
 
 
+IN_USE_LOCK_FILE = ".in-use.lock"
+
+
+class StoreInUseError(RuntimeError):
+    """The database is held by a running agent and cannot be converted."""
+
+
 def _serialised(method):
     """Run a MemoryStore method under the store's write lock."""
 
@@ -124,6 +138,52 @@ VECTOR_DIM: int = 768
 # than failing every turn. Read at load time, so it applies per process.
 EMBEDDING_DEVICE: str | None = os.environ.get("MEMORY_EMBEDDING_DEVICE", "").strip() or None
 
+# How stored text and queries are turned into embedder input, recorded per
+# database in EMBEDDING_SCHEME_FILE. nomic-embed-text is trained with task
+# prefixes ("search_document: " on stored text, "search_query: " on queries)
+# and retrieves noticeably worse without them, but every database written
+# before this was recorded holds unprefixed vectors. Mixing the two in one
+# table would compare vectors from different input distributions, so the
+# scheme is a property of the database: one with rows and no marker is
+# "plain" (legacy) until `hermes-memory reembed` converts it; a new database
+# starts on "task_prefix".
+EMBEDDING_SCHEME_FILE: str = "embedding_scheme.json"
+SCHEME_PLAIN: str = "plain"
+SCHEME_TASK_PREFIX: str = "task_prefix"
+EMBEDDING_SCHEMES = (SCHEME_PLAIN, SCHEME_TASK_PREFIX)
+EMBED_KINDS = ("document", "query")
+_NOMIC_TASK_PREFIXES: dict[str, str] = {
+    "document": "search_document: ",
+    "query": "search_query: ",
+}
+# Rows per embedder call in `reembed`, and how many catch-up passes it makes
+# for rows written by another process while it ran.
+REEMBED_BATCH_SIZE: int = 64
+_REEMBED_MAX_PASSES: int = 5
+
+
+# Models whose bundled custom code may be loaded automatically when the
+# installed transformers requires it.
+_TRUSTED_REMOTE_CODE_MODELS = frozenset({
+    "nomic-ai/nomic-embed-text-v1",
+    "nomic-ai/nomic-embed-text-v1.5",
+    "nomic-ai/nomic-embed-text-v2-moe",
+})
+
+
+def model_uses_task_prefixes(model_name: str | None) -> bool:
+    """True for models trained with nomic's search_document/search_query
+    prefixes (nomic-embed-text v1, v1.5, v2). Other models, including
+    nomic-embed-code, which uses different instructions, get raw text."""
+    return "nomic-embed-text" in str(model_name or "").lower()
+
+
+def _needs_trust_remote_code(exc: Exception) -> bool:
+    """True when a model load failed because its repository ships custom
+    modelling code that transformers will not run without consent."""
+    return "trust_remote_code" in str(exc)
+
+
 # One embedder operation at a time, process-wide. torch's MPS backend is not
 # thread-safe: two threads encoding concurrently abort in Metal ("A command
 # encoder is already encoding to this command buffer", SIGABRT/SIGSEGV) — e.g.
@@ -144,6 +204,19 @@ SEARCH_OVERFETCH_MULTIPLIER: int = 3
 
 # Index training threshold — LanceDB IVF_PQ needs ~256 rows minimum
 VECTOR_INDEX_MIN_ROWS: int = 256
+
+# Every vector query and vector index uses cosine distance (0 = same
+# direction, 1 = orthogonal, 2 = opposite), which is what `score = 1 -
+# _distance`, `min_score` and every dedup threshold assume. LanceDB defaults
+# to squared L2, which for unit vectors is `2 - 2*cos`: twice the cosine
+# distance, so a cos-0.5 match used to score 0.0.
+VECTOR_DISTANCE_TYPE: str = "cosine"
+
+# With an IVF_PQ index, `_distance` is a compressed (PQ) approximation that
+# can be off by 0.1 or more, which is enough to flip a dedup threshold.
+# Refining re-scores `limit * factor` candidates on the full vectors, so the
+# returned distances are exact. Without an index it is a no-op.
+VECTOR_REFINE_FACTOR: int = 5
 
 # Auto-compaction threshold. Every `_table.add()` writes a new on-disk data
 # fragment, and every read has to open every fragment of the table's current
@@ -215,6 +288,12 @@ CROSS_SESSION_PROMOTION_THRESHOLD: int = env_int("MEMORY_CROSS_SESSION_PROMOTION
 ENFORCE_VALID_UNTIL: bool = os.environ.get(
     "MEMORY_ENFORCE_VALID_UNTIL", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
+
+
+def _rrf_to_score(rrf: Any) -> float:
+    """Map an RRF score onto [0, 1]. RRF scores are 0..~0.033 (1/61 + 1/61
+    for a row ranked first by both legs); scaling by 30 puts that near 1.0."""
+    return max(0.0, min(1.0, float(rrf or 0.0) * 30.0))
 
 
 def _hidden_from_recall(metadata: Any, now_ms: int) -> bool:
@@ -430,6 +509,12 @@ class MemoryStore:
         self.embedding_model_name = embedding_model
         self._embedder: SentenceTransformer | None = None
         self._embedder_lock = threading.Lock()
+        # Embedding scheme of this database (see EMBEDDING_SCHEME_FILE), set
+        # by _initialise. `_scheme_stamp` identifies the marker file version
+        # it was read from, so a `reembed` run by another process (the CLI
+        # while the agent runs) is picked up on the next encode.
+        self._scheme: str | None = None
+        self._scheme_stamp: tuple[int, int, int] | None = None
         # Serialises read-modify-write sequences on a row's metadata (update,
         # supersede, access counting, forget). Without it concurrent callers
         # — the provider's prefetch, sync and extraction threads share one
@@ -479,6 +564,7 @@ class MemoryStore:
         Path(self.db_path).mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(self.db_path)
         self._ensure_table()
+        self._init_embedding_scheme()
         self._initialised = True
 
     def _load_embedder(self):
@@ -500,15 +586,42 @@ class MemoryStore:
         and failing every turn would be worse than ignoring it."""
         device = EMBEDDING_DEVICE
         if not device:
-            return sentence_transformer_cls(self.embedding_model_name)
+            return self._new_model(sentence_transformer_cls)
         try:
-            return sentence_transformer_cls(self.embedding_model_name, device=device)
+            return self._new_model(sentence_transformer_cls, device=device)
         except Exception as e:
             logger.warning(
                 "MEMORY_EMBEDDING_DEVICE=%r could not be used (%s); falling back "
                 "to automatic device selection", device, e,
             )
-            return sentence_transformer_cls(self.embedding_model_name)
+            return self._new_model(sentence_transformer_cls)
+
+    def _new_model(self, sentence_transformer_cls, **kwargs):
+        """Construct the model, retrying with ``trust_remote_code=True`` for
+        nomic-embed-text when the installed transformers needs it.
+
+        nomic-embed-text v1/v1.5 ship custom NomicBert modelling code. Some
+        transformers / sentence-transformers releases load them natively,
+        others refuse without ``trust_remote_code=True``. Trying without it
+        first keeps a load that works today unchanged; the retry is limited
+        to nomic models so a user-chosen model never runs remote code
+        implicitly."""
+        try:
+            return sentence_transformer_cls(self.embedding_model_name, **kwargs)
+        except Exception as e:
+            # Exact official repositories only: a third-party or local model
+            # whose name merely contains "nomic-embed-text" must never have
+            # its custom code run without the user asking for it.
+            if not (str(self.embedding_model_name).lower() in _TRUSTED_REMOTE_CODE_MODELS
+                    and _needs_trust_remote_code(e)):
+                raise
+            logger.info(
+                "Loading %s needs its custom model code; retrying with "
+                "trust_remote_code=True", self.embedding_model_name,
+            )
+            return sentence_transformer_cls(
+                self.embedding_model_name, trust_remote_code=True, **kwargs,
+            )
 
     def warmup(self) -> None:
         """Pre-load the embedding model + run a throwaway encode.
@@ -529,6 +642,12 @@ class MemoryStore:
                 )
         except Exception as e:
             logger.warning("MemoryStore.warmup encode failed: %s", e)
+        # Background housekeeping that must stay off the start-up path.
+        try:
+            self._initialise()
+            self._migrate_vector_index_metric()
+        except Exception as e:
+            logger.warning("MemoryStore.warmup index migration failed: %s", e)
 
     def _ensure_table(self):
         """Open or create the memories table; create the FTS index on `text`.
@@ -547,6 +666,10 @@ class MemoryStore:
             existing_tables = self._db.table_names()
         if table_name in existing_tables:
             self._table = self._db.open_table(table_name)
+            # The vector-index metric migration is NOT done here: retraining
+            # an index takes seconds on a large store and this runs inside
+            # the provider's synchronous start-up, and in read-only CLI
+            # commands. `warmup()` does it, in the background.
             return
 
         try:
@@ -562,9 +685,79 @@ class MemoryStore:
         except Exception as e:  # pragma: no cover — defensive
             logger.warning("Failed to create FTS index on 'text': %s", e)
 
+    def _vector_index_metric(self) -> str | None:
+        """Distance metric of the index on the `vector` column, lower-cased
+        ("l2", "cosine", "dot"); "" when an index exists but its metric
+        cannot be read; None when there is no vector index."""
+        try:
+            indices = self._table.list_indices()
+        except Exception:
+            return None
+        for idx in indices:
+            if "vector" not in list(getattr(idx, "columns", None) or []):
+                continue
+            metric = None
+            with contextlib.suppress(Exception):
+                metric = self._table.index_stats(idx.name).distance_type
+            if not metric:
+                details = getattr(idx, "index_details", None) or {}
+                metric = details.get("metric_type")
+            return str(metric or "").lower()
+        return None
+
+    def _build_vector_index(self) -> None:
+        # The metric-first form is the call every supported lancedb accepts
+        # (>= 0.25); newer releases flag it as deprecated, which is noise here.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            self._table.create_index(
+                metric=VECTOR_DISTANCE_TYPE, vector_column_name="vector", replace=True,
+            )
+
+    def _migrate_vector_index_metric(self) -> None:
+        """Rebuild, once, a vector index built with another metric.
+
+        Databases indexed before cosine was set explicitly carry an L2
+        IVF_PQ index. A cosine query against it still returns correct
+        distances, but LanceDB falls back to a brute-force scan and logs a
+        warning on every query. The index holds no data of its own, so
+        replacing it loses nothing. If the rebuild fails (for example the
+        table has shrunk below what IVF_PQ can train on), the stale index is
+        dropped so queries stay exact and quiet; `maybe_create_vector_index`
+        builds a cosine one later."""
+        metric = self._vector_index_metric()
+        if not metric or metric == VECTOR_DISTANCE_TYPE:
+            return
+        logger.info(
+            "Rebuilding the %s vector index with the %s metric",
+            metric, VECTOR_DISTANCE_TYPE,
+        )
+        try:
+            self._build_vector_index()
+            return
+        except Exception as e:
+            logger.warning("Rebuilding the %s vector index failed: %s", metric, e)
+        try:
+            # Another process may have rebuilt it meanwhile: look again
+            # before dropping, so a fresh cosine index is never removed.
+            self._checkout_latest()
+            if self._vector_index_metric() in (VECTOR_DISTANCE_TYPE, None, ""):
+                return
+            for idx in self._table.list_indices():
+                if "vector" in list(getattr(idx, "columns", None) or []):
+                    self._table.drop_index(idx.name)
+        except Exception as e:
+            logger.warning("Dropping the %s vector index failed: %s", metric, e)
+
     def maybe_create_vector_index(self) -> bool:
-        """Create the IVF_PQ vector index when there are enough rows to train.
-        Returns True if the index was just created, False otherwise."""
+        """Create the cosine IVF_PQ vector index when there are enough rows
+        to train, or rebuild one that uses another metric. Returns True if
+        an index was just built, False otherwise."""
+        metric = self._vector_index_metric()
+        if metric in (VECTOR_DISTANCE_TYPE, ""):
+            # Already right, or unreadable: never rebuild on every call
+            # (create_index replaces by default).
+            return False
         try:
             row_count = len(self._table)
         except Exception:
@@ -572,14 +765,19 @@ class MemoryStore:
         if row_count < VECTOR_INDEX_MIN_ROWS:
             return False
         try:
-            self._table.create_index(vector_column_name="vector")
+            self._build_vector_index()
             return True
         except Exception as e:
-            msg = str(e).lower()
-            if "already exists" in msg or "exists" in msg:
-                return False
             logger.warning("Vector index creation failed: %s", e)
             return False
+
+    def _vector_query(self, vector: Sequence[float]):
+        """Start a vector query whose `_distance` is exact cosine distance."""
+        return (
+            self._table.search(list(vector), vector_column_name="vector")
+            .distance_type(VECTOR_DISTANCE_TYPE)
+            .refine_factor(VECTOR_REFINE_FACTOR)
+        )
 
     # ----- maintenance -----
 
@@ -587,13 +785,37 @@ class MemoryStore:
         """Append `rows` to the table, then run cooldown-gated fragment
         compaction.
 
-        Every write path funnels through here so a single counter sees all
+        Every append funnels through here (updates and deletes through
+        `_table_update` / `_table_delete`) so a single counter sees all
         fragment-creating writes. Keeping `self._table.add` out of the
         individual CRUD methods means the compaction policy — and the
         file-descriptor-exhaustion guard — live in exactly one place.
         See `optimize`."""
         try:
             self._table.add(rows)
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
+        self._maybe_optimize()
+
+    def _table_update(self, *, where: str, values: dict[str, Any]) -> None:
+        """`table.update` that also feeds the auto-optimize counter.
+
+        Updates rewrite the row into a new data file and a new table version,
+        so they accumulate fragments exactly like appends do — recall
+        bookkeeping alone is one update per recalled memory per turn."""
+        try:
+            self._table.update(where=where, values=values)
+        except Exception as _e:
+            _raise_if_fd_exhaustion(_e)
+            raise
+        self._maybe_optimize()
+
+    def _table_delete(self, where: str) -> None:
+        """`table.delete` that also feeds the auto-optimize counter (deletes
+        leave deletion files and a new version behind)."""
+        try:
+            self._table.delete(where)
         except Exception as _e:
             _raise_if_fd_exhaustion(_e)
             raise
@@ -675,28 +897,146 @@ class MemoryStore:
             return vec
         return vec.tolist()  # numpy.ndarray, torch.Tensor, etc.
 
-    def encode(self, text: str) -> list[float]:
-        """Encode text into a single normalised 768-d vector. Thread-safe:
-        embedder calls are serialised process-wide (see _ENCODE_LOCK)."""
+    # ----- embedding scheme -----
+
+    @property
+    def scheme_marker_path(self) -> str:
+        return os.path.join(self.db_path, EMBEDDING_SCHEME_FILE)
+
+    @property
+    def preferred_embedding_scheme(self) -> str:
+        """The scheme a new database gets, and `reembed` converts to."""
+        if model_uses_task_prefixes(self.embedding_model_name):
+            return SCHEME_TASK_PREFIX
+        return SCHEME_PLAIN
+
+    def _marker_stamp(self) -> tuple[int, int, int] | None:
+        try:
+            st = os.stat(self.scheme_marker_path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def read_scheme_marker(self) -> dict[str, Any] | None:
+        """The parsed marker file, or None when it is missing or unreadable."""
+        try:
+            with open(self.scheme_marker_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("scheme") not in EMBEDDING_SCHEMES:
+            return None
+        return data
+
+    def _write_scheme_marker(self, scheme: str, **extra: Any) -> None:
+        """Atomically replace the marker: readers see the old file or the
+        new one, never a torn write."""
+        payload = {
+            "scheme": scheme,
+            "model": self.embedding_model_name,
+            "updated_at": int(time.time() * 1000),
+            **extra,
+        }
+        tmp = f"{self.scheme_marker_path}.tmp-{os.getpid()}-{threading.get_ident()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.scheme_marker_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+        self._scheme = scheme
+        self._scheme_stamp = self._marker_stamp()
+
+    def _init_embedding_scheme(self) -> None:
+        """Decide this database's scheme: the marker's when there is one;
+        "plain" for a legacy database (rows, no marker), whose vectors were
+        all made without prefixes; otherwise (empty) the preferred scheme,
+        recorded so later opens agree."""
+        stamp = self._marker_stamp()
+        marker = self.read_scheme_marker() if stamp is not None else None
+        if marker is not None:
+            self._scheme, self._scheme_stamp = marker["scheme"], stamp
+            return
+        try:
+            empty = self._table.count_rows() == 0
+        except Exception:
+            empty = False  # unknown: assume existing vectors, change nothing
+        if not empty:
+            self._scheme = SCHEME_PLAIN
+            return
+        try:
+            self._write_scheme_marker(self.preferred_embedding_scheme)
+        except OSError as e:
+            # Unrecorded, a later open would see rows and no marker and
+            # treat them as plain, so plain is the only consistent choice.
+            logger.warning(
+                "Could not record the embedding scheme in %s (%s); using %r",
+                self.scheme_marker_path, e, SCHEME_PLAIN,
+            )
+            self._scheme = SCHEME_PLAIN
+
+    @property
+    def embedding_scheme(self) -> str:
+        """This database's current scheme, re-read when the marker changed
+        on disk (another process ran `reembed`)."""
+        stamp = self._marker_stamp()
+        if stamp is not None and stamp != self._scheme_stamp:
+            marker = self.read_scheme_marker()
+            if marker is not None:
+                self._scheme, self._scheme_stamp = marker["scheme"], stamp
+        return self._scheme or SCHEME_PLAIN
+
+    def _embedder_input(
+        self, texts: list[str], kind: str, scheme: str | None = None,
+    ) -> list[str]:
+        if kind not in EMBED_KINDS:
+            raise ValueError(f"encode: kind must be one of {EMBED_KINDS}, got {kind!r}")
+        scheme = scheme or self.embedding_scheme
+        if scheme != SCHEME_TASK_PREFIX or not model_uses_task_prefixes(
+            self.embedding_model_name
+        ):
+            return texts
+        prefix = _NOMIC_TASK_PREFIXES[kind]
+        return [prefix + t for t in texts]
+
+    def _encode_many(self, texts: Sequence[str], kind: str, scheme: str | None = None):
+        """Raw embedder output (one row per text) under this store's scheme,
+        or `scheme` when given (`reembed`)."""
+        inputs = self._embedder_input(list(texts), kind, scheme)
         # Resolve (and if needed load) the model BEFORE taking the encode
         # lock — loading takes _embedder_lock then the encode lock, and the
         # order must be the same everywhere.
         model = self.embedder
         with self._encode_lock:
-            vector = model.encode(text, normalize_embeddings=True)
-        return self._to_list(vector)
-
-    def encode_batch(self, texts: Sequence[str]) -> list[list[float]]:
-        """Encode many texts in one shot. Use this for bulk inserts.
-        Thread-safe, like :meth:`encode`."""
-        model = self.embedder
-        with self._encode_lock:
-            vectors = model.encode(
-                list(texts),
+            return model.encode(
+                inputs,
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-        return [self._to_list(v) for v in vectors]
+
+    def encode(self, text: str, *, kind: str = "document") -> list[float]:
+        """Encode text into a single normalised 768-d vector. Thread-safe:
+        embedder calls are serialised process-wide (see _ENCODE_LOCK).
+
+        `kind` is "document" for text that is stored, or compared with
+        stored text (dedup), and "query" for a search query; with the
+        "task_prefix" scheme it picks nomic's prefix."""
+        (text,) = self._embedder_input([text], kind)
+        model = self.embedder
+        with self._encode_lock:
+            vector = model.encode(text, normalize_embeddings=True)
+        return self._to_list(vector)
+
+    def encode_batch(
+        self, texts: Sequence[str], *, kind: str = "document",
+    ) -> list[list[float]]:
+        """Encode many texts in one shot. Use this for bulk inserts.
+        Thread-safe, like :meth:`encode`; `kind` as for :meth:`encode`."""
+        return [self._to_list(v) for v in self._encode_many(texts, kind)]
 
     # ----- internals -----
 
@@ -786,7 +1126,7 @@ class MemoryStore:
             tier=tier, confidence=confidence, now_ms=now_ms, extra=metadata_extra
         )
 
-        vector = self.encode(text)
+        vector = self.encode(text, kind="document")
         self._table_add([
             MemorySchema(
                 id=mem_id,
@@ -822,7 +1162,7 @@ class MemoryStore:
                     f"exceeding the {MAX_TEXT_CHARS}-char limit "
                     f"(MEMORY_MAX_TEXT_CHARS) — summarise or split it."
                 )
-        vectors = self.encode_batch(texts)
+        vectors = self.encode_batch(texts, kind="document")
 
         now_ms = int(time.time() * 1000)
         for entry, vector in zip(entries, vectors, strict=True):
@@ -953,7 +1293,7 @@ class MemoryStore:
         the vector was just computed for the write)."""
         if not vector:
             return []
-        search = self._table.search(list(vector), vector_column_name="vector")
+        search = self._vector_query(vector)
         where = self._filters_clause(category, scope)
         if where:
             search = search.where(where)
@@ -1008,6 +1348,11 @@ class MemoryStore:
         existing = self.get_by_id(mem_id)
         if existing is None:
             return None
+        if _is_archived(existing["metadata"]):
+            # The chain led to an archived row: its successor is gone. Editing
+            # or superseding it would resurrect a stale version, so treat it
+            # as not updatable (it can still be read or forgotten).
+            return None
 
         metadata = _parse_metadata(existing["metadata"])
         now_ms = int(time.time() * 1000)
@@ -1049,7 +1394,7 @@ class MemoryStore:
                 category = "other"
             update_values["category"] = category
 
-        self._table.update(
+        self._table_update(
             where=f"id = '{_escape_sql(effective_id)}'",
             values=update_values,
         )
@@ -1122,7 +1467,7 @@ class MemoryStore:
             else float(existing["importance"])
         )
 
-        vector = self.encode(text)
+        vector = self.encode(text, kind="document")
 
         # Atomic-ish: do the write of the new row first so a partial failure
         # leaves the old row visible (preferred over a missing row).
@@ -1139,7 +1484,7 @@ class MemoryStore:
             )
         ])
 
-        self._table.update(
+        self._table_update(
             where=f"id = '{_escape_sql(old_id)}'",
             values={"metadata": json.dumps(archived_meta)},
         )
@@ -1160,7 +1505,7 @@ class MemoryStore:
         if not purge_history:
             # get_by_id follows the supersede chain; delete the resolved live
             # row rather than an already-archived predecessor.
-            self._table.delete(f"id = '{_escape_sql(existing['id'])}'")
+            self._table_delete(f"id = '{_escape_sql(existing['id'])}'")
             return True
         # get_by_id follows the supersede chain forward to the live row;
         # walk `supersedes` back from there to collect the whole lineage.
@@ -1177,7 +1522,7 @@ class MemoryStore:
         if mem_id not in seen:
             lineage.append(mem_id)
         id_list = ", ".join(f"'{_escape_sql(i)}'" for i in lineage)
-        self._table.delete(f"id IN ({id_list})")
+        self._table_delete(f"id IN ({id_list})")
         return True
 
     def delete(self, mem_id: str) -> bool:
@@ -1208,7 +1553,8 @@ class MemoryStore:
         "memory was actually used" signal from the agent). Pass
         `throttle_seconds=N` to override the default cooldown."""
         existing = self.get_by_id(mem_id)
-        if existing is None:
+        if existing is None or _is_archived(existing["metadata"]):
+            # Archived with no live successor: nothing to count against.
             return False
 
         metadata = _parse_metadata(existing["metadata"])
@@ -1231,7 +1577,7 @@ class MemoryStore:
         # get_by_id follows the supersede chain, so `existing` may be the live
         # successor of `mem_id`. Write to the row we read: writing its metadata
         # onto the archived `mem_id` row would un-archive the stale version.
-        self._table.update(
+        self._table_update(
             where=f"id = '{_escape_sql(existing['id'])}'",
             values={"metadata": json.dumps(metadata)},
         )
@@ -1308,7 +1654,7 @@ class MemoryStore:
                         )
 
             try:
-                self._table.update(
+                self._table_update(
                     where=f"id = '{_escape_sql(mem_id)}'",
                     values={"metadata": json.dumps(metadata)},
                 )
@@ -1326,10 +1672,17 @@ class MemoryStore:
         archived with a ``superseded_by`` pointer, the method follows that
         chain until it reaches the current live version, guarding against
         cycles with a depth limit of 32.
+
+        When the next hop is missing (the successor was deleted by `forget`
+        or the compactor) the last row found is returned — an archived row
+        whose `state` says so — so the history stays addressable. Callers
+        that would change a row (`update`, `increment_access_count`) refuse
+        such a row rather than touch a stale version.
         """
         self._checkout_latest()
         seen: set[str] = set()
         current_id = mem_id
+        last_row: dict[str, Any] | None = None
         while True:
             results = (
                 self._table.search()
@@ -1338,8 +1691,9 @@ class MemoryStore:
                 .to_list()
             )
             if not results:
-                return None
+                return last_row
             row = self._row_to_dict(results[0])
+            last_row = row
             if not follow_chain:
                 return row
             meta = row.get("metadata") or {}
@@ -1453,6 +1807,75 @@ class MemoryStore:
             fetch_limit = min(fetch_limit * 4, MAX_SCAN_ROWS)
         return rows[offset : offset + limit]
 
+    # Columns the recall anchors need; the 768-d vector is never read.
+    _ANCHOR_COLUMNS = (
+        "id", "text", "category", "scope", "importance", "timestamp", "metadata",
+    )
+
+    @staticmethod
+    def _like_any(key: str, value_json: str) -> str:
+        """LIKE test for `"key": value` under both json.dumps spacings."""
+        # LIKE treats a backslash as its escape character, and JSON text
+        # contains backslashes for quotes, backslashes and non-ASCII
+        # characters. Double them so the pattern matches the stored text
+        # literally; otherwise such a session id matched nothing.
+        v = _escape_sql(value_json.replace("\\", "\\\\"))
+        k = _escape_sql(json.dumps(key).replace("\\", "\\\\"))
+        return f"(metadata LIKE '%{k}: {v}%' OR metadata LIKE '%{k}:{v}%')"
+
+    def _session_anchor_rows(
+        self, session_id: str, strict: bool
+    ) -> list[dict[str, Any]]:
+        """Recallable rows for `session_id`, unordered, read in one scan.
+
+        The session test is pushed into the query as a LIKE prefilter and
+        then re-checked in Python (LIKE wildcards in an id only ever
+        over-match), so the cost no longer grows with the whole table, and
+        no vector column is loaded. Returns [] on a scan error."""
+        sess = self._like_any("source_session", json.dumps(session_id))
+        if strict:
+            session_clause = sess
+        else:
+            session_clause = " OR ".join(
+                [sess, self._like_any("cross_session", "true")]
+                + [self._like_any("tier", json.dumps(t)) for t in sorted(CROSS_SESSION_TIERS)]
+            )
+        where = _and_clauses(
+            "timestamp > 0",
+            session_clause,
+            "NOT " + self._like_any("state", json.dumps(ARCHIVED_STATE)),
+        )
+        try:
+            raw = (
+                self._table.search()
+                .where(where)
+                .select(list(self._ANCHOR_COLUMNS))
+                .limit(MAX_SCAN_ROWS)
+                .to_list()
+            )
+        except Exception:
+            return []
+        now_ms = int(time.time() * 1000)
+        out = []
+        for r in raw:
+            d = self._row_to_dict(r)
+            if _hidden_from_recall(d["metadata"], now_ms):
+                continue
+            if not _session_anchor_match(d["metadata"], session_id, strict):
+                continue
+            out.append(d)
+        return out
+
+    def anchors_for_session(
+        self, session_id: str, limit: int = 2, *, strict: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """`(first_for_session, recent_for_session)` from a single scan."""
+        if not session_id:
+            return [], []
+        rows = self._session_anchor_rows(session_id, strict)
+        rows.sort(key=lambda x: x.get("timestamp", 0))
+        return rows[:limit], rows[::-1][:limit]
+
     def recent_for_session(
         self, session_id: str, limit: int = 2, *, strict: bool = False
     ) -> list[dict[str, Any]]:
@@ -1463,28 +1886,7 @@ class MemoryStore:
         Used by the recall path as a recency anchor so the agent keeps sight
         of the latest instruction even when the current query is semantically
         distant from earlier task framing."""
-        if not session_id:
-            return []
-        try:
-            rows = (
-                self._table.search()
-                .where("timestamp > 0")
-                .limit(MAX_SCAN_ROWS)
-                .to_list()
-            )
-        except Exception:
-            return []
-        now_ms = int(time.time() * 1000)
-        out = []
-        for r in rows:
-            d = self._row_to_dict(r)
-            if _hidden_from_recall(d["metadata"], now_ms):
-                continue
-            if not _session_anchor_match(d["metadata"], session_id, strict):
-                continue
-            out.append(d)
-        out.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-        return out[:limit]
+        return self.anchors_for_session(session_id, limit, strict=strict)[1]
 
     def first_for_session(
         self, session_id: str, limit: int = 2, *, strict: bool = False
@@ -1495,28 +1897,7 @@ class MemoryStore:
         Used alongside `recent_for_session` to pin task-framing memories
         (written at the start of a session) so they are always injected even
         after many subsequent turns push them out of the recency window."""
-        if not session_id:
-            return []
-        try:
-            rows = (
-                self._table.search()
-                .where("timestamp > 0")
-                .limit(MAX_SCAN_ROWS)
-                .to_list()
-            )
-        except Exception:
-            return []
-        now_ms = int(time.time() * 1000)
-        out = []
-        for r in rows:
-            d = self._row_to_dict(r)
-            if _hidden_from_recall(d["metadata"], now_ms):
-                continue
-            if not _session_anchor_match(d["metadata"], session_id, strict):
-                continue
-            out.append(d)
-        out.sort(key=lambda x: x.get("timestamp", 0))  # ascending — oldest first
-        return out[:limit]
+        return self.anchors_for_session(session_id, limit, strict=strict)[0]
 
     def search(
         self,
@@ -1545,7 +1926,13 @@ class MemoryStore:
         threshold. Semantics depend on the mode:
           - vector: keep iff `(1 - _distance) >= min_score`  (cosine)
           - bm25:   keep iff `_score >= min_score`           (FTS rank)
-          - hybrid: keep iff `_rrf_score >= min_score`        (fused rank)
+          - hybrid: keep iff `score >= min_score`             (the 0-1 `score`
+            derived from the fused rank; the raw `_rrf_score` tops out near
+            0.033, so a threshold on it could never be met by a sane value)
+
+        Every result carries a `score` in [0, 1], higher is better: cosine
+        similarity `1 - _distance` (vector), `_score / 10` (bm25), or
+        `_rrf_score * 30` (hybrid, so it follows the hybrid ranking).
         """
         if not query_text or not query_text.strip():
             return []
@@ -1612,8 +1999,8 @@ class MemoryStore:
         min_score: float | None = None,
     ) -> list[dict[str, Any]]:
         self._checkout_latest()
-        vector = self.encode(query_text)
-        search = self._table.search(vector, vector_column_name="vector")
+        vector = self.encode(query_text, kind="query")
+        search = self._vector_query(vector)
         where = self._filters_clause(category, scope)
         if where:
             search = search.where(where)
@@ -1687,7 +2074,8 @@ class MemoryStore:
         """Reciprocal Rank Fusion of vector + BM25 results.
 
         Always returns plain dicts (with `_rrf_score` set) for parity with
-        the other search modes."""
+        the other search modes. `score` is derived from `_rrf_score`, so it
+        follows the returned order."""
         candidate = max(limit * 2, 10)
         vector_results = self._vector_search(
             query_text, candidate, category, scope,
@@ -1703,6 +2091,7 @@ class MemoryStore:
         b_rank = {r["id"]: i + 1 for i, r in enumerate(bm25_results)}
 
         rrf_k = 60
+        bm25_map = {r["id"]: r for r in bm25_results}
         merged: dict[str, dict[str, Any]] = {}
         for entry in vector_results:
             mid = entry["id"]
@@ -1710,6 +2099,9 @@ class MemoryStore:
                 1.0 / (rrf_k + v_rank[mid])
                 + (1.0 / (rrf_k + b_rank[mid]) if mid in b_rank else 0.0)
             )
+            # Keep the BM25 leg's raw signal on rows found by both legs.
+            if mid in bm25_map and "_score" in bm25_map[mid]:
+                entry["_score"] = bm25_map[mid]["_score"]
             merged[mid] = entry
 
         for entry in bm25_results:
@@ -1722,6 +2114,11 @@ class MemoryStore:
             )
             merged[mid] = entry
 
+        # The legs' `_row_to_dict` set `score` from their own signal (cosine
+        # or BM25), which mixed two scales and did not follow this ranking.
+        for entry in merged.values():
+            entry["score"] = _rrf_to_score(entry["_rrf_score"])
+
         ranked = sorted(
             merged.values(),
             key=lambda e: e.get("_rrf_score", 0.0),
@@ -1730,7 +2127,7 @@ class MemoryStore:
         if min_score is not None:
             ranked = [
                 r for r in ranked
-                if float(r.get("_rrf_score") or 0.0) >= min_score
+                if _rrf_to_score(float(r.get("_rrf_score") or 0.0)) >= min_score
             ]
         return ranked[:limit]
 
@@ -1738,20 +2135,32 @@ class MemoryStore:
 
     def stats(self) -> dict[str, Any]:
         """Return memory store statistics. Counts include archived rows;
-        use `purge_archived` to remove them. The category/tier breakdowns
-        scan up to MAX_SCAN_ROWS rows; very large stores may want a sampling
-        strategy instead."""
+        use `purge_archived` to remove them. The breakdowns read every row
+        (metadata only, in pages).
+
+        When the table cannot be read, `scan_error` holds the message and
+        the active / archived counts are not meaningful (they stay 0) —
+        callers must not present that as a healthy empty store."""
+        scan_error: str | None = None
         try:
             count = len(self._table)
-        except Exception:
+        except Exception as e:
             count = 0
+            scan_error = str(e)
 
         cat_counts: dict[str, int] = {}
         tier_counts: dict[str, int] = {}
         active_count = 0
         archived_count = 0
 
-        for row in self._scan_all(limit=MAX_SCAN_ROWS):
+        try:
+            rows = list(self._scan_all(
+                limit=None, strict=True, columns=("category", "metadata"),
+            ))
+        except Exception as e:
+            rows = []
+            scan_error = scan_error or str(e)
+        for row in rows:
             cat = row.get("category", "unknown")
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
             meta = _parse_metadata(row.get("metadata", "{}"))
@@ -1762,30 +2171,52 @@ class MemoryStore:
             else:
                 active_count += 1
 
-        return {
+        result = {
             "total_memories": count,
             "active_memories": active_count,
             "archived_memories": archived_count,
             "db_path": self.db_path,
             "embedding_model": self.embedding_model_name,
             "embedding_device": self._embedding_device_label(),
+            "embedding_scheme": self.embedding_scheme,
+            "embedding_scheme_preferred": self.preferred_embedding_scheme,
+            "reembed_interrupted": self.reembed_interrupted(),
             "vector_dimensions": VECTOR_DIM,
             "categories": cat_counts,
             "tiers": tier_counts,
         }
+        if scan_error is not None:
+            result["scan_error"] = scan_error
+        return result
+
+    _PURGE_BATCH = 500
+
+    def _delete_ids(self, ids: list[str]) -> None:
+        """Delete rows by id in batches (one table version per batch)."""
+        for i in range(0, len(ids), self._PURGE_BATCH):
+            chunk = ids[i : i + self._PURGE_BATCH]
+            in_list = ", ".join(f"'{_escape_sql(m)}'" for m in chunk)
+            self._table_delete(f"id IN ({in_list})")
 
     def purge_archived(
-        self, grace_period_days: int = 30, *, dry_run: bool = False
+        self,
+        grace_period_days: int = 30,
+        *,
+        dry_run: bool = False,
+        strict: bool = False,
     ) -> int:
         """Permanently delete archived memories older than grace_period_days.
 
         Returns the number of entries deleted. With ``dry_run=True`` nothing
         is deleted — the return value is the count a real run would remove.
-        Iterates pages so stores larger than MAX_SCAN_ROWS are still cleaned
-        up correctly."""
+        Every row is examined (in pages, without vectors), however large the
+        store. With ``strict=True`` an unreadable table raises instead of
+        reporting 0."""
         cutoff_ms = int(time.time() * 1000) - (grace_period_days * 24 * 60 * 60 * 1000)
-        purged = 0
-        for row in self._scan_all(limit=MAX_SCAN_ROWS):
+        to_delete: list[str] = []
+        for row in self._scan_all(
+            limit=None, strict=strict, columns=("id", "metadata")
+        ):
             meta = _parse_metadata(row.get("metadata", "{}"))
             if meta.get("state") != ARCHIVED_STATE:
                 continue
@@ -1793,11 +2224,11 @@ class MemoryStore:
             if invalidated and invalidated < cutoff_ms:
                 mem_id = row.get("id")
                 if mem_id:
-                    if not dry_run:
-                        self._table.delete(f"id = '{_escape_sql(mem_id)}'")
-                    purged += 1
+                    to_delete.append(mem_id)
 
+        purged = len(to_delete)
         if purged and not dry_run:
+            self._delete_ids(to_delete)
             logger.info(
                 "Purged %d archived memories older than %d days",
                 purged, grace_period_days,
@@ -1805,7 +2236,11 @@ class MemoryStore:
         return purged
 
     def purge_expired(
-        self, grace_period_days: int = 30, *, dry_run: bool = False
+        self,
+        grace_period_days: int = 30,
+        *,
+        dry_run: bool = False,
+        strict: bool = False,
     ) -> int:
         """Permanently delete memories whose ``valid_until`` passed more than
         *grace_period_days* ago.
@@ -1818,23 +2253,230 @@ class MemoryStore:
         number deleted, or with ``dry_run=True`` the number a real run would
         delete."""
         cutoff_ms = int(time.time() * 1000) - (grace_period_days * 24 * 60 * 60 * 1000)
-        purged = 0
-        for row in self._scan_all(limit=MAX_SCAN_ROWS):
+        to_delete: list[str] = []
+        for row in self._scan_all(
+            limit=None, strict=strict, columns=("id", "metadata")
+        ):
             meta = _parse_metadata(row.get("metadata", "{}"))
             if meta.get("state") == ARCHIVED_STATE or not _is_expired(meta, cutoff_ms):
                 continue
             mem_id = row.get("id")
             if mem_id:
-                if not dry_run:
-                    self._table.delete(f"id = '{_escape_sql(mem_id)}'")
-                purged += 1
+                to_delete.append(mem_id)
 
+        purged = len(to_delete)
         if purged and not dry_run:
+            self._delete_ids(to_delete)
             logger.info(
                 "Purged %d memories expired more than %d days ago",
                 purged, grace_period_days,
             )
         return purged
+
+    # -- in-use lock ---------------------------------------------------------
+    # A running agent encodes a vector and may write it seconds later (after
+    # LLM dedup calls). If the embedding scheme changed in between, that row
+    # would carry a vector of the old scheme in a store marked as new, and
+    # no later pass could tell. So `reembed` needs the store to itself: the
+    # agent holds a shared flock on IN_USE_LOCK_FILE for as long as it runs,
+    # and `reembed` takes it exclusively or refuses.
+
+    def hold_in_use_lock(self) -> bool:
+        """Mark this database as in use by a running agent (shared lock,
+        kept until the process exits). Returns False when `reembed` is
+        converting it right now, or locking is unavailable."""
+        if fcntl is None or getattr(self, "_in_use_fd", None) is not None:
+            return getattr(self, "_in_use_fd", None) is not None
+        try:
+            os.makedirs(self.db_path, exist_ok=True)
+            fd = os.open(os.path.join(self.db_path, IN_USE_LOCK_FILE),
+                         os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._in_use_fd = fd
+        return True
+
+    @contextlib.contextmanager
+    def _exclusive_use(self) -> Iterator[None]:
+        """Hold the database exclusively, or raise `StoreInUseError`."""
+        if fcntl is None:
+            yield
+            return
+        os.makedirs(self.db_path, exist_ok=True)
+        fd = os.open(os.path.join(self.db_path, IN_USE_LOCK_FILE),
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                raise StoreInUseError(
+                    "the memory database is in use by a running Hermes agent; "
+                    "stop Hermes, run reembed, then start it again"
+                ) from e
+            yield
+        finally:
+            os.close(fd)
+
+    def reembed_interrupted(self) -> bool:
+        """True when a `reembed` started converting and did not finish."""
+        marker = self.read_scheme_marker()
+        return bool(marker and marker.get("reembed_target"))
+
+    def reembed(
+        self,
+        *,
+        batch_size: int = REEMBED_BATCH_SIZE,
+        dry_run: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Re-encode every row's vector with the preferred embedding scheme.
+
+        All-or-nothing: every vector is computed first, then all of them are
+        written in one table commit (only the `vector` column; text and
+        metadata are untouched), and only then does the marker name the new
+        scheme. A failure or interruption before the commit changes nothing;
+        one between the commit and the marker leaves `reembed_target` in the
+        marker, which `doctor` reports, and running `reembed` again repairs
+        it. Rows another process writes meanwhile are caught by further
+        passes. Returns a summary dict; `status` is "up_to_date",
+        "dry_run", "converted" or "incomplete" (rows kept arriving; run it
+        again)."""
+        if batch_size < 1:
+            raise ValueError("reembed: batch_size must be >= 1")
+        target = self.preferred_embedding_scheme
+        with self._write_lock:
+            self._checkout_latest()
+            current = self.embedding_scheme
+            interrupted = self.reembed_interrupted()
+            result: dict[str, Any] = {
+                "from": current, "to": target, "rows": self._table.count_rows(),
+                "reembedded": 0, "interrupted_before": interrupted,
+            }
+            if current == target and not interrupted:
+                result["status"] = "up_to_date"
+                return result
+            if dry_run:
+                result["status"] = "dry_run"
+                return result
+
+            had_vector_index = self._vector_index_metric() is not None
+            with self._exclusive_use():
+                result["reembedded"], complete = self._reembed_passes(
+                    current, target, batch_size, progress,
+                )
+            result["status"] = "converted" if complete else "incomplete"
+        if had_vector_index and result["reembedded"]:
+            # The IVF_PQ codebook was trained on the old vectors.
+            try:
+                self._build_vector_index()
+            except Exception as e:
+                logger.warning("reembed: rebuilding the vector index failed: %s", e)
+        if result["reembedded"]:
+            self.optimize()
+        return result
+
+    def _reembed_passes(
+        self,
+        current: str,
+        target: str,
+        batch_size: int,
+        progress: Callable[[int, int], None] | None,
+    ) -> tuple[int, bool]:
+        """Convert every row, then any row that appeared meanwhile. Returns
+        (rows re-encoded, whether a final pass found nothing left)."""
+        done: set[str] = set()
+        flipped = False
+        for _ in range(_REEMBED_MAX_PASSES):
+            self._checkout_latest()
+            rows = [r for r in self._id_text_rows() if r["id"] not in done]
+            if not rows:
+                break
+            ids = [r["id"] for r in rows]
+            duplicated = sorted({i for i in ids if ids.count(i) > 1}) if len(set(ids)) != len(ids) else []
+            if duplicated:
+                # The vector write is keyed on id and would be rejected as
+                # ambiguous, after all the encoding work. Say what is wrong.
+                raise ValueError(
+                    f"{len(duplicated)} id(s) are stored more than once "
+                    f"(e.g. {duplicated[0]}); remove the duplicate rows, then run "
+                    "reembed again"
+                )
+            vectors = self._reembed_vectors(
+                [r["text"] for r in rows], target, batch_size, progress,
+            )
+            if not flipped:
+                self._write_scheme_marker(current, reembed_target=target)
+            try:
+                self._replace_vectors(ids, vectors)
+            except Exception:
+                if not flipped:
+                    # The commit failed, so nothing changed: drop the
+                    # pending flag. (An interrupt keeps it: the commit may
+                    # have landed.)
+                    self._write_scheme_marker(current)
+                raise
+            if not flipped:
+                # From here on this and every other process encodes new
+                # rows and queries with the target scheme.
+                self._write_scheme_marker(target)
+                flipped = True
+            done.update(ids)
+        else:
+            # Rows kept arriving: keep the pending flag so doctor says to
+            # run it again rather than claiming a clean conversion.
+            self._write_scheme_marker(target, reembed_target=target)
+            return len(done), False
+        if not flipped:
+            # Empty table: nothing to convert, only the label changes.
+            self._write_scheme_marker(target)
+        return len(done), True
+
+    def _id_text_rows(self) -> list[dict[str, Any]]:
+        """Every row's id and text, without vectors (strict scan)."""
+        n = max(self._table.count_rows(), 1)
+        return self._table.search().select(["id", "text"]).limit(n).to_list()
+
+    def _reembed_vectors(
+        self,
+        texts: list[str],
+        scheme: str,
+        batch_size: int,
+        progress: Callable[[int, int], None] | None,
+    ):
+        import numpy as np
+
+        chunks = []
+        for start in range(0, len(texts), batch_size):
+            out = np.asarray(
+                self._encode_many(texts[start:start + batch_size], "document", scheme),
+                dtype=np.float32,
+            )
+            if out.ndim != 2 or out.shape[1] != VECTOR_DIM:
+                raise ValueError(
+                    f"reembed: the embedder returned vectors of shape {out.shape}, "
+                    f"the table stores {VECTOR_DIM}-d vectors; nothing was changed"
+                )
+            chunks.append(out)
+            if progress is not None:
+                progress(min(start + batch_size, len(texts)), len(texts))
+        return np.concatenate(chunks)
+
+    def _replace_vectors(self, ids: list[str], vectors) -> None:
+        """Overwrite the `vector` of rows `ids` in a single commit."""
+        import pyarrow as pa
+
+        vector_type = self._table.schema.field("vector").type
+        flat = pa.array(vectors.reshape(-1), type=pa.float32())
+        source = pa.table({
+            "id": pa.array(ids, type=pa.string()),
+            "vector": pa.FixedSizeListArray.from_arrays(flat, VECTOR_DIM).cast(vector_type),
+        })
+        self._table.merge_insert("id").when_matched_update_all().execute(source)
 
     def _checkout_latest(self) -> None:
         """Advance the table handle to the latest dataset version.
@@ -1854,18 +2496,40 @@ class MemoryStore:
         except Exception:
             pass
 
+    _SCAN_PAGE_ROWS = 5000
+
     def _scan_all(
-        self, limit: int = MAX_SCAN_ROWS, *, strict: bool = False
+        self,
+        limit: int | None = MAX_SCAN_ROWS,
+        *,
+        strict: bool = False,
+        columns: Sequence[str] | None = None,
     ) -> Iterable[dict[str, Any]]:
-        """Iterate every row in the table up to `limit`. Yields raw rows.
+        """Iterate rows of the table, up to `limit` (None = every row).
+        Yields raw rows.
+
+        Reads in pages so a large store is never materialised in one query,
+        and `columns` (e.g. without `vector`) keeps the 768-d vectors out of
+        memory when only metadata is needed.
 
         Fail-soft by default — a scan error is logged and an empty iterator
         returned, so `stats` / `purge_archived` degrade gracefully. Pass
         `strict=True` to re-raise instead: callers that must not mistake a
-        corrupt store (a missing fragment file) for an empty one — `export` —
-        need the failure surfaced rather than swallowed."""
+        corrupt store (a missing fragment file) for an empty one — `export`,
+        `doctor` — need the failure surfaced rather than swallowed."""
+        results: list[dict[str, Any]] = []
         try:
-            results = self._table.search().limit(limit).to_list()
+            while limit is None or len(results) < limit:
+                page = self._SCAN_PAGE_ROWS
+                if limit is not None:
+                    page = min(page, limit - len(results))
+                query = self._table.search()
+                if columns:
+                    query = query.select(list(columns))
+                rows = query.offset(len(results)).limit(page).to_list()
+                results.extend(rows)
+                if len(rows) < page:
+                    break
         except Exception as e:
             logger.error("Full table scan failed: %s", e)
             if strict:
@@ -2004,13 +2668,11 @@ class MemoryStore:
         # this row. Hybrid takes precedence (most informative); then
         # vector (cosine 1-distance); then BM25 raw.
         if "_rrf_score" in result:
-            # RRF scores are typically 0..0.033 (1/(60+1)+1/(60+1)). Scale
-            # by 30 so a top RRF hit lands near 1.0; clamp to [0, 1].
-            result["score"] = max(0.0, min(1.0, float(result["_rrf_score"]) * 30.0))
+            result["score"] = _rrf_to_score(result["_rrf_score"])
         elif distance is not None:
-            # Cosine distance: 0 = identical, ~1 = orthogonal. Normalised
-            # vectors give distances in [0, 2]; for relevant matches it's
-            # almost always 0..1.
+            # Cosine distance (see VECTOR_DISTANCE_TYPE): 0 = identical,
+            # 1 = orthogonal, 2 = opposite, so this is cosine similarity
+            # with negative values clamped to 0.
             result["score"] = max(0.0, min(1.0, 1.0 - float(distance)))
         elif score is not None:
             # BM25 raw — no clean normalisation. Scale by 10 (typical

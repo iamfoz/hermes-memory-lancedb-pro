@@ -153,7 +153,7 @@ def _import_from_str(store: MemoryStore, jsonl: str, **kwargs) -> int:
 def _doctor_output(store: MemoryStore) -> str:
     """Run _cmd_doctor, capture stdout, return it as a string."""
     buf = io.StringIO()
-    args = _Args(path=store.db_path, quiet=True)
+    args = _Args(path=store.db_path, quiet=False)
     old_stdout = sys.stdout
     sys.stdout = buf
     try:
@@ -748,7 +748,7 @@ class TestCompactCommand:
     def _compact_args(self, **overrides) -> _Args:
         defaults = dict(
             dry_run=False, scope=None, min_age_days=0, similarity=0.88,
-            max_scan=200, quiet=True,
+            max_scan=200, quiet=True, yes=True,
         )
         defaults.update(overrides)
         return _Args(**defaults)

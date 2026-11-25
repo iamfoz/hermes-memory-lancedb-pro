@@ -119,11 +119,17 @@ class MemoryRetriever:
         # instantiated, which happens after dotenv loading, so by this point
         # os.environ is fully populated.
         # -----------------------------------------------------------------
-        self._langsearch_api_key: str = os.environ.get("LANGSEARCH_API_KEY", "")
+        # Through the host's profile-scoped secret accessor when there is
+        # one (a gateway serving several profiles keeps each profile's keys
+        # out of os.environ), else os.environ.
+        from .llm_client import _make_secret_reader
+
+        read_secret = _make_secret_reader(None)
+        self._langsearch_api_key: str = read_secret("LANGSEARCH_API_KEY")
         self._google_cloud_project: str = (
-            os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GOOGLE_PROJECT_ID")
-            or os.environ.get("GOOGLE_PROJECT")
+            read_secret("GOOGLE_CLOUD_PROJECT")
+            or read_secret("GOOGLE_PROJECT_ID")
+            or read_secret("GOOGLE_PROJECT")
             or ""
         )
         self._google_ranking_model: str = os.environ.get(
@@ -176,6 +182,10 @@ class MemoryRetriever:
                 tier.
             min_score: drop final results below this threshold. Defaults to
                 ``DEFAULT_MIN_RECALL_SCORE`` (env ``MEMORY_MIN_RECALL_SCORE``).
+                Compared with ``_final_score`` = 0.7 x relevance (cosine
+                similarity, with a BM25 bonus) + 0.3 x memory health (an
+                active reranker blends its own score in). The scale is
+                absolute, so a floor can reject a query that matches nothing.
             exclude_categories: drop candidates in these categories before
                 scoring, so they neither take result slots nor suppress
                 similar rows in the diversity step.
@@ -376,7 +386,11 @@ class MemoryRetriever:
         vector_results: list[dict[str, Any]],
         bm25_results: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Vector-score-dominant fusion with BM25 confirmation bonus."""
+        """Vector-score-dominant fusion with BM25 confirmation bonus.
+
+        A vector hit's fusion score is its cosine similarity to the query
+        (`1 - _distance`, clamped to [0, 1]), times the BM25 bonus when BM25
+        also found it, so scores are comparable across queries."""
         vector_map = {r["id"]: r for r in vector_results}
         vector_ranks = {r["id"]: i + 1 for i, r in enumerate(vector_results)}
         bm25_map = {r["id"]: r for r in bm25_results}
@@ -385,11 +399,6 @@ class MemoryRetriever:
         ordered_ids = list(vector_map.keys()) + [
             mid for mid in bm25_map if mid not in vector_map
         ]
-
-        vector_dists = [r.get("_distance", 0.0) for r in vector_results]
-        max_dist = max(vector_dists) if vector_dists else 1.0
-        min_dist = min(vector_dists) if vector_dists else 0.0
-        dist_range = max_dist - min_dist
 
         fused: list[dict[str, Any]] = []
         for mid in ordered_ids:
@@ -401,11 +410,15 @@ class MemoryRetriever:
             in_bm25 = mid in bm25_map
 
             if in_vector:
-                raw_dist = entry.get("_distance", 0.0)
-                # When all distances are equal (single result or degenerate
-                # embedding) treat as neutral relevance, not perfect (1.0).
-                norm_dist = (raw_dist - min_dist) / dist_range if dist_range > 0 else 0.5
-                fusion_score = max(0.01, 1.0 - norm_dist)
+                # Absolute cosine similarity, not min-max across this query's
+                # pool: normalising always gave the nearest hit 1.0, so an
+                # unrelated query still scored ~0.7+ and no score floor
+                # (hard_min_score, min_score) could reject it.
+                raw_dist = entry.get("_distance")
+                fusion_score = (
+                    max(0.0, min(1.0, 1.0 - float(raw_dist)))
+                    if raw_dist is not None else 0.0
+                )
                 if in_bm25:
                     bm25_rank = bm25_ranks[mid]
                     fusion_score *= 1.0 + (0.3 / (1 + math.log1p(bm25_rank)))

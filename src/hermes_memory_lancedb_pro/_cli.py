@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from . import task_ledger as _tl
 from ._sql import is_expired as _is_expired
 from ._sql import parse_metadata as _parse_metadata
 from .store import (
-    MAX_SCAN_ROWS,
+    SCHEME_PLAIN,
     VECTOR_DIM,
     MemoryStore,
     resolve_db_path,
@@ -56,7 +57,8 @@ PLUGIN_CLI_CONTENT = '''\
 """Hermes plugin CLI shim for hermes-memory-lancedb-pro.
 
 Exposes register_cli() so hermes-agent can wire the lancedb_pro commands
-(init, doctor, export, import, reset, stats, search, purge, compact, task)
+(init, doctor, export, import, reset, stats, search, purge, compact, reembed,
+task)
 into `hermes lancedb_pro`.
 
 Regenerate with: hermes-memory-lancedb-pro install-plugin
@@ -92,6 +94,63 @@ def _open_store(args: argparse.Namespace) -> MemoryStore:
     store = MemoryStore(db_path=db_path)
     store._initialise()
     return store
+
+
+def _open_existing_store(args: argparse.Namespace) -> MemoryStore | None:
+    """Open the store at ``args.path`` only if one is already there.
+
+    `_open_store` creates the directory and table, so a mistyped ``--path`` on
+    a read-only command used to conjure an empty database and report "0
+    memories" (or write an empty "backup"). Returns None, after printing an
+    error, when there is no store to read."""
+    db_path = resolve_db_path(getattr(args, "path", None))
+    if not os.path.isdir(os.path.join(db_path, "memories.lance")):
+        _stderr(
+            f"error: no memory store at {db_path} (check --path, or run "
+            "`init` to create one)"
+        )
+        return None
+    return _open_store(args)
+
+
+def _confirm(prompt: str = 'Type "yes" to proceed: ') -> bool:
+    """Ask for confirmation; False (never a traceback) when stdin is closed."""
+    try:
+        return input(prompt).strip().lower() == "yes"
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted (no input available; pass --yes to skip the prompt).")
+        return False
+
+
+def _report_unreadable(stats: dict[str, Any]) -> None:
+    """Say that the store could not be read in full (stderr)."""
+    _stderr(
+        f"error: the store at {stats.get('db_path', '?')} could not be read "
+        f"in full: {stats.get('scan_error')}\n"
+        "  The counts are not reliable. To recover whatever is still "
+        "readable, run:\n"
+        "    hermes-memory-lancedb-pro export --salvage -o backup.jsonl"
+    )
+
+
+def _unreadable(store: MemoryStore) -> bool:
+    """True (after reporting it) when the store's table cannot be read."""
+    health = store.stats()
+    if health.get("scan_error"):
+        _report_unreadable(health)
+        return True
+    return False
+
+
+def _positive_int(value: str) -> int:
+    """argparse type: an integer >= 1."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
 
 
 def _stderr(msg: str, quiet: bool = False) -> None:
@@ -145,25 +204,37 @@ def _cmd_export(
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
-    store = _store if _store is not None else _open_store(args)
     quiet = getattr(args, "quiet", False)
     out_path = getattr(args, "out", "-")
-    limit = getattr(args, "limit", 100_000)
+    # None = export everything. The limit counts rows actually written (after
+    # the archived filter), not rows scanned.
+    limit = getattr(args, "limit", None)
+    if limit is not None and limit < 1:
+        _stderr(f"error: --limit must be >= 1, got {limit}")
+        return 2
     include_archived = getattr(args, "include_archived", False)
     salvage = getattr(args, "salvage", False)
+    store = _store if _store is not None else _open_existing_store(args)
+    if store is None:
+        return 1
 
     # Scan BEFORE opening the output file: a scan failure must never truncate
     # an existing file or leave behind a misleading empty export.
     if salvage:
         try:
-            rows, report = store.salvage_scan(limit=limit)
+            rows, report = store.salvage_scan(limit=_store_module.MAX_SCAN_ROWS)
         except Exception as e:
             _stderr(f"export --salvage failed: {e}")
             return 1
         _stderr(_format_salvage_report(report), quiet)
+        if len(rows) >= _store_module.MAX_SCAN_ROWS:
+            _stderr(
+                f"warning: the salvage scan stopped at {len(rows)} rows "
+                "(MEMORY_MAX_SCAN_ROWS); the backup may be incomplete"
+            )
     else:
         try:
-            rows = store._scan_all(limit=limit, strict=True)
+            rows = store._scan_all(limit=None, strict=True)
         except Exception as e:
             _stderr(
                 "export failed: the full table scan errored — the store may "
@@ -172,6 +243,10 @@ def _cmd_export(
             )
             return 1
 
+    # Every vector in one store shares its scheme; recording it lets import
+    # tell whether the vectors fit the target store.
+    scheme = store.embedding_scheme
+
     if out_path != "-":
         parent = os.path.dirname(os.path.abspath(out_path))
         os.makedirs(parent, exist_ok=True)
@@ -179,11 +254,15 @@ def _cmd_export(
 
     try:
         count = 0
+        truncated = False
         for row in rows:
             meta_str = row.get("metadata", "{}")
             meta = _parse_metadata(meta_str)
             if not include_archived and meta.get("state") == "archived":
                 continue
+            if limit is not None and count >= limit:
+                truncated = True
+                break
 
             # Normalise the vector to a plain Python list of floats.
             raw_vec = row.get("vector")
@@ -202,6 +281,7 @@ def _cmd_export(
                 "importance": float(row.get("importance", 0.5)),
                 "timestamp": int(row.get("timestamp", 0)),
                 "vector": vector,
+                "embedding_scheme": scheme,
                 # Keep metadata as a JSON *string* so the import path can
                 # round-trip it without re-serialising the dict.
                 "metadata": meta_str if isinstance(meta_str, str) else json.dumps(meta),
@@ -211,6 +291,14 @@ def _cmd_export(
 
         destination = "stdout" if out_path == "-" else out_path
         _stderr(f"wrote {count} memories to {destination}", quiet)
+        if truncated:
+            # Never gated by --quiet: a backup that looks complete but is not
+            # is exactly what must not pass silently.
+            _stderr(
+                f"warning: output truncated at --limit {limit}; more memories "
+                "were left out. Re-run with a higher --limit, or without one "
+                "to export everything."
+            )
         return 0
     finally:
         if out_path != "-":
@@ -254,19 +342,32 @@ def _cmd_import(
     (``metadata.source_id``, written by versions before 0.16.1). Pass
     ``--allow-existing`` to skip those rows instead. Pass ``--reembed`` to
     re-encode ``text`` with the current embedder instead of the stored vector.
+    A row whose vector was made under another embedding scheme than the
+    target store's (``embedding_scheme``; exports without it predate task
+    prefixes, so "plain") is re-encoded too, so one store never mixes
+    schemes.
 
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
-    store = _store if _store is not None else _open_store(args)
     quiet = getattr(args, "quiet", False)
     in_path = getattr(args, "input", "-")
     allow_existing = getattr(args, "allow_existing", False)
     reembed = getattr(args, "reembed", False)
 
-    in_file = sys.stdin if in_path == "-" else open(in_path, encoding="utf-8")  # noqa: SIM115
+    # Open the input first: a missing file must not leave a freshly created
+    # empty database behind.
+    try:
+        in_file = sys.stdin if in_path == "-" else open(in_path, encoding="utf-8")  # noqa: SIM115
+    except OSError as e:
+        _stderr(f"error: cannot read {in_path}: {e}")
+        return 1
 
-    imported = skipped = re_embedded = 0
+    store = _store if _store is not None else _open_store(args)
+    store_scheme = store.embedding_scheme
+    scheme_warned = False
+
+    imported = skipped = re_embedded = rejected = 0
     try:
         for lineno, raw_line in enumerate(in_file, start=1):
             line = raw_line.strip()
@@ -276,6 +377,11 @@ def _cmd_import(
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 _stderr(f"  warning: line {lineno} is not valid JSON ({exc}); skipping", quiet)
+                rejected += 1
+                continue
+            if not isinstance(record, dict):
+                _stderr(f"  warning: line {lineno} is not a JSON object; skipping", quiet)
+                rejected += 1
                 continue
 
             source_id = record.get("id", "")
@@ -293,22 +399,36 @@ def _cmd_import(
                 return 1
 
             text = record.get("text", "")
-            if not text or not text.strip():
+            if not isinstance(text, str):
+                _stderr(f"  warning: line {lineno} has non-string text; skipping", quiet)
+                rejected += 1
+                continue
+            if not text.strip():
                 _stderr(f"  warning: line {lineno} has empty text; skipping", quiet)
                 continue
 
-            vector: list[float] = record.get("vector") or []
-            dim_mismatch = len(vector) != VECTOR_DIM
+            # Coerce the numeric fields before anything is written, so a bad
+            # row is skipped whole instead of aborting the import midway.
+            try:
+                raw_importance = record.get("importance")
+                importance = 0.5 if raw_importance is None else float(raw_importance)
+                raw_ts = record.get("timestamp")
+                timestamp = None if raw_ts is None else int(float(raw_ts))
+            except (TypeError, ValueError, OverflowError) as exc:
+                _stderr(
+                    f"  warning: line {lineno} has a bad importance/timestamp "
+                    f"({exc}); skipping",
+                    quiet,
+                )
+                rejected += 1
+                continue
 
-            if reembed or dim_mismatch:
-                if dim_mismatch and not reembed:
-                    _stderr(
-                        f"  warning: line {lineno} vector dim {len(vector)} != {VECTOR_DIM}; "
-                        "re-encoding",
-                        quiet,
-                    )
-                vector = store.encode(text)
-                re_embedded += 1
+            vector = record.get("vector")
+            if not isinstance(vector, list):
+                vector = []
+            dim_mismatch = len(vector) != VECTOR_DIM
+            record_scheme = record.get("embedding_scheme") or SCHEME_PLAIN
+            scheme_mismatch = record_scheme != store_scheme
 
             meta_str = record.get("metadata", "{}")
             if isinstance(meta_str, dict):
@@ -321,18 +441,44 @@ def _cmd_import(
                 meta_dict = {}
             final_meta_str = json.dumps(meta_dict)
 
-            store.store_raw(
-                text=text,
-                vector=vector,
-                category=record.get("category", "other"),
-                scope=record.get("scope", "global"),
-                importance=float(record.get("importance", 0.5)),
-                metadata=final_meta_str,
-                timestamp=record.get("timestamp"),
-                # Keep the exported id: supersedes / superseded_by links in
-                # the metadata refer to it.
-                mem_id=str(source_id) if source_id else None,
-            )
+            if reembed or dim_mismatch or scheme_mismatch:
+                if dim_mismatch and not reembed:
+                    _stderr(
+                        f"  warning: line {lineno} vector dim {len(vector)} != {VECTOR_DIM}; "
+                        "re-encoding",
+                        quiet,
+                    )
+                elif scheme_mismatch and not reembed and not scheme_warned:
+                    scheme_warned = True
+                    _stderr(
+                        f"  note: vectors made with the {record_scheme!r} embedding "
+                        f"scheme are re-encoded for this {store_scheme!r} store",
+                        quiet,
+                    )
+                vector = store.encode(text, kind="document")
+                re_embedded += 1
+
+            category = record.get("category")
+            scope = record.get("scope")
+            try:
+                store.store_raw(
+                    text=text,
+                    vector=vector,
+                    category=category if isinstance(category, str) and category else "other",
+                    scope=scope if isinstance(scope, str) and scope else "global",
+                    importance=importance,
+                    metadata=final_meta_str,
+                    timestamp=timestamp,
+                    # Keep the exported id: supersedes / superseded_by links in
+                    # the metadata refer to it.
+                    mem_id=str(source_id) if source_id else None,
+                )
+            except (ValueError, TypeError) as exc:
+                _stderr(f"  warning: line {lineno} was rejected ({exc}); skipping", quiet)
+                rejected += 1
+                if reembed or dim_mismatch or scheme_mismatch:
+                    re_embedded -= 1
+                continue
             imported += 1
 
     finally:
@@ -341,17 +487,49 @@ def _cmd_import(
 
     _stderr(
         f"imported {imported} memories (skipped {skipped} duplicates, "
-        f"re-embedded {re_embedded})",
+        f"re-embedded {re_embedded}, rejected {rejected})",
         quiet,
     )
+    if rejected:
+        _stderr(f"error: {rejected} row(s) could not be imported (see the warnings above)")
+        return 1
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Embedding scheme reporting (doctor / stats)
+# ---------------------------------------------------------------------------
+
+
+def _scheme_label(stats: dict[str, Any]) -> str:
+    scheme = stats.get("embedding_scheme", SCHEME_PLAIN)
+    if scheme == SCHEME_PLAIN and stats.get("embedding_scheme_preferred", scheme) != scheme:
+        return f"{scheme} (legacy: no task prefixes)"
+    return str(scheme)
+
+
+def _reembed_advice(stats: dict[str, Any]) -> str | None:
+    """The `reembed` recommendation for this store, or None."""
+    if stats.get("reembed_interrupted"):
+        return (
+            "Run `hermes-memory reembed` — a previous re-encode did not finish, "
+            "so the vectors may not match the recorded embedding scheme."
+        )
+    scheme = stats.get("embedding_scheme")
+    preferred = stats.get("embedding_scheme_preferred")
+    if scheme and preferred and scheme != preferred:
+        return (
+            f"Run `hermes-memory reembed` — this store's vectors use the {scheme!r} "
+            f"scheme; {stats.get('embedding_model', 'the model')} retrieves better "
+            f"with {preferred!r} (preview with --dry-run)."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Doctor subcommand
 # ---------------------------------------------------------------------------
 
-_DOCTOR_MAX_SCAN = MAX_SCAN_ROWS
 _ORPHAN_EXAMPLE_LIMIT = 5
 _OLD_PERIPHERAL_DAYS = 90
 _COMPACTION_MIN_AGE_DAYS = 7
@@ -370,7 +548,16 @@ def _cmd_doctor(
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
-    store = _store if _store is not None else _open_store(args)
+    quiet = bool(getattr(args, "quiet", False))
+
+    def say(*a: Any, **k: Any) -> None:
+        # Informational output; --quiet keeps only findings and errors.
+        if not quiet:
+            print(*a, **k)
+
+    store = _store if _store is not None else _open_existing_store(args)
+    if store is None:
+        return 1
     stats = store.stats()
 
     total = stats["total_memories"]
@@ -378,45 +565,55 @@ def _cmd_doctor(
     archived = stats["archived_memories"]
     archived_ratio = (archived / total * 100) if total else 0.0
 
+    if stats.get("scan_error"):
+        # The counts below would read as a healthy empty store.
+        print("\n--- Store is unreadable ---")
+        print(f"  The table scan failed: {stats['scan_error']}")
+        print("  The counts are not reliable. To recover whatever is still")
+        print("  readable, run:")
+        print("    hermes-memory-lancedb-pro export --salvage -o backup.jsonl")
+        return 1
+
     # ---- Header ----
-    print("=== Hermes Memory Doctor ===")
-    print(f"package_version:   {__version__}")
-    print(f"db_path:           {stats['db_path']}")
-    print(f"embedding_model:   {stats['embedding_model']}")
-    print(f"embedding_device:  {stats.get('embedding_device', 'auto')}")
-    print(f"vector_dimensions: {stats['vector_dimensions']}")
-    print(f"total_memories:    {total}")
-    print()
+    say("=== Hermes Memory Doctor ===")
+    say(f"package_version:   {__version__}")
+    say(f"db_path:           {stats['db_path']}")
+    say(f"embedding_model:   {stats['embedding_model']}")
+    say(f"embedding_device:  {stats.get('embedding_device', 'auto')}")
+    say(f"embedding_scheme:  {_scheme_label(stats)}")
+    say(f"vector_dimensions: {stats['vector_dimensions']}")
+    say(f"total_memories:    {total}")
+    say()
 
     # ---- Counts ----
-    print("--- Counts ---")
-    print(f"active:   {active}")
-    print(f"archived: {archived}")
-    print(f"archived_ratio: {archived_ratio:.1f}%")
+    say("--- Counts ---")
+    say(f"active:   {active}")
+    say(f"archived: {archived}")
+    say(f"archived_ratio: {archived_ratio:.1f}%")
     if archived_ratio > 30.0:
-        print(
+        say(
             "  → run 'hermes-memory purge --grace-days 30' to reclaim space "
             "(preview with --dry-run)"
         )
-    print()
+    say()
 
     # ---- Categories ----
-    print("--- Categories ---")
+    say("--- Categories ---")
     categories = stats.get("categories", {})
     for cat, cnt in sorted(categories.items(), key=lambda kv: -kv[1]):
-        print(f"  {cat}: {cnt}")
+        say(f"  {cat}: {cnt}")
     if not categories:
-        print("  (none)")
-    print()
+        say("  (none)")
+    say()
 
     # ---- Tiers ----
-    print("--- Tiers ---")
+    say("--- Tiers ---")
     tiers = stats.get("tiers", {})
     for tier, cnt in sorted(tiers.items(), key=lambda kv: -kv[1]):
-        print(f"  {tier}: {cnt}")
+        say(f"  {tier}: {cnt}")
     if not tiers:
-        print("  (none)")
-    print()
+        say("  (none)")
+    say()
 
     # ---- Full scan for anomaly checks ----
     now_ms = int(time.time() * 1000)
@@ -438,7 +635,10 @@ def _cmd_doctor(
     # an empty one, and doctor would then report "No anomalies detected".
     # Scan strictly: an unreadable store is the finding.
     try:
-        scanned_rows = list(store._scan_all(limit=_DOCTOR_MAX_SCAN, strict=True))
+        scanned_rows = list(store._scan_all(
+            limit=None, strict=True,
+            columns=("id", "category", "timestamp", "metadata"),
+        ))
     except Exception as e:
         print("\n--- Store is unreadable ---")
         print(f"  The full table scan failed: {e}")
@@ -500,76 +700,88 @@ def _cmd_doctor(
                 archived_older_than_grace += 1
 
     # ---- Anomalies ----
-    print("--- Anomalies ---")
-    has_anomalies = False
+    # Findings are collected first so --quiet can still print them (and
+    # nothing else) when there are any.
+    found: list[str] = []
+
+    if stats["total_memories"] != active + archived:
+        found.append(
+            f"Row count mismatch: total_memories {stats['total_memories']} != "
+            f"active {active} + archived {archived}"
+        )
 
     if orphan_supersedes:
-        has_anomalies = True
-        print(f"Orphan supersedes (supersedes target missing): {len(orphan_supersedes)}")
-        for eid in orphan_supersedes[:_ORPHAN_EXAMPLE_LIMIT]:
-            print(f"  {eid}")
+        found.append(f"Orphan supersedes (supersedes target missing): {len(orphan_supersedes)}")
+        found.extend(f"  {eid}" for eid in orphan_supersedes[:_ORPHAN_EXAMPLE_LIMIT])
 
     if orphan_superseded_by:
-        has_anomalies = True
-        print(f"Orphan superseded_by (target missing): {len(orphan_superseded_by)}")
-        for eid in orphan_superseded_by[:_ORPHAN_EXAMPLE_LIMIT]:
-            print(f"  {eid}")
+        found.append(f"Orphan superseded_by (target missing): {len(orphan_superseded_by)}")
+        found.extend(f"  {eid}" for eid in orphan_superseded_by[:_ORPHAN_EXAMPLE_LIMIT])
 
     if old_peripheral_ids:
-        has_anomalies = True
-        print(
+        found.append(
             f"Old peripheral memories (>{_OLD_PERIPHERAL_DAYS}d, 0 access): "
             f"{len(old_peripheral_ids)}"
         )
 
     if cross_session_zero_access:
-        has_anomalies = True
-        print(
+        found.append(
             f"Cross-session memories with 0 access (possible premature promotion): "
             f"{len(cross_session_zero_access)}"
         )
 
-    if not has_anomalies:
-        print("  No anomalies detected.")
-    print()
+    say("--- Anomalies ---")
+    if found:
+        if quiet:
+            print("--- Anomalies ---")
+        for line in found:
+            print(line)
+    else:
+        say("  No anomalies detected.")
+    say()
 
     # ---- Expiry ----
     # Not an anomaly: time-bound memories ("dentist tomorrow") are meant to
     # expire. Reported so "why isn't X recalled?" has an answer.
-    print("--- Expiry ---")
+    say("--- Expiry ---")
     enforcing = _store_module.ENFORCE_VALID_UNTIL
-    print(
+    say(
         f"valid_until enforcement: {'on' if enforcing else 'off'} "
         "(MEMORY_ENFORCE_VALID_UNTIL)"
     )
     verb = "hidden from recall" if enforcing else "still recalled"
-    print(f"expired memories ({verb}): {len(expired_ids)}")
+    say(f"expired memories ({verb}): {len(expired_ids)}")
     for eid in expired_ids[:_ORPHAN_EXAMPLE_LIMIT]:
-        print(f"  {eid}")
-    print()
+        say(f"  {eid}")
+    say()
 
     # ---- Recommendations ----
-    print("--- Recommendations ---")
+    say("--- Recommendations ---")
     any_rec = False
 
     if archived_older_than_grace > 0:
         any_rec = True
-        print(
+        say(
             f"Run `hermes-memory purge --grace-days 30` — "
             f"{archived_older_than_grace} archived rows older than 30 days."
         )
 
     if old_non_archived_count > 0:
         any_rec = True
-        print(
+        say(
             f"Run `hermes-memory compact --dry-run` to preview merging — "
             f"{old_non_archived_count} old non-archived rows that may be "
             "near-duplicates."
         )
 
+    reembed_advice = _reembed_advice(stats)
+    if reembed_advice:
+        any_rec = True
+        say(reembed_advice)
+
     if not any_rec:
-        print("  No recommendations.")
-    print()
+        say("  No recommendations.")
+    say()
 
     return 0
 
@@ -593,13 +805,18 @@ def _cmd_stats(
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
-    store = _store if _store is not None else _open_store(args)
+    store = _store if _store is not None else _open_existing_store(args)
+    if store is None:
+        return 1
     stats = store.stats()
+    rc = 1 if stats.get("scan_error") else 0
 
     if getattr(args, "json", False):
         payload = {"package_version": __version__, **stats}
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-        return 0
+        if rc:
+            _report_unreadable(stats)
+        return rc
 
     total = stats.get("total_memories", 0)
     active = stats.get("active_memories", 0)
@@ -609,10 +826,14 @@ def _cmd_stats(
     print(f"db_path:           {stats.get('db_path', '')}")
     print(f"embedding_model:   {stats.get('embedding_model', '')}")
     print(f"embedding_device:  {stats.get('embedding_device', 'auto')}")
+    print(f"embedding_scheme:  {_scheme_label(stats)}")
     print(f"vector_dimensions: {stats.get('vector_dimensions', '')}")
     print(f"total_memories:    {total}")
     print(f"active:            {active}")
     print(f"archived:          {archived} ({archived_ratio:.1f}%)")
+    reembed_advice = _reembed_advice(stats)
+    if reembed_advice:
+        print(f"  → {reembed_advice}")
     categories = stats.get("categories", {})
     if categories:
         print("categories:")
@@ -623,7 +844,9 @@ def _cmd_stats(
         print("tiers:")
         for tier, cnt in sorted(tiers.items(), key=lambda kv: -kv[1]):
             print(f"  {tier}: {cnt}")
-    return 0
+    if rc:
+        _report_unreadable(stats)
+    return rc
 
 
 def _row_score(row: dict[str, Any]) -> float | None:
@@ -635,6 +858,10 @@ def _row_score(row: dict[str, Any]) -> float | None:
     matching the ``min_score`` semantics in ``MemoryStore.search``).
     """
     if "_rrf_score" in row:
+        # Hybrid: the 0-1 `score` the store derives from the fused rank,
+        # the same scale `--min-score` is compared with.
+        if row.get("score") is not None:
+            return float(row["score"])
         return float(row["_rrf_score"])
     if "_score" in row:
         return float(row["_score"])
@@ -664,7 +891,9 @@ def _cmd_search(
     ``_store`` is an optional pre-built store, used by tests to bypass the
     second-instantiation path which can fail with some LanceDB versions.
     """
-    store = _store if _store is not None else _open_store(args)
+    store = _store if _store is not None else _open_existing_store(args)
+    if store is None:
+        return 1
     quiet = getattr(args, "quiet", False)
 
     rows = store.search(
@@ -721,23 +950,38 @@ def _cmd_purge(
     include_expired = bool(getattr(args, "include_expired", False))
     what = "archived and expired memories" if include_expired else "archived memories"
 
+    # Opened before the prompt so a mistyped --path is reported, not confirmed.
+    store = _store if _store is not None else _open_existing_store(args)
+    if store is None:
+        return 1
+
     if not dry_run and not getattr(args, "yes", False):
         db_path = resolve_db_path(getattr(args, "path", None))
         print(
             f"This will PERMANENTLY DELETE {what} older than "
             f"{grace_days} days at: {db_path}"
         )
-        answer = input('Type "yes" to proceed: ').strip().lower()
-        if answer != "yes":
+        if not _confirm():
             print("Aborted.")
             return 1
 
-    store = _store if _store is not None else _open_store(args)
-    archived = store.purge_archived(grace_period_days=grace_days, dry_run=dry_run)
+    try:
+        archived = store.purge_archived(
+            grace_period_days=grace_days, dry_run=dry_run, strict=True
+        )
+    except Exception as e:
+        _report_unreadable({"db_path": store.db_path, "scan_error": e})
+        return 1
     prefix = "[dry-run] would purge" if dry_run else "purged"
     _stderr(f"{prefix} {archived} archived memories older than {grace_days} days", quiet)
     if include_expired:
-        expired = store.purge_expired(grace_period_days=grace_days, dry_run=dry_run)
+        try:
+            expired = store.purge_expired(
+                grace_period_days=grace_days, dry_run=dry_run, strict=True
+            )
+        except Exception as e:
+            _report_unreadable({"db_path": store.db_path, "scan_error": e})
+            return 1
         _stderr(
             f"{prefix} {expired} memories expired more than {grace_days} days ago",
             quiet,
@@ -751,60 +995,51 @@ def _cmd_purge(
     return 0
 
 
-def _cmd_compact(
-    args: argparse.Namespace,
-    _store: MemoryStore | None = None,
-) -> int:
-    """Cluster near-duplicate memories and merge each cluster into one row.
-
-    Wraps ``memory_compactor.run_compaction`` — the same pass the provider
-    runs automatically on a cooldown — with explicit knobs. ``--dry-run``
-    prints the merge plan without changing the store.
-
-    ``_store`` is an optional pre-built store, used by tests to bypass the
-    second-instantiation path which can fail with some LanceDB versions.
-    """
-    from .memory_compactor import CompactionConfig, run_compaction
-
-    store = _store if _store is not None else _open_store(args)
-    quiet = getattr(args, "quiet", False)
-    dry_run = bool(getattr(args, "dry_run", False))
-
+def _compact_args_error(args: argparse.Namespace) -> str | None:
+    """Message for an out-of-range compact knob, else None."""
     similarity = getattr(args, "similarity", 0.88)
     if not 0 < similarity <= 1:
         # 0 or less puts every row of a scope in one cluster and merges
         # unrelated memories into a single row.
-        _stderr(f"error: --similarity must be in (0, 1], got {similarity}")
-        return 2
+        return f"--similarity must be in (0, 1], got {similarity}"
     if getattr(args, "min_age_days", 7) < 0 or getattr(args, "max_scan", 200) <= 0:
-        _stderr("error: --min-age-days must be >= 0 and --max-scan must be > 0")
-        return 2
+        return "--min-age-days must be >= 0 and --max-scan must be > 0"
+    return None
 
-    cfg = CompactionConfig(
-        min_age_days=getattr(args, "min_age_days", 7),
-        similarity_threshold=getattr(args, "similarity", 0.88),
-        max_memories_to_scan=getattr(args, "max_scan", 200),
-        dry_run=dry_run,
+
+def _print_compact_plan(result, quiet: bool) -> None:
+    _stderr(
+        f"[dry-run] scanned {result.scanned} memories, "
+        f"{result.clusters_found} mergeable cluster(s)",
+        quiet,
     )
-    result = run_compaction(store, cfg, scopes=getattr(args, "scope", None) or None)
-
-    if dry_run:
-        _stderr(
-            f"[dry-run] scanned {result.scanned} memories, "
-            f"{result.clusters_found} mergeable cluster(s)",
-            quiet,
+    for i, plan in enumerate(result.plans[:_COMPACT_PLAN_PREVIEW], start=1):
+        print(
+            f"  cluster {i}: {len(plan.member_indices)} rows → "
+            f"{_snippet(plan.merged.text)}"
         )
-        for i, plan in enumerate(result.plans[:_COMPACT_PLAN_PREVIEW], start=1):
-            print(
-                f"  cluster {i}: {len(plan.member_indices)} rows → "
-                f"{_snippet(plan.merged.text)}"
-            )
-        if len(result.plans) > _COMPACT_PLAN_PREVIEW:
-            print(
-                f"  … and {len(result.plans) - _COMPACT_PLAN_PREVIEW} more cluster(s)"
-            )
-        return 0
+    if len(result.plans) > _COMPACT_PLAN_PREVIEW:
+        print(f"  … and {len(result.plans) - _COMPACT_PLAN_PREVIEW} more cluster(s)")
 
+
+def _compact_confirmed(args: argparse.Namespace, plan_result) -> bool:
+    """Show what compaction is about to merge and delete; True to go on."""
+    if getattr(args, "yes", False):
+        return True
+    rows = sum(len(p.member_indices) for p in plan_result.plans)
+    print(
+        f"This will merge {plan_result.clusters_found} cluster(s) "
+        f"({rows} memories) into {plan_result.clusters_found} new row(s) and "
+        f"PERMANENTLY DELETE the {rows} originals at: "
+        f"{resolve_db_path(getattr(args, 'path', None))}"
+    )
+    if _confirm():
+        return True
+    print("Aborted.")
+    return False
+
+
+def _report_compaction(result, quiet: bool) -> int:
     _stderr(
         f"scanned {result.scanned} memories: merged {result.memories_created} of "
         f"{result.clusters_found} cluster(s), -{result.memories_deleted} "
@@ -820,8 +1055,135 @@ def _cmd_compact(
     return 0
 
 
+def _cmd_compact(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Cluster near-duplicate memories and merge each cluster into one row.
+
+    Wraps ``memory_compactor.run_compaction`` — the same pass the provider
+    runs automatically on a cooldown — with explicit knobs. ``--dry-run``
+    prints the merge plan without changing the store; a real run shows the
+    cluster count and asks for confirmation unless ``--yes``, because the
+    merged rows replace (hard-delete) their sources.
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    from .memory_compactor import CompactionConfig, run_compaction
+
+    quiet = getattr(args, "quiet", False)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    problem = _compact_args_error(args)
+    if problem:
+        _stderr(f"error: {problem}")
+        return 2
+
+    store = _store if _store is not None else _open_existing_store(args)
+    # run_compaction scans fail-soft, so an unreadable table would read as
+    # "scanned 0 memories". Check first.
+    if store is None or _unreadable(store):
+        return 1
+
+    scopes = getattr(args, "scope", None) or None
+    cfg = CompactionConfig(
+        min_age_days=getattr(args, "min_age_days", 7),
+        similarity_threshold=getattr(args, "similarity", 0.88),
+        max_memories_to_scan=getattr(args, "max_scan", 200),
+        dry_run=True,
+    )
+    # Always plan first (no writes): the plan feeds both --dry-run and the
+    # confirmation prompt, which must show what is about to be merged.
+    result = run_compaction(store, cfg, scopes=scopes)
+
+    if dry_run:
+        _print_compact_plan(result, quiet)
+        return 0
+    if result.clusters_found == 0:
+        _stderr(f"scanned {result.scanned} memories: nothing to merge", quiet)
+        return 0
+    if not _compact_confirmed(args, result):
+        return 1
+    result = run_compaction(store, dataclasses.replace(cfg, dry_run=False), scopes=scopes)
+
+    return _report_compaction(result, quiet)
+
+
+def _cmd_reembed(
+    args: argparse.Namespace,
+    _store: MemoryStore | None = None,
+) -> int:
+    """Re-encode every stored vector with the model's preferred embedding
+    scheme (nomic task prefixes), so a legacy store gets the same retrieval
+    quality as a new one. Text and metadata are not changed.
+
+    ``--dry-run`` reports what would change; a real run prompts for
+    confirmation unless ``--yes``. See ``MemoryStore.reembed`` for the
+    all-or-nothing guarantees.
+
+    ``_store`` is an optional pre-built store, used by tests to bypass the
+    second-instantiation path which can fail with some LanceDB versions.
+    """
+    quiet = getattr(args, "quiet", False)
+    batch_size = getattr(args, "batch_size", _store_module.REEMBED_BATCH_SIZE)
+    if batch_size < 1:
+        _stderr(f"error: --batch-size must be >= 1, got {batch_size}")
+        return 2
+    store = _store if _store is not None else _open_store(args)
+
+    plan = store.reembed(dry_run=True)
+    if plan["status"] == "up_to_date":
+        _stderr(f"embedding scheme is already {plan['to']!r}; nothing to re-encode", quiet)
+        return 0
+    what = (
+        f"{plan['rows']} memories at {store.db_path} "
+        f"({plan['from']!r} -> {plan['to']!r})"
+    )
+    if getattr(args, "dry_run", False):
+        print(f"[dry-run] would re-encode {what}")
+        return 0
+    if not getattr(args, "yes", False):
+        print(f"This will re-encode the vectors of {what}.")
+        print("Text and metadata are not changed. Best run while the Hermes agent is stopped.")
+        if not _confirm():
+            print("Aborted.")
+            return 1
+    return _run_reembed(store, batch_size, plan["rows"], quiet)
+
+
+def _run_reembed(store: MemoryStore, batch_size: int, rows: int, quiet: bool) -> int:
+    step = max(rows // 10, 1)
+
+    def progress(done: int, total: int) -> None:
+        # About ten progress lines, whatever the store size.
+        if done == total or done // step != (done - batch_size) // step:
+            _stderr(f"  encoded {done}/{total}", quiet)
+
+    try:
+        result = store.reembed(batch_size=batch_size, progress=progress)
+    except Exception as e:
+        if store.reembed_interrupted():
+            _stderr(f"reembed failed: {e}. Run `reembed` again to finish.")
+        else:
+            _stderr(f"reembed failed: {e}. No vectors were changed.")
+        return 1
+    if result["status"] == "incomplete":
+        _stderr(
+            f"re-encoded {result['reembedded']} memories, but new ones kept "
+            "arriving; stop the Hermes agent and run `reembed` again."
+        )
+        return 1
+    _stderr(
+        f"re-encoded {result['reembedded']} memories; embedding scheme is now "
+        f"{result['to']!r}",
+        quiet,
+    )
+    return 0
+
+
 def _add_store_admin_parsers(subs) -> None:
-    """Wire stats/search/purge/compact onto a subparsers group.
+    """Wire stats/search/purge/compact/reembed onto a subparsers group.
 
     Shared by ``main()`` and ``register_cli()`` so the standalone and in-host
     CLIs cannot drift apart flag-by-flag.
@@ -895,7 +1257,8 @@ def _add_store_admin_parsers(subs) -> None:
         help="Merge clusters of near-duplicate memories",
         description=(
             "Cluster near-duplicate memories by vector similarity and merge each "
-            "cluster into a single row (sources are archived). The provider runs "
+            "cluster into a single row (the source rows are deleted). Asks for "
+            "confirmation unless --yes. The provider runs "
             "this automatically on a cooldown; this command runs it on demand."
         ),
     )
@@ -911,9 +1274,34 @@ def _add_store_admin_parsers(subs) -> None:
     p_compact.add_argument("--max-scan", dest="max_scan", type=int, default=200,
                            metavar="N",
                            help="Maximum rows to scan per pass (default: 200)")
+    p_compact.add_argument("-y", "--yes", action="store_true",
+                           help="Skip the confirmation prompt")
     p_compact.add_argument("--path", default=None, metavar="PATH",
                            help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_compact.add_argument("-q", "--quiet", action="store_true",
+                           help="Suppress non-essential output")
+
+    p_reembed = subs.add_parser(
+        "reembed",
+        help="Re-encode all vectors with the current embedding scheme",
+        description=(
+            "Re-encode every memory's vector with the scheme the embedding model "
+            "expects (task prefixes for nomic-embed-text). Stores created before "
+            "prefixes were used keep working without it, with weaker recall. "
+            "All vectors are computed first and written in one commit; text and "
+            "metadata are not changed."
+        ),
+    )
+    p_reembed.add_argument("--dry-run", action="store_true",
+                           help="Report what would be re-encoded without changing anything")
+    p_reembed.add_argument("--batch-size", dest="batch_size", type=int,
+                           default=_store_module.REEMBED_BATCH_SIZE, metavar="N",
+                           help="Texts per embedder call (default: %(default)s)")
+    p_reembed.add_argument("-y", "--yes", action="store_true",
+                           help="Skip confirmation prompt")
+    p_reembed.add_argument("--path", default=None, metavar="PATH",
+                           help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
+    p_reembed.add_argument("-q", "--quiet", action="store_true",
                            help="Suppress non-essential output")
 
 
@@ -926,6 +1314,9 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
     """Dispatch hermes lancedb_pro <subcommand> to the correct handler."""
     cmd = getattr(args, "lancedb_pro_command", None)
     if cmd is None:
+        print_help = getattr(args, "_lancedb_pro_help", None)
+        if print_help is not None:
+            print_help()
         return 0
     if cmd == "task":
         return _cmd_task_dispatch(args)
@@ -939,6 +1330,7 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
         "search": _cmd_search,
         "purge": _cmd_purge,
         "compact": _cmd_compact,
+        "reembed": _cmd_reembed,
     }.get(cmd, lambda _: 0)(args)
 
 
@@ -993,8 +1385,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                           help="Output file path (default: stdout)")
     p_export.add_argument("--include-archived", action="store_true",
                           help="Include archived rows (excluded by default)")
-    p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
-                          help="Maximum rows to export (default: 100000)")
+    p_export.add_argument("--limit", type=_positive_int, default=None, metavar="N",
+                          help="Maximum rows to export, counted after the archived "
+                               "filter (default: all)")
     p_export.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
@@ -1050,7 +1443,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     _add_task_subparsers(p_task, dest="task_command")
     p_task.set_defaults(func=_cmd_task_dispatch)
 
-    subparser.set_defaults(func=_dispatch_plugin_cli)
+    subparser.set_defaults(func=_dispatch_plugin_cli, _lancedb_pro_help=subparser.print_help)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,8 +1744,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     if not getattr(args, "yes", False):
         print(f"This will initialise the memory store at: {db_path}")
-        answer = input('Type "yes" to proceed: ').strip().lower()
-        if answer != "yes":
+        if not _confirm():
             print("Aborted.")
             return 1
 
@@ -1483,8 +1875,7 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 
     if not getattr(args, "yes", False):
         print(f"This will WIPE ALL MEMORIES at: {db_path}")
-        answer = input('Type "yes" to proceed: ').strip().lower()
-        if answer != "yes":
+        if not _confirm():
             print("Aborted.")
             return 1
 
@@ -2278,8 +2669,9 @@ def main() -> int:
                           help="Output file path (default: stdout)")
     p_export.add_argument("--include-archived", action="store_true",
                           help="Include archived rows (excluded by default)")
-    p_export.add_argument("--limit", type=int, default=100_000, metavar="N",
-                          help="Maximum rows to export (default: 100000)")
+    p_export.add_argument("--limit", type=_positive_int, default=None, metavar="N",
+                          help="Maximum rows to export, counted after the archived "
+                               "filter (default: all)")
     p_export.add_argument("--path", default=None, metavar="PATH",
                           help="DB directory (default: $MEMORY_DB_DIR, else <hermes home>/memory-lancedb)")
     p_export.add_argument("-q", "--quiet", action="store_true",
@@ -2369,6 +2761,7 @@ def main() -> int:
         "search": _cmd_search,
         "purge": _cmd_purge,
         "compact": _cmd_compact,
+        "reembed": _cmd_reembed,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }
