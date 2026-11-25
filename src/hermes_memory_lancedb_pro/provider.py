@@ -22,8 +22,9 @@ That's all hermes-agent's plugin discovery needs. The provider:
     don't get injected on weak matches
   * batches `sync_turn` writes and increments access counts via the
     throttled `mark_recall_used` API
-  * runs `sync_turn` in a daemon thread so hermes-agent is never
-    blocked by the write path
+  * writes `sync_turn` turns in dispatch order: inline on the host's
+    serialized memory worker, or on a background thread when called
+    from the main thread, so the caller's turn is never blocked
   * isolates the database under `hermes_home` when supplied by
     hermes-agent's `initialize()` call
 """
@@ -31,6 +32,7 @@ That's all hermes-agent's plugin discovery needs. The provider:
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -52,7 +54,7 @@ from .memory_compactor import (
 )
 from .retriever import DEFAULT_MIN_RECALL_SCORE, MemoryRetriever
 from .store import MAX_TEXT_CHARS as _STORE_MAX_TEXT_CHARS
-from .store import MemoryStore, resolve_db_path
+from .store import MemoryStore, _check_injection_guard, resolve_db_path
 from .task_ledger import build_control_block as _build_task_control_block
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,24 @@ _ADMISSION_PRESET_EXPLICIT: bool = "MEMORY_ADMISSION_PRESET" in os.environ
 _EXTRACTION_RATE_LIMIT: int = env_int("MEMORY_EXTRACTION_RATE_LIMIT", 0)
 
 # ---------------------------------------------------------------------------
+# Turn-write drain bounds
+# ---------------------------------------------------------------------------
+# How long session end / switch, pre-compress and shutdown wait for queued
+# turn writes. One smart-extraction pass makes several LLM calls (extract,
+# dedup, admission), so this must cover a slow pass, not just an embedding.
+_WRITE_DRAIN_TIMEOUT_S: float = max(0.0, env_float("MEMORY_WRITE_DRAIN_TIMEOUT_S", 60.0))
+# prefetch / system_prompt_block wait this long for the previous turn's write
+# to become visible. Kept short: it is on the user's critical path, and the
+# host abandons a provider prefetch after 8 seconds.
+_RECALL_FLUSH_TIMEOUT_S = 2.0
+# How long one turn write waits for the writes queued before it. Far above
+# any real extraction pass: it only stops a lost ticket wedging writes forever.
+_WRITE_ORDER_WAIT_S = 300.0
+# Serialises the auto-anchor check-and-write across the turn-write path and
+# on_pre_compress, so two callers cannot both see "no anchor" and write one.
+_ANCHOR_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # Recall guardrails
 # ---------------------------------------------------------------------------
 # Categories that are NEVER injected into the recall block regardless of score.
@@ -206,21 +226,27 @@ _RECALL_CHAR_BUDGET: int = env_int("MEMORY_RECALL_CHAR_BUDGET", 4800)
 # the model mistakes it for user-loaded context ("I see you have a massive
 # file loaded..."). A genuine memory is a fact or note, never a file.
 _RECALL_MAX_ITEM_CHARS: int = env_int("MEMORY_RECALL_MAX_ITEM_CHARS", 600)
-# When True, memories with category="active_task" are pinned to the front of
-# the recall block and bypass the never-categories filter and char budget.
-# This ensures long-running task state is always in context.
+# When True (default), the active-task state (formal task pins and the
+# auto-anchor session breadcrumb) is injected into the system prompt by
+# `system_prompt_block` and `on_pre_compress`, and the auto-anchor is written.
+# Set MEMORY_ACTIVE_TASK_PIN=off for pipelines that do not want any
+# active-task text or breadcrumb rows.
 _RECALL_ACTIVE_TASK_PIN: bool = os.environ.get(
     "MEMORY_ACTIVE_TASK_PIN", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
-# When True, the full durable-task protocol is prepended to every recall
-# block so the model always knows how to manage multi-step work — without
-# requiring an explicit skill invocation.  Set MEMORY_TASK_PROTOCOL=off to
-# silence (e.g. in automated pipelines that manage the ledger externally).
+# When True (default), the full durable-task protocol is part of the system
+# prompt block (`system_prompt_block`) so the model always knows how to manage
+# multi-step work — without requiring an explicit skill invocation.  Set
+# MEMORY_TASK_PROTOCOL=off to silence (e.g. in automated pipelines that manage
+# the ledger externally).
 _RECALL_TASK_PROTOCOL: bool = os.environ.get(
     "MEMORY_TASK_PROTOCOL", "on"
 ).strip().lower() not in ("off", "0", "false", "no")
+# Cap on the transcript sent to the reflection LLM. The most recent part is
+# kept. 0 disables the cap.
+_REFLECTION_MAX_CHARS: int = env_int("MEMORY_REFLECTION_MAX_CHARS", 12000)
 
-# Full durable-task protocol injected every turn when _RECALL_TASK_PROTOCOL
+# Full durable-task protocol placed in the system prompt when _RECALL_TASK_PROTOCOL
 # is True.  Front-loaded with the unconditional no-greeting rule so the
 # model cannot misread the scope as "only during a running task".
 _TASK_PROTOCOL_TEXT = """\
@@ -353,6 +379,35 @@ def _extract_message_texts(messages: Any) -> list[str]:
         if isinstance(content, str) and content.strip():
             texts.append(content)
     return texts
+
+
+def _labeled_message_texts(messages: Any) -> list[str]:
+    """Like `_extract_message_texts`, but each text is prefixed with its
+    speaker role (``user:``, ``assistant:``, ``tool:`` ...) so a consumer
+    such as the reflection prompt can tell the user's words from tool
+    output. A message without a role gets no prefix."""
+    out: list[str] = []
+    for msg in messages or []:
+        body = "\n".join(_extract_message_texts([msg]))
+        if not body:
+            continue
+        role = msg.get("role") if isinstance(msg, dict) else None
+        role = str(role).strip() if role else ""
+        out.append(f"{role}: {body}" if role else body)
+    return out
+
+
+def _cap_transcript(texts: list[str], max_chars: int) -> str:
+    """Join *texts* and keep the most recent *max_chars*, starting on a line
+    boundary and marking the cut. ``max_chars <= 0`` means no cap."""
+    transcript = "\n".join(texts).strip()
+    if max_chars <= 0 or len(transcript) <= max_chars:
+        return transcript
+    tail = transcript[-max_chars:]
+    nl = tail.find("\n")
+    if 0 <= nl < len(tail) - 1:
+        tail = tail[nl + 1:]
+    return "[earlier conversation truncated]\n" + tail
 
 
 def _first_user_text(messages: Any) -> str:
@@ -530,7 +585,21 @@ def _spawn_warmup(store: MemoryStore) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("lancedb_pro warmup failed: %s", e)
 
-    threading.Thread(target=_run, daemon=True, name="lancedb-pro-warmup").start()
+    _spawn_context_thread(_run, name="lancedb-pro-warmup").start()
+
+
+def _spawn_context_thread(target: Any, *, name: str) -> threading.Thread:
+    """Unstarted daemon thread that runs *target* under the caller's
+    contextvars. The host keeps the profile's HERMES_HOME and secret scope in
+    contextvars, so a bare thread would write under the default profile. Uses
+    the host's helper when it has one."""
+    try:
+        from agent.memory_provider import spawn_context_thread
+
+        return spawn_context_thread(target, name=name, daemon=True)
+    except Exception:  # older host without the helper, or no host at all
+        ctx = contextvars.copy_context()
+        return threading.Thread(target=ctx.run, args=(target,), name=name, daemon=True)
 
 
 def _coerce_str_list(value: Any) -> list[str]:
@@ -704,16 +773,23 @@ def _apply_recall_guardrails(
         budget = char_budget
         budgeted: list[dict[str, Any]] = []
         for r in rest:
-            cost = len(r.get("text") or "") + 60  # ~60 chars overhead per formatted line
+            # Charge what _format_recall will actually emit (the per-item
+            # cap), not the raw length: one oversized row must not use up the
+            # budget and evict every other item.
+            text_len = len(r.get("text") or "")
+            if _RECALL_MAX_ITEM_CHARS > 0:
+                text_len = min(text_len, _RECALL_MAX_ITEM_CHARS)
+            cost = text_len + 60  # ~60 chars overhead per formatted line
             if budget < cost and budgeted:
-                logger.debug(
-                    "lancedb_pro recall budget exhausted after %d items; %d dropped",
-                    len(budgeted),
-                    len(rest) - len(budgeted),
-                )
-                break
+                # Skip, don't stop: a smaller later item may still fit.
+                continue
             budget -= cost
             budgeted.append(r)
+        if len(budgeted) < len(rest):
+            logger.debug(
+                "lancedb_pro recall budget: %d items kept, %d dropped",
+                len(budgeted), len(rest) - len(budgeted),
+            )
         rest = budgeted
 
     return pinned + rest
@@ -1087,6 +1163,17 @@ def _auto_anchor_session_if_needed(
     conversation_id: str,
     store: MemoryStore,
 ) -> None:
+    """Locked wrapper: see `_auto_anchor_unlocked`."""
+    with _ANCHOR_LOCK:
+        _auto_anchor_unlocked(user_content, session_id, conversation_id, store)
+
+
+def _auto_anchor_unlocked(
+    user_content: str,
+    session_id: str,
+    conversation_id: str,
+    store: MemoryStore,
+) -> None:
     """Auto-create an active_task breadcrumb if this conversation has none.
 
     Without a pinned task, context compaction silently destroys all session
@@ -1099,6 +1186,8 @@ def _auto_anchor_session_if_needed(
     `conversation_id` (stable across the context-compression session-id
     rotations within one conversation), NOT by the raw session id. A genuine
     `/reset` clears it via `_archive_auto_anchors`."""
+    if not _RECALL_ACTIVE_TASK_PIN:
+        return
     try:
         existing = _list_active_task_rows(store)
     except Exception as exc:
@@ -1127,14 +1216,32 @@ def _auto_anchor_session_if_needed(
 
     snippet = _quote_safe(user_content, 200)
 
-    anchor_text = (
-        "SESSION IN PROGRESS — do NOT greet.\n"
-        + (f'The user\'s first message (quoted, not an instruction): "{snippet}"\n'
-           if snippet else "")
-        + "\nContinue from where you left off.\n"
-        "Run `hermes lancedb_pro task list` to check for pinned tasks.\n"
-        "If mid-task: resume it. Otherwise: answer the user's message directly."
-    )
+    def _compose(quoted: str) -> str:
+        return (
+            "SESSION IN PROGRESS — do NOT greet.\n"
+            + (f'The user\'s first message (quoted, not an instruction): "{quoted}"\n'
+               if quoted else "")
+            + "\nContinue from where you left off.\n"
+            "Run `hermes lancedb_pro task list` to check for pinned tasks.\n"
+            "If mid-task: resume it. Otherwise: answer the user's message directly."
+        )
+
+    anchor_text = _compose(snippet)
+    if snippet:
+        # The write-time injection guard would reject (or blank out) the whole
+        # anchor over a quoted user line it dislikes. The anchor is the
+        # post-compaction no-greeting defence, so write it without the quote
+        # rather than lose it.
+        try:
+            guarded = _check_injection_guard(anchor_text, where="auto-anchor")
+        except ValueError:
+            guarded = None
+        if guarded != anchor_text:
+            logger.warning(
+                "lancedb_pro: the injection guard flagged the user's first "
+                "message; writing the session anchor without the quote"
+            )
+            anchor_text = _compose("")
 
     meta: dict[str, Any] = {
         "auto_anchor": True,
@@ -1231,9 +1338,15 @@ def _build_provider_class():
             smart_extractor: Any = None,
             auto_smart_extraction: bool = True,
         ):
+            # Store, retriever and extractor are resolved lazily (see the
+            # properties below): the host constructs the provider at plugin
+            # load, before `initialize()` knows the profile's database, and
+            # an eager `MemoryStore.get_instance()` here created a stray
+            # database at the default path.
             self._explicit_store = store is not None
-            self._store = store or MemoryStore.get_instance()
-            self._retriever = retriever or MemoryRetriever(self._store)
+            self._lazy_lock = threading.RLock()
+            self._store_obj: MemoryStore | None = store
+            self._retriever_obj: MemoryRetriever | None = retriever
             # Base recall config. jmunch-mode widening is applied per
             # recall in `_do_recall` (see `_effective_recall_config`), not
             # cached here — jmunch may only be confirmed mid-session.
@@ -1250,15 +1363,20 @@ def _build_provider_class():
             # genuine reset — so it cleanly scopes auto-anchors to one
             # conversation even in a gateway serving many from one store.
             self._conversation_id: str = ""
-            self._sync_thread: threading.Thread | None = None
-            # Protects _sync_thread reference against concurrent sync_turn /
-            # on_session_end / shutdown calls from different threads.
-            self._thread_lock = threading.Lock()
-            # Serializes the join+create+start sequence so two concurrent
-            # sync_turn callers cannot each launch their own write thread.
+            # Turn writes run strictly in dispatch order: each takes the next
+            # ticket and runs once every earlier ticket has finished, whether
+            # it runs inline or on a background thread. `_write_done` is
+            # always a prefix of `_write_issued`, so "all writes dispatched
+            # so far are done" is `_write_done >= issued-at-that-time`.
+            self._write_cv = threading.Condition()
+            self._write_issued = 0
+            self._write_done = 0
+            # Serializes ticket dispatch. on_session_end holds it for its
+            # whole barrier so no turn write is dispatched between its wait
+            # and the summary write.
             self._dispatch_lock = threading.Lock()
             # Lock protecting _pending_used_ids — dict is mutated from the
-            # calling thread (prefetch) and from the sync_turn daemon
+            # calling thread (prefetch) and from the sync_turn write
             # thread simultaneously.
             self._pending_lock = threading.Lock()
             # Cache last-prefetched ids per session so we can mark them
@@ -1272,9 +1390,10 @@ def _build_provider_class():
             # back to writing raw user/assistant turns — the same shape this
             # provider always wrote, so existing stores don't migrate.
             self._auto_smart_extraction = auto_smart_extraction
-            self._smart_extractor = smart_extractor
-            if smart_extractor is None and auto_smart_extraction:
-                self._smart_extractor = _maybe_build_default_smart_extractor(self._store)
+            self._extractor_obj = smart_extractor
+            self._extractor_resolved = (
+                smart_extractor is not None or not auto_smart_extraction
+            )
             # Embedding-model warmup runs once, off the first turn's path.
             self._warmed_up = False
             # Agent identity for reflection ownership; may be overridden by
@@ -1291,8 +1410,75 @@ def _build_provider_class():
         def name(self) -> str:
             return PROVIDER_NAME
 
+        # ---- lazily resolved collaborators -------------------------------
+
+        @property
+        def _store(self) -> MemoryStore:
+            with self._lazy_lock:
+                if self._store_obj is None:
+                    self._store_obj = MemoryStore.get_instance()
+                return self._store_obj
+
+        @_store.setter
+        def _store(self, value: MemoryStore) -> None:
+            self._store_obj = value
+
+        @property
+        def _retriever(self) -> MemoryRetriever:
+            with self._lazy_lock:
+                if self._retriever_obj is None:
+                    self._retriever_obj = MemoryRetriever(self._store)
+                return self._retriever_obj
+
+        @_retriever.setter
+        def _retriever(self, value: MemoryRetriever) -> None:
+            self._retriever_obj = value
+
+        @property
+        def _smart_extractor(self) -> Any:
+            with self._lazy_lock:
+                if not self._extractor_resolved:
+                    self._extractor_obj = _maybe_build_default_smart_extractor(
+                        self._store
+                    )
+                    self._extractor_resolved = True
+                return self._extractor_obj
+
+        @_smart_extractor.setter
+        def _smart_extractor(self, value: Any) -> None:
+            self._extractor_obj = value
+            self._extractor_resolved = True
+
         def is_available(self) -> bool:
-            return True
+            """Config/dependency check only (the host calls this on its hot
+            path): no model is loaded and no database is opened."""
+            return not self._missing_dependencies()
+
+        def unavailable_reason(self) -> str:
+            missing = self._missing_dependencies()
+            if not missing:
+                return ""
+            return (
+                "missing Python package(s): " + ", ".join(missing)
+                + " (pip install " + " ".join(missing) + ")"
+            )
+
+        @staticmethod
+        def _missing_dependencies() -> list[str]:
+            import importlib.util
+
+            missing: list[str] = []
+            for dist, module in (
+                ("lancedb", "lancedb"),
+                ("sentence-transformers", "sentence_transformers"),
+            ):
+                try:
+                    found = importlib.util.find_spec(module) is not None
+                except (ImportError, ValueError):
+                    found = False
+                if not found:
+                    missing.append(dist)
+            return missing
 
         def initialize(self, session_id: str, **kwargs: Any) -> None:
             """Called by hermes-agent before the first turn of each session.
@@ -1332,21 +1518,33 @@ def _build_provider_class():
                         db_path, profile_db,
                     )
                 self._store = MemoryStore.get_instance(db_path=db_path)
-                self._retriever = MemoryRetriever(self._store)
+                self._retriever_obj = None
                 if self._auto_smart_extraction:
-                    self._smart_extractor = _maybe_build_default_smart_extractor(
-                        self._store
-                    )
+                    # Rebuilt against the profile's store. Resolved here, in
+                    # the host's profile context, not on a later write thread.
+                    self._extractor_resolved = False
+                    self._extractor_obj = None
+                    _ = self._smart_extractor
             elif self._explicit_store:
                 # get_instance() calls _initialise() internally, but an
                 # explicitly-supplied store may not have been opened yet.
                 self._store._initialise()
+            elif self._auto_smart_extraction:
+                _ = self._smart_extractor  # same build point as the branch above
 
             # Warm the embedding model once, in the background, so the
             # cold-start cost never lands on the user's first turn.
             if not self._warmed_up:
                 self._warmed_up = True
                 _spawn_warmup(self._store)
+            # Mark the database as in use so `reembed` refuses to convert it
+            # underneath a running agent (see MemoryStore.hold_in_use_lock).
+            try:
+                hold = getattr(self._store, "hold_in_use_lock", None)
+                if callable(hold) and not hold():
+                    logger.debug("lancedb_pro: could not take the in-use lock")
+            except Exception as exc:
+                logger.debug("lancedb_pro: in-use lock failed: %s", exc)
 
         def get_tool_schemas(self) -> list[dict[str, Any]]:
             return []  # context-only provider; no tool calls
@@ -1485,7 +1683,10 @@ def _build_provider_class():
                 if _RECALL_TASK_PROTOCOL:
                     parts.append(_TASK_PROTOCOL_TEXT)
                 try:
-                    task_mems = _list_active_task_rows(self._store)
+                    task_mems = (
+                        _list_active_task_rows(self._store)
+                        if _RECALL_ACTIVE_TASK_PIN else []
+                    )
                     # Scope to this conversation — formal pins stay global,
                     # auto-anchors from other conversations are dropped.
                     task_mems = [
@@ -1572,9 +1773,7 @@ def _build_provider_class():
                     existing_ids = {r.get("id") for r in results}
                     # strict: only rows written in THIS session. Otherwise the
                     # anchors are the store's oldest/newest global rows.
-                    first_anchors = self._store.first_for_session(
-                        session_id, limit=2, strict=True)
-                    recent_anchors = self._store.recent_for_session(
+                    first_anchors, recent_anchors = self._store.anchors_for_session(
                         session_id, limit=2, strict=True)
                     seen: set[str | None] = set(existing_ids)
                     extra_anchors = []
@@ -1613,8 +1812,8 @@ def _build_provider_class():
             ]
 
             # Recall guardrails — drop never-categories, enforce char/token
-            # budget. (Active-task pinning is a no-op here now that the
-            # category is filtered out above — see `system_prompt_block`.)
+            # budget. (Active tasks were filtered out above; they are owned
+            # by `system_prompt_block`, which honours MEMORY_ACTIVE_TASK_PIN.)
             results = _apply_recall_guardrails(
                 results,
                 _RECALL_NEVER_CATEGORIES,
@@ -1702,7 +1901,7 @@ def _build_provider_class():
             the protocol branch of `_do_recall`."""
             if not query or not query.strip():
                 return ""
-            self._flush_pending_write()
+            self._flush_pending_write(reason="prefetch")
             return self._do_recall(query, session_id or self._session_id)
 
         def system_prompt_block(self) -> str:
@@ -1736,7 +1935,7 @@ def _build_provider_class():
             any error — which would remove the entire greeting defence. Every
             path here is therefore guarded."""
             try:
-                self._flush_pending_write()
+                self._flush_pending_write(reason="system_prompt_block")
                 return self._do_recall("", self._session_id)
             except Exception as exc:
                 logger.debug("lancedb_pro system_prompt_block failed: %s", exc)
@@ -1756,11 +1955,11 @@ def _build_provider_class():
               2. Return the current active-task control block so the host
                  folds it into the compressed summary as a second, redundant
                  copy of the task state."""
-            # Join any in-flight sync_turn write first. That thread also
-            # calls `_auto_anchor_session_if_needed`; flushing it here
-            # serialises the two callers so they cannot both pass the
-            # "no anchor exists" check and create duplicate anchors.
-            self._flush_pending_write()
+            # Give a pending turn write a moment to land, but do not wait out
+            # a whole extraction pass: this runs inline in a live turn. The
+            # duplicate-anchor race with that write is closed by the lock
+            # inside `_auto_anchor_session_if_needed`, not by waiting.
+            self._flush_pending_write(reason="on_pre_compress")
             try:
                 if self._writes_enabled():
                     first_user = _first_user_text(messages)
@@ -1770,6 +1969,8 @@ def _build_provider_class():
                     )
             except Exception as exc:
                 logger.debug("lancedb_pro on_pre_compress anchor failed: %s", exc)
+            if not _RECALL_ACTIVE_TASK_PIN:
+                return ""
             try:
                 task_mems = _list_active_task_rows(self._store)
                 task_mems = [
@@ -1812,12 +2013,16 @@ def _build_provider_class():
             *,
             session_id: str = "",
         ) -> None:
-            """Persist a completed turn in a daemon thread (non-blocking).
+            """Persist a completed turn, in dispatch order.
 
-            hermes-agent must not be blocked by the write path; all I/O
-            happens in a background daemon thread. We join any still-running
-            previous thread first (with a 5-second cap) so writes remain
-            ordered per session.
+            hermes-agent's MemoryManager.sync_all already calls this on its
+            single serialized background worker and relies on that worker
+            for turn ordering, `flush_pending()` and the shutdown drain. So
+            off the main thread the write runs inline: the host's drain then
+            really covers it. Only a main-thread caller (standalone use, or
+            the host's fallback when its worker cannot start) gets a
+            background thread, so its turn is not blocked. Either way writes
+            run one at a time, in the order they were dispatched.
 
             When a `smart_extractor` is configured, sync_turn delegates the
             write to it (LLM-driven 6-category extraction). Otherwise we
@@ -1901,28 +2106,101 @@ def _build_provider_class():
                     except Exception as e:
                         logger.warning("lancedb_pro mark_recall_used failed: %s", e)
 
+            background = threading.current_thread() is threading.main_thread()
             with self._dispatch_lock:
-                with self._thread_lock:
-                    prev = self._sync_thread
-                if prev and prev.is_alive():
-                    prev.join(timeout=5.0)
-                new_thread = threading.Thread(target=_do, daemon=True)
-                with self._thread_lock:
-                    self._sync_thread = new_thread
-                new_thread.start()
+                with self._write_cv:
+                    self._write_issued += 1
+                    ticket = self._write_issued
+                if background:
+                    try:
+                        worker = _spawn_context_thread(
+                            lambda: self._run_write_in_order(ticket, _do),
+                            name="lancedb-pro-sync",
+                        )
+                        worker.start()
+                    except RuntimeError as exc:
+                        # The ticket must still complete, or every later
+                        # write would wait for it forever.
+                        logger.warning(
+                            "lancedb_pro: cannot start a write thread (%s); writing inline", exc,
+                        )
+                        background = False
+                    except BaseException:
+                        # Anything else (a Ctrl-C between issuing the ticket
+                        # and starting the thread): release the ticket so
+                        # later writes are not wedged behind it, then re-raise.
+                        self._complete_ticket(ticket)
+                        raise
+            if not background:
+                # Outside _dispatch_lock: a session-end barrier on another
+                # thread then waits with its own bound instead of blocking on
+                # the lock for the whole extraction.
+                self._run_write_in_order(ticket, _do)
 
-        def _flush_pending_write(self, timeout: float = 2.0) -> None:
-            """Wait briefly for the previous sync_turn write thread to finish.
+        def _run_write_in_order(self, ticket: int, write: Any) -> None:
+            """Run *write* once every earlier ticket has finished, then mark
+            *ticket* done. Never raises."""
+            try:
+                with self._write_cv:
+                    # Bounded: if an earlier ticket was somehow lost, go
+                    # ahead rather than block every later write for good.
+                    if not self._write_cv.wait_for(
+                        lambda: self._write_done >= ticket - 1,
+                        timeout=_WRITE_ORDER_WAIT_S,
+                    ):
+                        logger.warning(
+                            "lancedb_pro: an earlier turn write did not finish in %.0fs; "
+                            "writing this turn anyway", _WRITE_ORDER_WAIT_S,
+                        )
+                write()
+            except Exception as exc:
+                logger.warning("lancedb_pro sync_turn write failed: %s", exc)
+            finally:
+                self._complete_ticket(ticket)
 
-            Called at the top of prefetch / system_prompt_block so that
-            the previous turn's memories are visible to the upcoming recall.
-            Without this, a slow embedding (e.g. first-ever model load on a
-            brand-new install) causes the read to race the write and return
-            empty results for the first several turns."""
-            with self._thread_lock:
-                thread = self._sync_thread
-            if thread and thread.is_alive():
-                thread.join(timeout=timeout)
+        def _complete_ticket(self, ticket: int) -> None:
+            with self._write_cv:
+                self._write_done = max(self._write_done, ticket)
+                self._write_cv.notify_all()
+
+        def _flush_pending_write(
+            self,
+            timeout: float = _RECALL_FLUSH_TIMEOUT_S,
+            *,
+            reason: str = "recall",
+            level: int = logging.INFO,
+        ) -> bool:
+            """Wait for every sync_turn write dispatched so far to finish, in
+            order, for at most *timeout* seconds. Returns False, and logs, when
+            it gives up; the writes keep running and still land in order.
+
+            prefetch / system_prompt_block call this with the short default
+            so the previous turn's memories are visible to the upcoming recall
+            (without it a slow embedding, e.g. a first-ever model load, races
+            the read); giving up there is routine when extraction is slow, so
+            it logs at INFO. Lifecycle barriers use `_drain_pending_writes`."""
+            with self._write_cv:
+                target = self._write_issued
+                done = self._write_cv.wait_for(
+                    lambda: self._write_done >= target, timeout=timeout,
+                )
+                pending = target - self._write_done
+            if not done:
+                logger.log(
+                    level,
+                    "lancedb_pro %s: gave up after %.1fs waiting for %d pending turn "
+                    "write(s); they keep running in the background",
+                    reason, timeout, pending,
+                )
+            return done
+
+        def _drain_pending_writes(self, reason: str) -> bool:
+            """Lifecycle barrier: wait up to `_WRITE_DRAIN_TIMEOUT_S` for every
+            pending turn write. Giving up here risks losing a turn, so it
+            warns."""
+            return self._flush_pending_write(
+                _WRITE_DRAIN_TIMEOUT_S, reason=reason, level=logging.WARNING,
+            )
 
         def _raw_sync_turn(
             self,
@@ -1943,7 +2221,7 @@ def _build_provider_class():
             to re-greet). The smart_extractor path handles both sides properly
             by extracting facts rather than storing raw turns.
 
-            ``_store_override`` lets the sync_turn daemon thread pass the
+            ``_store_override`` lets the sync_turn write pass the
             store it captured at dispatch time, preventing a concurrent
             initialize() from redirecting writes to the wrong database."""
             store = _store_override or self._store
@@ -1974,9 +2252,14 @@ def _build_provider_class():
             reset: bool = False,
             **_kwargs: Any,
         ) -> None:
-            # Let the previous session's last write land before switching,
-            # so a reset can reliably see (and archive) its auto-anchor.
-            self._flush_pending_write()
+            # A reset must see (and archive) the conversation's auto-anchor,
+            # so wait for every pending write. Any other switch runs inline
+            # on the host's main thread and needs no such guarantee: each
+            # write captured its store, session and conversation at dispatch.
+            if reset:
+                self._drain_pending_writes("on_session_switch")
+            else:
+                self._flush_pending_write(reason="on_session_switch")
             # A genuine reset (/new, /reset) begins a fresh conversation.
             # Archive THIS conversation's auto-anchor before the id changes —
             # otherwise `system_prompt_block` would surface a stale "you are
@@ -2196,19 +2479,16 @@ def _build_provider_class():
         def on_session_end(self, messages: list) -> None:
             """Called by hermes-agent at conversation end (not process exit).
 
-            Joins any pending sync_turn thread so writes complete first,
+            Waits for every pending sync_turn write so they complete first,
             writes a session-summary memory from the conversation history,
             flushes the pending-recall ledger, then triggers the
             cooldown-gated auto-purge.
 
             Holds `_dispatch_lock` for the whole barrier so a concurrent
-            `sync_turn` cannot launch a new write thread between our join
-            and the summary write."""
+            `sync_turn` cannot dispatch a new write between our wait and
+            the summary write."""
             with self._dispatch_lock:
-                with self._thread_lock:
-                    thread = self._sync_thread
-                if thread and thread.is_alive():
-                    thread.join(timeout=10.0)
+                self._drain_pending_writes("on_session_end")
 
                 try:
                     self._write_session_summary(messages)
@@ -2216,7 +2496,7 @@ def _build_provider_class():
                     logger.warning("lancedb_pro session-summary write failed: %s", e)
 
                 try:
-                    self._maybe_write_reflection(_extract_message_texts(messages))
+                    self._maybe_write_reflection(_labeled_message_texts(messages))
                 except Exception as e:
                     logger.warning("lancedb_pro reflection write failed: %s", e)
 
@@ -2244,13 +2524,18 @@ def _build_provider_class():
             llm = getattr(extractor, "llm", None)
             if llm is None:
                 return
-            conversation = "\n".join(texts).strip()
+            # Role-labelled and capped to the most recent part: the prompt asks
+            # for truths about the user, and an unbounded tool-heavy
+            # transcript overflows the model context (the call then fails
+            # silently).
+            conversation = _cap_transcript(texts, _REFLECTION_MAX_CHARS)
             if not conversation:
                 return
 
             from .extraction_prompts import build_reflection_prompt
-            result = llm.complete_json(
-                build_reflection_prompt(conversation), label="reflection",
+            from .llm_client import complete_json_with_retry
+            result = complete_json_with_retry(
+                llm, build_reflection_prompt(conversation), label="reflection",
             )
             if not isinstance(result, dict):
                 return
@@ -2332,11 +2617,12 @@ def _build_provider_class():
             )
 
         def shutdown(self) -> None:
-            """Called by hermes-agent at process exit."""
-            with self._thread_lock:
-                thread = self._sync_thread
-            if thread and thread.is_alive():
-                thread.join(timeout=5.0)
+            """Called by hermes-agent at process exit.
+
+            The host gives its own worker only a short drain before calling
+            this, so a slow extraction may still be running (inline on that
+            worker, or on our background thread): wait for it here."""
+            self._drain_pending_writes("shutdown")
             with self._pending_lock:
                 self._pending_used_ids.clear()
             with self._reflection_lock:

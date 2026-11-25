@@ -249,6 +249,7 @@ class TestNoDoubleCreditOnNewHost:
         # Now the host calls sync_turn — _pending_used_ids has been
         # drained, so the legacy crediting block is skipped.
         p.sync_turn("user msg", "assistant msg", session_id="sess-D")
+        p._flush_pending_write()  # main-thread sync_turn writes in the background
         count_after_sync_turn = real_store.get_by_id(mid)["metadata"]["access_count"]
 
         # No double-credit — count is the same
@@ -277,6 +278,7 @@ class TestOldHostStillWorks:
         assert "sess-E" in p._pending_used_ids
         # Old host calls sync_turn (no on_recall_used in between)
         p.sync_turn("user msg", "assistant msg", session_id="sess-E")
+        p._flush_pending_write()  # main-thread sync_turn writes in the background
         meta = real_store.get_by_id(mid)["metadata"]
         # mark_recall_used ran in sync_turn — the prefetched id was credited
         assert meta.get("access_count", 0) >= 1
