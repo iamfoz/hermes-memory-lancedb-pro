@@ -98,6 +98,8 @@ Conversation text and stored memories are passed to the extraction, dedup, merge
 | `MEMORY_EXTRACTION_MODEL` | *(none)* | Model id for extraction. |
 | `MEMORY_EXTRACTION_PROVIDER` | *(none)* | `openai` (default behaviour) or `anthropic` to route the override through the Anthropic SDK. |
 | `MEMORY_EXTRACTION_RATE_LIMIT` | `0` | Maximum extraction passes per hour. Each pass makes one extraction call plus dedup, admission-utility and merge calls per candidate, so this is not a cap on LLM calls or spend. When the cap is reached, turns are stored as raw user/assistant memories until the window clears. `0` disables the cap. |
+| `MEMORY_EXTRACTION_TIMEOUT` | `30` | Seconds to wait for one extraction LLM call. Raise it (for example `90`) for slow or free routes; a timed-out call stores the turn unprocessed. |
+| `MEMORY_EXTRACTION_MAX_TOKENS` | `4096` | Output budget per extraction call on OpenAI-compatible endpoints. A reasoning model spends part of it before answering and can return nothing; raise it, or use a non-reasoning model. |
 | `MEMORY_WRITE_DRAIN_TIMEOUT_S` | `60` | Seconds that session end, a session reset and shutdown wait for pending turn writes (one extraction pass can make several LLM calls). A warning is logged if the wait runs out; the writes keep running. Recall (prefetch), context compression and non-reset session switches wait at most 2 seconds. |
 | `OPENAI_API_KEY` | *(none)* | Fallback extraction LLM (OpenAI-compatible). |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for the OpenAI fallback. |

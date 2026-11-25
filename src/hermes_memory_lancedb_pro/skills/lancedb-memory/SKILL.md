@@ -115,6 +115,36 @@ do anything, and you should not narrate it. When an extraction model is
 configured it distils the turn into separate facts, merges them with what is
 already known, and replaces facts that have changed.
 
+**If only raw turns are being stored, extraction is broken, not quietly
+disabled.** When the extraction call fails, the turn is still saved, but as
+unprocessed text: memories keep arriving and nothing looks wrong. Signs: new
+memories read like transcripts instead of distilled facts, almost everything is
+in the `other` category, or `doctor` shows consecutive failures under
+`--- Extraction ---`. To find out why, and to prove a fix:
+
+```bash
+hermes lancedb_pro doctor            # the Extraction section: last success, last error
+hermes lancedb_pro extraction-test   # one real call on a sample turn; writes nothing
+```
+
+`extraction-test` prints the model, the time taken, and either the facts it
+extracted or the error. The two usual causes:
+
+- **The model reasons first and never answers.** A reasoning model can spend
+  its whole output budget thinking and return empty content (the error says
+  `empty response content … finish_reason=length`). A router alias such as
+  "auto" or "cheap" can resolve to such a model without warning. Fix: pin a
+  specific non-reasoning model, or raise `MEMORY_EXTRACTION_MAX_TOKENS`.
+- **The call times out.** The default wait is 30 seconds, which slow or free
+  routes exceed. Fix: raise `MEMORY_EXTRACTION_TIMEOUT` (for example `90`).
+
+These are settings for the operator to change, followed by a gateway restart.
+**Never edit the plugin's installed files to work around this**: the next
+plugin update overwrites the edit and the fault comes back. Report what
+`extraction-test` printed and which setting would fix it. Do not say memories
+are being distilled until `extraction-test` reports `OK` and `doctor` shows a
+recent success.
+
 ### On purpose
 
 When the user says "remember this", or you learn something that must not be
@@ -196,6 +226,7 @@ What to act on in `doctor`:
 | `Store is unreadable` | The database is damaged | Stop. Tell the user; point them to `export --salvage`. Do not run anything that writes. |
 | `embedding_scheme: plain (legacy …)` and recommends `reembed` | The database predates an embedding improvement; it works as is | Mention it to the user once. Do not run `reembed` yourself. |
 | A reembed was interrupted | A conversion did not finish | Tell the user to run `reembed` again with Hermes stopped. |
+| `Extraction is FAILING` | Turns are stored unprocessed | Run `extraction-test`, then report the error and the setting that fixes it (see "Writing memory"). |
 | A high archived ratio, or "purge" recommended | Old versions are piling up | Harmless. It is cleaned automatically; mention it only if asked. |
 | Expired memories counted | Dated memories past their time | Normal; they are hidden from recall. |
 | Orphan entries under Anomalies | Broken links between versions | Report it to the user. |
@@ -277,6 +308,7 @@ is an error, not an empty memory: check you did not pass a wrong `--path`
 | `search QUERY [--mode hybrid\|vector\|bm25] [--limit N] [--category C] [--min-score X] [--json]` | Find memories | No |
 | `stats [--json]` | Counts by category and tier | No |
 | `doctor [-q]` | Health report | No |
+| `extraction-test` | One real extraction call on a sample turn | No (costs one model call) |
 | `compact --dry-run` | Preview duplicate merging | No |
 | `compact -y` | Merge near-duplicates | Yes |
 | `task …` | Durable task ledger (see the `durable-task` skill) | Yes |

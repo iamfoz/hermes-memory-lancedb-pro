@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
@@ -410,7 +411,8 @@ class OpenAICompatibleLlmClient(_LastErrorState):
         api_key: str,
         base_url: str,
         model: str,
-        timeout: float = 30,
+        timeout: float | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         try:
             import openai as _openai  # noqa: PLC0415
@@ -420,10 +422,12 @@ class OpenAICompatibleLlmClient(_LastErrorState):
                 "Install it with: pip install openai"
             ) from exc
 
+        self.timeout = float(timeout) if timeout else extraction_timeout_s()
+        self.max_tokens = int(max_tokens) if max_tokens else extraction_max_tokens()
         self._client = _openai.OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=timeout,
+            timeout=self.timeout,
         )
         self.model = model
         self.base_url = base_url
@@ -451,7 +455,7 @@ class OpenAICompatibleLlmClient(_LastErrorState):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=4096,
+                max_tokens=self.max_tokens,
                 extra_headers=jmunch_request_headers() or None,
             )
             record_response_headers(raw_response.headers)
@@ -462,6 +466,11 @@ class OpenAICompatibleLlmClient(_LastErrorState):
                 getattr(getattr(exc, "response", None), "headers", None)
             )
             detail = _describe_request_error(exc)
+            if "timeout" in detail.lower() or "timed out" in detail.lower():
+                detail += (
+                    f" — no reply within {getattr(self, 'timeout', DEFAULT_EXTRACTION_TIMEOUT_S):.0f}s; "
+                    "raise MEMORY_EXTRACTION_TIMEOUT for a slow route"
+                )
             self._last_error = (
                 f"hermes-memory-lancedb-pro: llm-client [{effective_label}] "
                 f"request failed for model {self.model}: {detail}"
@@ -471,11 +480,11 @@ class OpenAICompatibleLlmClient(_LastErrorState):
             return None
 
         if not raw:
+            reason = _empty_reply_reason(response, self.model)
             self._last_error = (
-                f"hermes-memory-lancedb-pro: llm-client [{effective_label}] "
-                f"empty response content from model {self.model}"
+                f"hermes-memory-lancedb-pro: llm-client [{effective_label}] {reason}"
             )
-            logger.warning("llm_client [%s]: empty response", effective_label)
+            logger.warning("llm_client [%s]: %s", effective_label, reason)
             return None
 
         parsed, err = _parse_json_with_repair(raw, effective_label)
@@ -522,7 +531,8 @@ class AnthropicLlmClient(_LastErrorState):
 
         # Explicit timeout: the SDK default is about 10 minutes, and one hung
         # call stalled the whole multi-call extraction pipeline.
-        self._client = _anthropic.Anthropic(api_key=api_key, timeout=30.0, max_retries=2)
+        self.timeout = extraction_timeout_s()
+        self._client = _anthropic.Anthropic(api_key=api_key, timeout=self.timeout, max_retries=2)
         self.model = model
         self._max_tokens = max_tokens
         self._last_error = None
@@ -557,6 +567,11 @@ class AnthropicLlmClient(_LastErrorState):
                 getattr(getattr(exc, "response", None), "headers", None)
             )
             detail = _describe_request_error(exc)
+            if "timeout" in detail.lower() or "timed out" in detail.lower():
+                detail += (
+                    f" — no reply within {getattr(self, 'timeout', DEFAULT_EXTRACTION_TIMEOUT_S):.0f}s; "
+                    "raise MEMORY_EXTRACTION_TIMEOUT for a slow route"
+                )
             self._last_error = (
                 f"hermes-memory-lancedb-pro: llm-client [{effective_label}] "
                 f"request failed for model {self.model}: {detail}"
@@ -609,6 +624,102 @@ def _host_is_multiplexing() -> bool:
         return bool(is_multiplex_active())
     except Exception:  # noqa: BLE001
         return True
+
+
+EXTRACTION_STATUS_FILE = ".extraction-status.json"
+
+
+def read_extraction_status(db_path: str) -> dict[str, Any]:
+    """The recorded outcome of recent extraction calls for a database, or
+    ``{}`` when none has been recorded."""
+    try:
+        with open(os.path.join(db_path, EXTRACTION_STATUS_FILE), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def record_extraction_outcome(
+    db_path: str, *, ok: bool, error: str | None = None, model: str | None = None,
+) -> None:
+    """Record whether an extraction call worked, beside the database.
+
+    A failed call no longer loses the turn (it is stored unprocessed), which
+    makes a broken extraction model easy to miss: memories keep arriving,
+    just never distilled. `doctor` reads this file to say so. Best-effort."""
+    try:
+        status = read_extraction_status(db_path)
+        now_ms = int(time.time() * 1000)
+        if ok:
+            status["last_success_at"] = now_ms
+            status["consecutive_failures"] = 0
+        else:
+            status["last_failure_at"] = now_ms
+            status["last_error"] = (error or "no reply")[:500]
+            status["consecutive_failures"] = int(status.get("consecutive_failures") or 0) + 1
+        if model:
+            status["model"] = model
+        path = os.path.join(db_path, EXTRACTION_STATUS_FILE)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(status, fh)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - never break the write path
+        logger.debug("llm_client: could not record extraction status: %s", exc)
+
+
+DEFAULT_EXTRACTION_TIMEOUT_S = 30.0
+DEFAULT_EXTRACTION_MAX_TOKENS = 4096
+
+
+def extraction_timeout_s() -> float:
+    """``MEMORY_EXTRACTION_TIMEOUT``: seconds to wait for one LLM call
+    (default 30). Slow or free routes need more; raise it there rather than
+    editing the installed plugin, which an update overwrites."""
+    raw = os.environ.get("MEMORY_EXTRACTION_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_EXTRACTION_TIMEOUT_S
+    except ValueError:
+        logger.warning("MEMORY_EXTRACTION_TIMEOUT=%r is not a number; using %.0fs",
+                       raw, DEFAULT_EXTRACTION_TIMEOUT_S)
+        return DEFAULT_EXTRACTION_TIMEOUT_S
+    return value if value > 0 else DEFAULT_EXTRACTION_TIMEOUT_S
+
+
+def extraction_max_tokens() -> int:
+    """``MEMORY_EXTRACTION_MAX_TOKENS``: output budget per LLM call (default
+    4096). A reasoning model spends part of it before writing any answer."""
+    raw = os.environ.get("MEMORY_EXTRACTION_MAX_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_EXTRACTION_MAX_TOKENS
+    except ValueError:
+        logger.warning("MEMORY_EXTRACTION_MAX_TOKENS=%r is not an integer; using %d",
+                       raw, DEFAULT_EXTRACTION_MAX_TOKENS)
+        return DEFAULT_EXTRACTION_MAX_TOKENS
+    return value if value > 0 else DEFAULT_EXTRACTION_MAX_TOKENS
+
+
+def _empty_reply_reason(response: Any, model: str) -> str:
+    """Explain a reply with no content. The usual cause is a reasoning model
+    that used its whole output budget thinking and wrote no answer."""
+    finish = reasoning = None
+    try:
+        choice = response.choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        message = choice.message
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    except Exception:  # noqa: BLE001
+        pass
+    detail = f"empty response content from model {model}"
+    if finish:
+        detail += f" (finish_reason={finish})"
+    if reasoning or finish == "length":
+        detail += (
+            ": the model spent its output budget on reasoning and wrote no answer. "
+            "Use a non-reasoning model, or raise MEMORY_EXTRACTION_MAX_TOKENS"
+        )
+    return detail
 
 
 def _make_secret_reader(env: Mapping[str, str] | None) -> Callable[[str], str]:

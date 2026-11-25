@@ -733,6 +733,9 @@ def _cmd_doctor(
         say("  No anomalies detected.")
     say()
 
+    # ---- Extraction ----
+    extraction_failing = _report_extraction(store.db_path, say)
+
     # ---- Expiry ----
     # Not an anomaly: time-bound memories ("dentist tomorrow") are meant to
     # expire. Reported so "why isn't X recalled?" has an answer.
@@ -775,10 +778,114 @@ def _cmd_doctor(
         any_rec = True
         say(reembed_advice)
 
+    if extraction_failing:
+        any_rec = True
+        say(
+            "Run `hermes lancedb_pro extraction-test` — the extraction model is "
+            "failing, so turns are being stored unprocessed."
+        )
+
     if not any_rec:
         say("  No recommendations.")
     say()
 
+    return 0
+
+
+_EXTRACTION_FAILING_AFTER = 3  # consecutive failed calls
+
+
+def _when(ms: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ms) / 1000))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "unknown"
+
+
+def _report_extraction(db_path: str, say) -> bool:
+    """Print the Extraction section of `doctor`; True when it is failing.
+
+    A failing extraction model is otherwise invisible: turns are still
+    stored, just unprocessed, so the store keeps growing and looks healthy."""
+    from .llm_client import read_extraction_status
+
+    status = read_extraction_status(db_path)
+    say("--- Extraction ---")
+    if not status:
+        say("no extraction calls recorded (no model configured, or none made yet)")
+        say()
+        return False
+    failures = int(status.get("consecutive_failures") or 0)
+    if status.get("model"):
+        say(f"model:                {status['model']}")
+    if status.get("last_success_at"):
+        say(f"last success:         {_when(status['last_success_at'])}")
+    else:
+        say("last success:         never")
+    if status.get("last_failure_at"):
+        say(f"last failure:         {_when(status['last_failure_at'])}")
+        say(f"  {status.get('last_error', '')}")
+    say(f"consecutive failures: {failures}")
+    failing = failures >= _EXTRACTION_FAILING_AFTER
+    if failing:
+        say("  Extraction is FAILING: turns are stored unprocessed, not distilled.")
+    say()
+    return failing
+
+
+_EXTRACTION_TEST_TURN = (
+    "User: Please remember that our staging database lives on host db-7 and "
+    "that I prefer deploys on Tuesday mornings.\n"
+    "Assistant: Noted: staging is on db-7, and you prefer Tuesday morning deploys."
+)
+
+
+def _cmd_extraction_test(args: argparse.Namespace) -> int:
+    """Make one real extraction call on a sample turn and report the result.
+
+    Reads and writes no memories. Use it to find out why extraction is
+    failing, and to prove a fix, before trusting that turns are distilled."""
+    from .extraction_prompts import build_extraction_prompt
+    from .llm_client import create_llm_client_from_env
+
+    client = create_llm_client_from_env()
+    if client is None:
+        print("No extraction model is configured, so turns are stored unprocessed.")
+        print("Set MEMORY_EXTRACTION_API_KEY, MEMORY_EXTRACTION_BASE_URL and "
+              "MEMORY_EXTRACTION_MODEL (or OPENAI_API_KEY / ANTHROPIC_API_KEY).")
+        return 1
+    print(f"model:      {getattr(client, 'model', '?')}")
+    if getattr(client, "base_url", None):
+        print(f"endpoint:   {client.base_url}")
+    print(f"timeout:    {getattr(client, 'timeout', '?')}s (MEMORY_EXTRACTION_TIMEOUT)")
+    if getattr(client, "max_tokens", None):
+        print(f"max tokens: {client.max_tokens} (MEMORY_EXTRACTION_MAX_TOKENS)")
+    prompt = build_extraction_prompt(_EXTRACTION_TEST_TURN, "User", context="extraction test")
+    started = time.time()
+    try:
+        result = client.complete_json(prompt, label="extraction-test")
+    except Exception as e:
+        result = None
+        error = f"{type(e).__name__}: {e}"
+    else:
+        get_error = getattr(client, "get_last_error", None)
+        error = get_error() if callable(get_error) else None
+    elapsed = time.time() - started
+    if result is None:
+        print(f"FAILED after {elapsed:.1f}s")
+        print(f"  {error or 'no reply and no error recorded'}")
+        return 1
+    memories = result.get("memories") if isinstance(result, dict) else None
+    if not isinstance(memories, list):
+        print(f"FAILED after {elapsed:.1f}s: the reply is JSON but has no 'memories' list")
+        return 1
+    print(f"OK in {elapsed:.1f}s: {len(memories)} memory candidate(s) extracted")
+    for m in memories[:5]:
+        if isinstance(m, dict):
+            print(f"  - [{m.get('category', '?')}] {_snippet(str(m.get('abstract') or m.get('content') or ''))}")
+    if not memories:
+        print("  The model replied but extracted nothing from a turn that states two "
+              "facts; check the model is suitable.")
     return 0
 
 
@@ -1291,6 +1398,16 @@ def _add_store_admin_parsers(subs) -> None:
     p_compact.add_argument("-q", "--quiet", action="store_true",
                            help="Suppress non-essential output")
 
+    subs.add_parser(
+        "extraction-test",
+        help="Make one real extraction call on a sample turn and report the result",
+        description=(
+            "Calls the configured extraction model once with a sample turn and "
+            "prints the model, the time taken and what it extracted, or the "
+            "error. Reads and writes no memories."
+        ),
+    )
+
     p_reembed = subs.add_parser(
         "reembed",
         help="Re-encode all vectors with the current embedding scheme",
@@ -1341,6 +1458,7 @@ def _dispatch_plugin_cli(args: argparse.Namespace) -> int:
         "purge": _cmd_purge,
         "compact": _cmd_compact,
         "reembed": _cmd_reembed,
+        "extraction-test": _cmd_extraction_test,
     }.get(cmd, lambda _: 0)(args)
 
 
@@ -2771,6 +2889,7 @@ def main() -> int:
         "purge": _cmd_purge,
         "compact": _cmd_compact,
         "reembed": _cmd_reembed,
+        "extraction-test": _cmd_extraction_test,
         "install-plugin": _cmd_install_plugin,
         "uninstall-plugin": _cmd_uninstall_plugin,
     }

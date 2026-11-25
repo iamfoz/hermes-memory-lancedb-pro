@@ -43,6 +43,10 @@ hermes lancedb_pro doctor
 
 If `doctor` says the store is unreadable, stop and tell the user.
 
+If new memories read like raw transcripts, or `doctor` says extraction is
+failing, run `hermes lancedb_pro extraction-test` and report its error. Never
+edit the plugin's installed files to work around it.
+
 ### Tidying (only when asked)
 
 ```bash

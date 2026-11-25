@@ -54,6 +54,7 @@ hermes-memory-lancedb-pro compact [--dry-run] [--scope SCOPE] [--min-age-days N]
 
 # Re-encode every vector with the embedding model's task prefixes (legacy stores)
 hermes-memory-lancedb-pro reembed [--dry-run] [--batch-size N] [-y]
+hermes-memory-lancedb-pro extraction-test   # one real extraction call on a sample turn; writes nothing
 ```
 
 `init`, `reset`, `purge`, and `reembed` prompt for confirmation before changing data; pass

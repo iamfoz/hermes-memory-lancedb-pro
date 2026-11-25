@@ -36,7 +36,7 @@ from .extraction_prompts import (
     build_extraction_prompt,
     build_merge_prompt,
 )
-from .llm_client import complete_json_with_retry
+from .llm_client import complete_json_with_retry, record_extraction_outcome
 from .memory_categories import (
     ALWAYS_MERGE_CATEGORIES,
     MERGE_SUPPORTED_CATEGORIES,
@@ -597,6 +597,19 @@ class SmartExtractor:
 
     # -- step 1: LLM extraction ------------------------------------------------
 
+    def _record_outcome(self, ok: bool) -> None:
+        """Note the outcome of the extraction call for `doctor`."""
+        db_path = getattr(self._store, "db_path", None)
+        if not isinstance(db_path, str) or not db_path:
+            return
+        error = None
+        if not ok:
+            get_error = getattr(self._llm, "get_last_error", None)
+            error = get_error() if callable(get_error) else None
+        record_extraction_outcome(
+            db_path, ok=ok, error=error, model=getattr(self._llm, "model", None),
+        )
+
     def _extract_candidates(
         self, conversation_text: str, *, context: str = ""
     ) -> list[CandidateMemory]:
@@ -612,6 +625,7 @@ class SmartExtractor:
         result = self._llm_complete_json_with_retry(
             prompt, label="extract-candidates",
         )
+        self._record_outcome(result is not None)
         if result is None:
             # The call failed or the reply was unusable — distinct from a
             # valid reply with nothing worth keeping.
