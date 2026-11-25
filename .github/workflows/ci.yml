@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ruff
+        run: python -m pip install "ruff>=0.6.0"
+
+      - name: Run ruff
+        run: python -m ruff check .
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The package's core dependencies include sentence-transformers, which
+      # pulls in torch (several GB). The tests stub the embedder, so CI installs
+      # only the runtime libraries the code imports, plus the dev tools from the
+      # `dev` extra, and installs the package itself without dependencies.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "lancedb>=0.25.0" "numpy>=1.24.0" "requests>=2.31.0"
+          python -m pip install "pytest>=8.0" "pytest-cov>=5.0" "ruff>=0.6.0"
+          python -m pip install --no-deps .
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
