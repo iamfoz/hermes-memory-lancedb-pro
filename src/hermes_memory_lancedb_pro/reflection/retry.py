@@ -48,7 +48,15 @@ _TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"service unavailable", re.IGNORECASE),
     re.compile(r"bad gateway", re.IGNORECASE),
     re.compile(r"gateway timeout", re.IGNORECASE),
-    re.compile(r"\b(?:http|status)\s*(?:502|503|504)\b", re.IGNORECASE),
+    re.compile(r"\b(?:http|status)\s*(?:429|500|502|503|504|529)\b", re.IGNORECASE),
+    # SDK exception texts: openai/anthropic raise "Connection error.",
+    # "Request timed out." and "Error code: 429 ...".
+    re.compile(r"\bconnection error\b", re.IGNORECASE),
+    re.compile(r"\b(?:api)?(?:timeout|connection)error\b", re.IGNORECASE),
+    re.compile(r"\brate[ _-]?limit", re.IGNORECASE),
+    re.compile(r"\btoo many requests\b", re.IGNORECASE),
+    re.compile(r"\boverloaded\b", re.IGNORECASE),
+    re.compile(r"\berror code:\s*(?:429|500|502|503|504|529)\b", re.IGNORECASE),
     re.compile(r"\btimed out\b", re.IGNORECASE),
     re.compile(r"\btimeout\b", re.IGNORECASE),
     re.compile(r"\bund_err_(?:socket|headers_timeout|body_timeout)\b", re.IGNORECASE),
@@ -58,6 +66,12 @@ _TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
 
 _NON_RETRY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b401\b", re.IGNORECASE),
+    # Other client errors fail the same way on a second try.
+    re.compile(r"\b(?:http|status|error code:)\s*(?:400|403|404|422)\b", re.IGNORECASE),
+    re.compile(r"\bforbidden\b", re.IGNORECASE),
+    re.compile(r"\bbad request\b", re.IGNORECASE),
+    re.compile(r"\binsufficient_quota\b", re.IGNORECASE),
+    re.compile(r"exceeded your current quota", re.IGNORECASE),
     re.compile(r"\bunauthorized\b", re.IGNORECASE),
     re.compile(r"invalid api key", re.IGNORECASE),
     re.compile(r"invalid[_ -]?token", re.IGNORECASE),

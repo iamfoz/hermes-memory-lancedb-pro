@@ -35,6 +35,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from .extraction_prompts import UNTRUSTED_DATA_NOTICE, wrap_untrusted
 from .memory_categories import MEMORY_CATEGORIES, CandidateMemory, SmartCategory
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -154,9 +155,23 @@ _PRESETS: dict[AdmissionPreset, callable] = {
 }
 
 
+_OFF_VALUES = ("off", "0", "false", "no", "disabled")
+
+
+def rejection_audit_enabled_from_env() -> bool:
+    """``MEMORY_ADMISSION_AUDIT``: default on; ``off`` / ``0`` / ``false`` /
+    ``no`` / ``disabled`` stops rejected candidates (and a conversation
+    excerpt) being written to ``rejections.jsonl``."""
+    raw = os.environ.get("MEMORY_ADMISSION_AUDIT", "on").strip().lower()
+    return raw not in _OFF_VALUES
+
+
 def get_preset(name: AdmissionPreset = "balanced") -> AdmissionControlConfig:
-    """Return a fresh config instance for the named preset."""
-    return _PRESETS.get(name, _preset_balanced)()
+    """Return a fresh config instance for the named preset, with
+    ``persist_rejected_audits`` taken from ``MEMORY_ADMISSION_AUDIT``."""
+    config = _PRESETS.get(name, _preset_balanced)()
+    config.persist_rejected_audits = rejection_audit_enabled_from_env()
+    return config
 
 
 def normalize_weights(w: AdmissionWeights) -> AdmissionWeights:
@@ -436,16 +451,24 @@ def _build_utility_prompt(candidate: CandidateMemory, conversation_text: str) ->
         if len(conversation_text) > 3000
         else conversation_text
     )
+    # Both blocks are third-party text; they are delimited and labelled as
+    # data so a line in the conversation cannot steer the score.
+    candidate_block = wrap_untrusted(
+        f"- Category: {candidate.category}\n"
+        f"- Abstract: {candidate.abstract}\n"
+        f"- Overview: {candidate.overview}\n"
+        f"- Content: {candidate.content}",
+        "candidate-memory",
+    )
     return f"""Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
 
+{UNTRUSTED_DATA_NOTICE}
+
 Conversation excerpt:
-{excerpt}
+{wrap_untrusted(excerpt, "conversation-excerpt")}
 
 Candidate memory:
-- Category: {candidate.category}
-- Abstract: {candidate.abstract}
-- Overview: {candidate.overview}
-- Content: {candidate.content}
+{candidate_block}
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -766,6 +789,7 @@ __all__ = [
     "NoveltyBreakdown",
     "append_rejection_audit",
     "get_preset",
+    "rejection_audit_enabled_from_env",
     "normalize_weights",
     "resolve_rejected_audit_path",
     "score_confidence_support",

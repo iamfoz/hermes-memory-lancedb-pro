@@ -36,10 +36,11 @@ MEMORY_CATEGORIES: tuple[SmartCategory, ...] = (
     "patterns",
 )
 
-# Categories that are time-versioned: a newer entry with the same `fact_key`
-# supersedes the older one (the older row is marked invalidated). Lifted
-# from the CortexReach TS source — applied in smart_extractor's supersede
-# branch and in admission control's recency scoring.
+# Categories that are time-versioned: a newer entry about the same fact
+# replaces the older one. Lifted from the CortexReach TS source. Here the
+# replacement is decided by the extractor's LLM dedup step (supersede /
+# contradict); `fact_key` is recorded on these rows but is not itself used
+# to find the row to supersede.
 TEMPORAL_VERSIONED_CATEGORIES: frozenset[SmartCategory] = frozenset({
     "preferences", "entities",
 })

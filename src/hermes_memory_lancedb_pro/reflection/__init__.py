@@ -16,6 +16,12 @@ form, then persists, ranks, and replays them. This package owns:
 - store             — orchestrator: parse → dedupe → embed → store, plus
                       load + rank the active reflection slices on recall
 
+The provider uses only the invariant / derived path (write at session end,
+rank on recall). The mapped-row, lesson and governance helpers, and
+resolved-item suppression, are library building blocks: nothing here writes
+mapped rows or sets ``resolved_at``, so they have no effect until a caller
+supplies such rows.
+
 This package does NOT call an LLM. The LLM that generates the reflection
 markdown is the caller's responsibility (PR 3's smart_extractor will be
 the typical caller). All persistence is dependency-injected via a small
@@ -87,6 +93,7 @@ from .store import (
     is_owned_by_agent,
     load_agent_reflection_slices_from_entries,
     load_reflection_mapped_rows_from_entries,
+    purge_stale_reflection_rows,
     store_reflection_to_lancedb,
 )
 
@@ -146,5 +153,6 @@ __all__ = [
     "is_owned_by_agent",
     "load_agent_reflection_slices_from_entries",
     "load_reflection_mapped_rows_from_entries",
+    "purge_stale_reflection_rows",
     "store_reflection_to_lancedb",
 ]

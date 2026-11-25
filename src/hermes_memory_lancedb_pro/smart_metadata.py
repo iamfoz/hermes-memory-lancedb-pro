@@ -22,8 +22,10 @@ _TEMPORAL_VERSIONED_CATEGORIES: frozenset[str] = frozenset({"preferences", "enti
 # Module-level regex (compile once)
 # ---------------------------------------------------------------------------
 
-# Matches "[topic]: description" or "[topic]：description" (CJK full-width colon)
-_COLON_RE = re.compile(r"^(.{1,120}?)[：:]")
+# Matches "[topic]: description" or "[topic]：description" (CJK full-width colon).
+# An ASCII colon only separates when followed by whitespace or the end, so the
+# colon in "https://host", "10:30" or "host:8080" is not taken as a topic end.
+_COLON_RE = re.compile(r"^(.{1,120}?)(?:：|:(?=\s|$))")
 # Matches "[topic] -> description" or "[topic] => description"
 _ARROW_RE = re.compile(r"^(.{1,120}?)(?:\s*->|\s*=>)")
 # Strip trailing punctuation from topic
@@ -269,12 +271,14 @@ def derive_fact_key(category: str, abstract: str) -> str | None:
         return None
 
     topic = trimmed
-    colon_match = _COLON_RE.match(trimmed)
-    arrow_match = _ARROW_RE.match(trimmed)
-    if colon_match and colon_match.group(1):
-        topic = colon_match.group(1)
-    elif arrow_match and arrow_match.group(1):
-        topic = arrow_match.group(1)
+    # Whichever separator comes first wins ("A -> B: C" has topic "A").
+    candidates = [
+        m.group(1)
+        for m in (_COLON_RE.match(trimmed), _ARROW_RE.match(trimmed))
+        if m and m.group(1)
+    ]
+    if candidates:
+        topic = min(candidates, key=len)
 
     normalized = (
         _TRAILING_PUNCT_RE.sub("", topic.lower().replace("\t", " "))
@@ -774,8 +778,9 @@ def update_support_stats(
 
     Slices are capped at :data:`MAX_SUPPORT_SLICES`.  When at the cap and a
     *new* context arrives, the slice with the oldest ``last_observed_at`` is
-    dropped, but its evidence counts remain in ``total_observations``
-    (slight drift in ``global_strength`` is an accepted trade-off).
+    dropped.  Its counts stay in ``total_observations`` and
+    ``global_strength`` on this and every later update: the evidence no
+    longer held by any slice is recovered from the stored totals.
     """
     ctx = _normalise_context(context_label) or "general"
 
@@ -837,9 +842,21 @@ def update_support_stats(
             dropped_contra += d.contradictions
         slices = slices[:MAX_SUPPORT_SLICES]
 
+    # Evidence from slices dropped by EARLIER updates is no longer in any
+    # slice; it survives only in the stored totals, so carry it forward.
+    carried_conf = 0
+    carried_contra = 0
+    if existing is not None and existing.total_observations > 0:
+        held_conf = sum(s.confirmations for s in existing.slices)
+        held_contra = sum(s.contradictions for s in existing.slices)
+        stored_conf = round(existing.global_strength * existing.total_observations)
+        carried_total = max(0, existing.total_observations - held_conf - held_contra)
+        carried_conf = min(carried_total, max(0, stored_conf - held_conf))
+        carried_contra = carried_total - carried_conf
+
     # Recompute global_strength including evidence from dropped slices
-    total_conf = dropped_conf
-    total_contra = dropped_contra
+    total_conf = dropped_conf + carried_conf
+    total_contra = dropped_contra + carried_contra
     for s in slices:
         total_conf += s.confirmations
         total_contra += s.contradictions

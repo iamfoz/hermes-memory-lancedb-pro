@@ -366,18 +366,9 @@ class TestReflectionRetryPlumbing:
                     }]}
                 return None
 
-        # Patch sleep to avoid the 1-3s retry delay in tests
-        with patch(
-            "hermes_memory_lancedb_pro.smart_extractor.run_with_reflection_transient_retry_once"
-        ) as mock_retry:
-            # Make the wrapper just call fn() twice if first raises
-            def _fake_retry(fn):
-                try:
-                    return fn()
-                except Exception:
-                    return fn()
-            mock_retry.side_effect = _fake_retry
-
+        # Patch sleep to avoid the 1-3s retry delay in tests; the real
+        # retry wrapper runs.
+        with patch("hermes_memory_lancedb_pro.reflection.retry.time.sleep"):
             extractor = SmartExtractor(store, llm=FlakeyLlm())
             stats = extractor.extract_and_persist(
                 user_content="hello", assistant_content="ok",
@@ -394,17 +385,7 @@ class TestReflectionRetryPlumbing:
                 attempts["count"] += 1
                 raise Exception("401 Unauthorized")
 
-        with patch(
-            "hermes_memory_lancedb_pro.smart_extractor.run_with_reflection_transient_retry_once"
-        ) as mock_retry:
-            # Realistic wrapper: call once, swallow error (no retry on non-transient)
-            def _fake_retry(fn):
-                try:
-                    return fn()
-                except Exception:
-                    raise
-            mock_retry.side_effect = _fake_retry
-
+        with patch("hermes_memory_lancedb_pro.reflection.retry.time.sleep"):
             extractor = SmartExtractor(store, llm=AuthFailLlm())
             stats = extractor.extract_and_persist(
                 user_content="hello", assistant_content="ok",

@@ -10,6 +10,11 @@ Ports CortexReach's `reflection-store.ts`. Responsibilities:
               (≤ 8) and derived (≤ 10) lines, plus mapped slices grouped
               by kind (user-model, agent-model, lesson, decision).
 
+Only the invariant / derived path is used by the provider. Nothing in this
+package writes ``resolved_at`` or mapped rows, so resolved-item suppression
+and ``load_reflection_mapped_rows_from_entries`` are library building
+blocks: they work on rows that some other writer produces.
+
 This module does NOT call an LLM. The LLM that *generates* the reflection
 markdown is the caller's job — typically PR 3's smart_extractor.
 
@@ -75,6 +80,9 @@ DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
 DEFAULT_REFLECTION_MAPPED_MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000
 
 REFLECTION_CATEGORY = "reflection"
+
+# Upper bound on reflection rows read when sweeping stale rows.
+_PURGE_SCAN_LIMIT = 20_000
 
 ReflectionStoreKind = Literal[
     "event", "item-invariant", "item-derived", "combined-legacy"
@@ -148,6 +156,9 @@ class MemoryStoreReflectionAdapter:
             text=text, vector=vector, category=category, scope=scope,
             importance=importance, metadata=metadata,
         )
+
+    def purge_stale_reflection_rows(self, *, now_ms: int | None = None) -> int:
+        return purge_stale_reflection_rows(self._store, now_ms=now_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -278,11 +289,12 @@ def build_reflection_store_payloads(
     event_id: str | None = None,
     source_reflection_path: str | None = None,
     write_legacy_combined: bool = True,
+    write_event: bool = True,
 ) -> tuple[str, ReflectionSlices, list[ReflectionStorePayload]]:
     """Build all payloads for a reflection run.
 
     Returns `(event_id, slices, payloads)`. Payloads include:
-      - one `event` (always)
+      - one `event` (unless `write_event=False`)
       - one `item-invariant` / `item-derived` per extracted line
       - one `combined-legacy` (only when `write_legacy_combined=True`
         and at least one line was extracted)
@@ -295,20 +307,19 @@ def build_reflection_store_payloads(
     )
     error_signals = _normalize_error_signals(tool_error_signals)
 
-    # Event payload — always emitted.
-    event_payload_obj = build_reflection_event_payload(
-        scope=scope, session_key=session_key, session_id=session_id,
-        agent_id=agent_id, command=command, run_at=run_at,
-        used_fallback=used_fallback, tool_error_signals=error_signals,
-        event_id=eid, source_reflection_path=source_reflection_path,
-    )
-    payloads: list[ReflectionStorePayload] = [
-        ReflectionStorePayload(
+    payloads: list[ReflectionStorePayload] = []
+    if write_event:
+        event_payload_obj = build_reflection_event_payload(
+            scope=scope, session_key=session_key, session_id=session_id,
+            agent_id=agent_id, command=command, run_at=run_at,
+            used_fallback=used_fallback, tool_error_signals=error_signals,
+            event_id=eid, source_reflection_path=source_reflection_path,
+        )
+        payloads.append(ReflectionStorePayload(
             text=event_payload_obj.text,
             metadata=_payload_metadata_dict(event_payload_obj.metadata),
             kind="event",
-        )
-    ]
+        ))
 
     # One per item.
     item_payloads = build_reflection_item_payloads(
@@ -324,12 +335,14 @@ def build_reflection_store_payloads(
         kind: ReflectionStoreKind = (
             "item-invariant" if item_kind == "invariant" else "item-derived"
         )
+        item_meta = _payload_metadata_dict(ip.metadata)
+        if kind == "item-derived":
+            # The reader ignores derived lines after this age, so the row is
+            # dead weight from then on; valid_until lets purge_expired and
+            # purge_stale_reflection_rows reclaim it.
+            item_meta["valid_until"] = run_at + DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
         payloads.append(
-            ReflectionStorePayload(
-                text=ip.text,
-                metadata=_payload_metadata_dict(ip.metadata),
-                kind=kind,
-            )
+            ReflectionStorePayload(text=ip.text, metadata=item_meta, kind=kind)
         )
 
     # Optional v3 combined-legacy payload.
@@ -415,6 +428,9 @@ def _build_legacy_combined_payload(
     }
     if source_reflection_path:
         metadata["source_reflection_path"] = source_reflection_path
+    # Same lifetime as the derived lines it bundles; the invariants in it are
+    # also stored as their own (non-expiring) item rows.
+    metadata["valid_until"] = run_at + DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
 
     return ReflectionStorePayload(text=text, metadata=metadata, kind="combined-legacy")
 
@@ -452,7 +468,13 @@ def store_reflection_to_lancedb(
 ) -> ReflectionStoreResult:
     """End-to-end reflection write. Embeds each payload, dedupes the
     combined-legacy payload against existing entries (cosine ≥ threshold
-    is considered a duplicate and skipped), and writes the rest."""
+    is considered a duplicate and skipped), and writes the rest.
+
+    The per-run event row is not written: nothing reads it, and it only
+    added a row (and a slot in the recall scan window) per session. After
+    writing, adapters that offer ``purge_stale_reflection_rows`` (the
+    default one does) sweep rows the reader can no longer use, including
+    event rows and expired derived rows written by older versions."""
     eid, slices, payloads = build_reflection_store_payloads(
         reflection_text=reflection_text, session_key=session_key,
         session_id=session_id, agent_id=agent_id, command=command,
@@ -460,6 +482,7 @@ def store_reflection_to_lancedb(
         used_fallback=used_fallback, event_id=event_id,
         source_reflection_path=source_reflection_path,
         write_legacy_combined=write_legacy_combined,
+        write_event=False,
     )
 
     stored_kinds: list[ReflectionStoreKind] = []
@@ -497,12 +520,87 @@ def store_reflection_to_lancedb(
         except Exception as e:
             logger.warning("reflection store failed (kind=%s): %s", payload.kind, e)
 
+    sweep = getattr(adapter, "purge_stale_reflection_rows", None)
+    if callable(sweep):
+        try:
+            sweep(now_ms=run_at)
+        except Exception as e:
+            logger.warning("reflection stale-row sweep failed: %s", e)
+
     return ReflectionStoreResult(
         stored=bool(stored_kinds),
         event_id=eid,
         slices=slices,
         stored_kinds=stored_kinds,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sweep rows the reader can no longer use
+# ---------------------------------------------------------------------------
+
+def _is_stale_reflection_row(
+    entry: dict[str, Any], metadata: dict[str, Any], now: int, derive_max: int,
+) -> bool:
+    kind = metadata.get("type")
+    if kind == "memory-reflection-event":
+        return True  # never read by any code path
+    ts = _metadata_timestamp(metadata, int(entry.get("timestamp", 0) or 0))
+    if ts <= 0 or (now - ts) <= derive_max:
+        return False
+    if kind == "memory-reflection-item":
+        return metadata.get("item_kind") == "derived"
+    if kind == "memory-reflection":
+        # Rows written with valid_until duplicate their invariants in item
+        # rows. Older ones without it are kept when they carry invariants,
+        # since the reader may still fall back to them.
+        return (
+            metadata.get("valid_until") is not None
+            or not _to_string_array(metadata.get("invariants"))
+        )
+    return False
+
+
+def purge_stale_reflection_rows(
+    store: MemoryStore,
+    *,
+    now_ms: int | None = None,
+    derive_max_age_ms: int | None = None,
+) -> int:
+    """Delete reflection rows nothing will read again; returns the count.
+
+    Removes event rows, derived item rows older than the derived max age,
+    and legacy combined rows past that age that hold no invariants (or that
+    carry ``valid_until``). Invariant rows are never touched. Safe on
+    databases written by older versions, which never set ``valid_until``."""
+    now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    derive_max = (
+        DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
+        if derive_max_age_ms is None
+        else max(0, int(derive_max_age_ms))
+    )
+    stale: list[str] = []
+    for entry in store.list_memories(
+        limit=_PURGE_SCAN_LIMIT, category=REFLECTION_CATEGORY,
+    ):
+        metadata = parse_reflection_metadata(entry.get("metadata"))
+        mem_id = entry.get("id")
+        if mem_id and _is_stale_reflection_row(entry, metadata, now, derive_max):
+            stale.append(mem_id)
+    # One batched delete. This runs at session end under the provider's
+    # dispatch lock; deleting row by row cost a lookup and a new table
+    # version per row, which on the first run after an upgrade (one legacy
+    # event row per past session) blocked new turn writes for a long time.
+    purged = 0
+    batch_delete = getattr(store, "_delete_ids", None)
+    if stale and callable(batch_delete):
+        batch_delete(stale)
+        purged = len(stale)
+    else:
+        purged = sum(1 for mem_id in stale if store.delete(mem_id))
+    if purged:
+        logger.info("Purged %d stale reflection row(s)", purged)
+    return purged
 
 
 # ---------------------------------------------------------------------------
@@ -1037,5 +1135,6 @@ __all__ = [
     "is_owned_by_agent",
     "load_agent_reflection_slices_from_entries",
     "load_reflection_mapped_rows_from_entries",
+    "purge_stale_reflection_rows",
     "store_reflection_to_lancedb",
 ]

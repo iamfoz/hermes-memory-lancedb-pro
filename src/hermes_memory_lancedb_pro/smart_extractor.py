@@ -20,6 +20,7 @@ import datetime as _dt
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -35,6 +36,7 @@ from .extraction_prompts import (
     build_extraction_prompt,
     build_merge_prompt,
 )
+from .llm_client import complete_json_with_retry
 from .memory_categories import (
     ALWAYS_MERGE_CATEGORIES,
     MERGE_SUPPORTED_CATEGORIES,
@@ -43,7 +45,7 @@ from .memory_categories import (
     SmartCategory,
     normalize_category,
 )
-from .reflection.retry import run_with_reflection_transient_retry_once
+from .smart_metadata import derive_fact_key
 from .temporal_classifier import classify_temporal, infer_expiry
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -61,6 +63,12 @@ MAX_MEMORIES_PER_EXTRACTION = 10
 MAX_SIMILAR_FOR_PROMPT = 5
 SIMILARITY_THRESHOLD = 0.55  # min cosine similarity for vector-search dedup pool
 DEFAULT_EXTRACT_MAX_CHARS = 8000
+# Per-field caps on text the LLM returns, applied before anything is stored.
+# The prompt asks for a one-line abstract and a short overview; without a cap
+# a hostile or runaway reply stored whatever length it liked.
+MAX_ABSTRACT_CHARS = 300
+MAX_OVERVIEW_CHARS = 2000
+MAX_CONTENT_CHARS = 4000
 
 DedupDecision = Literal[
     "create", "merge", "skip", "supersede",
@@ -72,6 +80,29 @@ _VALID_DECISIONS: frozenset[str] = frozenset({
 })
 _DESTRUCTIVE_DECISIONS: frozenset[str] = frozenset({"supersede", "contradict"})
 _PROFILE_SEARCH_LIMIT = 200
+
+
+def _is_archived_row(row: dict[str, Any]) -> bool:
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            return False
+    return isinstance(meta, dict) and meta.get("state") == "archived"
+
+
+def _row_similarity(row: dict[str, Any]) -> float | None:
+    """Cosine similarity of a vector-search row, or None when it carries
+    neither a distance nor a score."""
+    try:
+        if row.get("_distance") is not None:
+            return 1.0 - float(row["_distance"])
+        if row.get("score") is not None:
+            return float(row["score"])
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 class _ExtractionUnavailable(Exception):
@@ -311,27 +342,14 @@ class SmartExtractor:
         *,
         label: str,
     ) -> dict[str, Any] | None:
-        """Wrap the LLM's `complete_json` in `run_with_reflection_transient_retry_once`
-        so transient upstream blips (502 / connection reset / timeout) get one
-        retry with a 1-3s jittered delay. Non-transient errors (auth, quota,
-        content_policy) are NOT retried — bouncing those wastes quota.
-
-        Returns None on any unrecoverable failure (matching the contract of
-        the underlying `complete_json`)."""
+        """`complete_json` with one retry on a transient upstream failure
+        (timeout, connection reset, 429, 5xx; 1-3s jittered delay). Auth,
+        bad-request and quota errors are not retried. Returns None on any
+        unrecoverable failure, matching the contract of `complete_json`;
+        see `llm_client.complete_json_with_retry`."""
         if self._llm is None:
             return None
-
-        def _call() -> dict[str, Any] | None:
-            assert self._llm is not None
-            return self._llm.complete_json(prompt, label=label)
-
-        try:
-            return run_with_reflection_transient_retry_once(_call)
-        except Exception as e:
-            logger.warning(
-                "smart-extractor: %s LLM call raised after retry: %s", label, e,
-            )
-            return None
+        return complete_json_with_retry(self._llm, prompt, label=label)
 
     # -- main entry ------------------------------------------------------------
 
@@ -372,9 +390,17 @@ class SmartExtractor:
                 scope=target_scope,
             )
 
-        if self._rate_limiter is not None and self._rate_limiter.is_rate_limited():
+        if conversation_text is None:
+            conversation_text = self._format_conversation(user_content, assistant_content)
+        if not conversation_text or not conversation_text.strip():
+            return ExtractionStats()
+
+        # Check and record in one locked step: overlapping sync_turn threads
+        # could otherwise both pass the check and exceed the cap. The cap
+        # counts extraction passes (each makes several LLM calls), not calls.
+        if self._rate_limiter is not None and not self._rate_limiter.try_acquire():
             logger.info(
-                "smart-extractor: rate limited (%d calls/hr cap); falling back to legacy",
+                "smart-extractor: rate limited (%d extractions/hr cap); falling back to legacy",
                 self._rate_limiter.max_per_hour,
             )
             return self._legacy_fallback(
@@ -383,14 +409,6 @@ class SmartExtractor:
                 session_key=session_key,
                 scope=target_scope,
             )
-
-        if conversation_text is None:
-            conversation_text = self._format_conversation(user_content, assistant_content)
-        if not conversation_text or not conversation_text.strip():
-            return ExtractionStats()
-
-        if self._rate_limiter is not None:
-            self._rate_limiter.record_extraction()
 
         try:
             return self._run_llm_pipeline(
@@ -612,9 +630,9 @@ class SmartExtractor:
             # normaliser falls back to "entities", which is fine without
             # flooding the warning log on every extraction.
             category = normalize_category(raw.get("category"), warn=False)
-            abstract = (raw.get("abstract") or "").strip()
-            overview = (raw.get("overview") or "").strip()
-            content = (raw.get("content") or "").strip()
+            abstract = _cap_field(raw.get("abstract"), MAX_ABSTRACT_CHARS)
+            overview = _cap_field(raw.get("overview"), MAX_OVERVIEW_CHARS)
+            content = _cap_field(raw.get("content"), MAX_CONTENT_CHARS)
             if not abstract or len(abstract) < 5:
                 continue
             if is_noise(abstract):
@@ -862,6 +880,14 @@ class SmartExtractor:
             logger.warning("smart-extractor: vector search failed: %s", e)
             return DedupResult(decision="create", reason=f"vector search failed: {e}")
 
+        # Only genuinely similar memories are worth an LLM dedup call. The
+        # search has no floor of its own, so without this the nearest rows
+        # were offered however unrelated. A row whose similarity cannot be
+        # read is kept.
+        similar = [
+            r for r in similar
+            if (sim := _row_similarity(r)) is None or sim >= SIMILARITY_THRESHOLD
+        ]
         if not similar:
             return DedupResult(decision="create", reason="No similar memories found")
 
@@ -887,7 +913,8 @@ class SmartExtractor:
                 "category": meta.get("memory_category") or r.get("category") or "",
                 "abstract": meta.get("l0_abstract") or r.get("text", ""),
                 "overview": meta.get("l1_overview") or "",
-                "score": 1.0 - float(r.get("_distance") or 0.0),
+                # A missing distance must not read as a perfect match.
+                "score": _row_similarity(r) or 0.0,
             })
 
         prompt = build_dedup_prompt(
@@ -1013,6 +1040,11 @@ class SmartExtractor:
         except Exception as e:
             logger.warning("smart-extractor: merge get_by_id failed: %s", e)
             existing = None
+        if existing and _is_archived_row(existing):
+            # An archived row whose successor was deleted: there is nothing
+            # live to merge into (update() would refuse and the new fact
+            # would be dropped).
+            existing = None
         if not existing:
             # Existing entry vanished — fall through to create
             self._store_candidate(
@@ -1049,9 +1081,9 @@ class SmartExtractor:
             )
             return
 
-        merged_abstract = (merged.get("abstract") or "").strip()
-        merged_overview = (merged.get("overview") or "").strip()
-        merged_content = (merged.get("content") or "").strip()
+        merged_abstract = _cap_field(merged.get("abstract"), MAX_ABSTRACT_CHARS)
+        merged_overview = _cap_field(merged.get("overview"), MAX_OVERVIEW_CHARS)
+        merged_content = _cap_field(merged.get("content"), MAX_CONTENT_CHARS)
         if not merged_abstract:
             return
 
@@ -1084,6 +1116,16 @@ class SmartExtractor:
             )
         except Exception as e:
             logger.warning("smart-extractor: merge update failed: %s", e)
+            return
+        if not new_id:
+            # The target went away between the lookup and the update: keep
+            # the new fact as its own memory instead of losing it.
+            self._store_candidate(
+                candidate,
+                vector=self._store.encode(f"{candidate.abstract} {candidate.content}") or [],
+                session_key="merge-fallback", target_scope=target_scope,
+                admission_audit=admission_audit,
+            )
             return
 
         # Best-effort: update support stats on the merged (live) memory.
@@ -1131,6 +1173,9 @@ class SmartExtractor:
                     "source": "auto-capture",
                     "source_session": session_key,
                     "supersedes": match_id,
+                    # Explicit (even None): the old row's key must not carry
+                    # over onto a replacement with different wording.
+                    "fact_key": derive_fact_key(candidate.category, candidate.abstract),
                     **_temporal_fields(candidate.content or candidate.abstract),
                     "valid_until": infer_expiry(candidate.content or candidate.abstract),
                 },
@@ -1286,6 +1331,12 @@ class SmartExtractor:
             "source": "auto-capture",
             **_temporal_fields(classify_text),
         }
+        # Recorded for preferences / entities only (None for other
+        # categories). Nothing looks rows up by it yet: supersede is still
+        # decided by vector match plus the LLM.
+        fact_key = derive_fact_key(candidate.category, candidate.abstract)
+        if fact_key is not None:
+            meta_extra["fact_key"] = fact_key
         expiry = infer_expiry(classify_text)
         if expiry is not None:
             meta_extra["valid_until"] = expiry
@@ -1346,32 +1397,57 @@ class SmartExtractor:
 
 @dataclass
 class ExtractionRateLimiter:
-    """Sliding-window rate limiter for extractor invocations. Mostly
-    useful for hosts running with a paid LLM that want a hard cap on
-    spend per hour."""
+    """Sliding-window cap on extraction passes per hour. One pass is one
+    `extract_and_persist` run, which itself makes several LLM calls (extract,
+    then dedup / admission / merge per candidate), so this bounds passes, not
+    LLM calls. Thread-safe."""
     max_per_hour: int = 30
     _timestamps_ms: list[int] = field(default_factory=list)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
 
     def _prune(self) -> None:
+        # Caller holds _lock.
         cutoff = int(time.time() * 1000) - 60 * 60 * 1000
         self._timestamps_ms = [t for t in self._timestamps_ms if t >= cutoff]
 
+    def try_acquire(self) -> bool:
+        """Record one pass and return True, or return False (recording
+        nothing) when the cap is reached. Check and record are one step."""
+        with self._lock:
+            self._prune()
+            if len(self._timestamps_ms) >= self.max_per_hour:
+                return False
+            self._timestamps_ms.append(int(time.time() * 1000))
+            return True
+
     def is_rate_limited(self) -> bool:
-        self._prune()
-        return len(self._timestamps_ms) >= self.max_per_hour
+        with self._lock:
+            self._prune()
+            return len(self._timestamps_ms) >= self.max_per_hour
 
     def record_extraction(self) -> None:
-        self._prune()
-        self._timestamps_ms.append(int(time.time() * 1000))
+        with self._lock:
+            self._prune()
+            self._timestamps_ms.append(int(time.time() * 1000))
 
     def get_recent_count(self) -> int:
-        self._prune()
-        return len(self._timestamps_ms)
+        with self._lock:
+            self._prune()
+            return len(self._timestamps_ms)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _cap_field(value: Any, limit: int) -> str:
+    """An LLM-returned text field as a stripped string of at most *limit* chars."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:limit].rstrip()
+
 
 def _support_info_to_dict(support: Any) -> dict[str, Any]:
     """Convert a SupportInfoV2 dataclass / dict into a JSON-friendly dict."""
@@ -1385,7 +1461,10 @@ def _support_info_to_dict(support: Any) -> dict[str, Any]:
 
 __all__ = [
     "DEFAULT_EXTRACT_MAX_CHARS",
+    "MAX_ABSTRACT_CHARS",
+    "MAX_CONTENT_CHARS",
     "MAX_MEMORIES_PER_EXTRACTION",
+    "MAX_OVERVIEW_CHARS",
     "MAX_SIMILAR_FOR_PROMPT",
     "SIMILARITY_THRESHOLD",
     "DedupDecision",

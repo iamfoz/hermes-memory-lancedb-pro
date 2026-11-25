@@ -184,8 +184,9 @@ class TestStoreReflectionToLanceDB:
             agent_id="a", command="r", scope="agent", run_at=NOW,
         )
         assert result.stored is True
-        # event + 2 inv + 2 der + legacy = 6 writes
-        assert len(adapter.stored) == 6
+        # 2 inv + 2 der + legacy = 5 writes (the event row is opt-in:
+        # nothing reads it)
+        assert len(adapter.stored) == 5
         # All entries get the reflection category
         assert all(r.category == REFLECTION_CATEGORY for r in adapter.stored)
         # All inherit the requested scope
@@ -204,8 +205,8 @@ class TestStoreReflectionToLanceDB:
             agent_id="a", command="r", scope="agent", run_at=NOW,
         )
         kinds = [r.metadata for r in adapter.stored]
-        # 5 writes: legacy was deduped
-        assert len(adapter.stored) == 5
+        # 4 writes (2 inv + 2 der): legacy was deduped, no event row
+        assert len(adapter.stored) == 4
         assert "combined-legacy" not in [
             json.loads(m).get("type", "") for m in kinds
         ] + [
@@ -224,8 +225,8 @@ class TestStoreReflectionToLanceDB:
             session_key="sk", session_id="sid",
             agent_id="a", command="r", scope="agent", run_at=NOW,
         )
-        # 6 writes — legacy went through
-        assert len(adapter.stored) == 6
+        # 5 writes — legacy went through
+        assert len(adapter.stored) == 5
 
     def test_embed_failures_are_logged_not_raised(self):
         class FlakeyAdapter(FakeAdapter):
@@ -241,8 +242,8 @@ class TestStoreReflectionToLanceDB:
             session_key="sk", session_id="sid",
             agent_id="a", command="r", scope="agent", run_at=NOW,
         )
-        # legacy embed failed → 5 writes
-        assert len(adapter.stored) == 5
+        # legacy embed failed → 4 writes
+        assert len(adapter.stored) == 4
         assert result.stored is True  # other kinds did land
         assert "combined-legacy" not in result.stored_kinds
 
@@ -595,13 +596,13 @@ class TestMemoryStoreAdapterIntegration:
             run_at=int(time.time() * 1000),
         )
         assert result.stored is True
-        # Stored 6 entries (event + 2 inv + 2 der + legacy)
+        # Stored 5 entries (2 inv + 2 der + legacy; no event row)
         all_entries = real_store.list_memories(limit=20)
         reflection_entries = [
             e for e in all_entries
             if e["category"] == REFLECTION_CATEGORY
         ]
-        assert len(reflection_entries) >= 6
+        assert len(reflection_entries) == 5
 
     def test_load_back(self, real_store):
         adapter = MemoryStoreReflectionAdapter(real_store)
