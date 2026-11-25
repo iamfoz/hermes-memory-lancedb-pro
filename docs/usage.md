@@ -50,12 +50,15 @@ hermes-memory-lancedb-pro purge [--grace-days N] [--include-expired] [--dry-run]
 
 # Merge clusters of near-duplicate memories (the auto-compaction pass, on demand)
 hermes-memory-lancedb-pro compact [--dry-run] [--scope SCOPE] [--min-age-days N] \
-    [--similarity X] [--max-scan N]
+    [--similarity X] [--max-scan N] [-y]
+
+# Re-encode every vector with the embedding model's task prefixes (legacy stores)
+hermes-memory-lancedb-pro reembed [--dry-run] [--batch-size N] [-y]
 ```
 
-`init`, `reset`, and `purge` prompt for confirmation before changing data; pass
+`init`, `reset`, `purge`, and `reembed` prompt for confirmation before changing data; pass
 `-y` / `--yes` to skip the prompt in scripts. `import --reembed` re-encodes each
-row's text with the current embedding model instead of trusting stored vectors.
+row's text with the current embedding model instead of trusting stored vectors. Rows exported from a store with a different embedding scheme (exports from versions before task prefixes count as unprefixed) are re-encoded automatically, so one store never mixes schemes; this needs the embedding model, even without `--reembed`. Each exported record carries an `embedding_scheme` field (`plain` or `task_prefix`).
 `export` exits non-zero if the table scan fails (a corrupt store is never
 silently reported as empty); `export --salvage` then performs a best-effort
 recovery scan — walking the dataset's version history and, if needed, reading
@@ -71,6 +74,15 @@ malformed `valid_until` are never touched. `doctor`'s *Expiry* section shows
 how many there are.
 `compact` runs the same near-duplicate merge pass the provider triggers
 automatically on a cooldown; `--dry-run` prints the merge plan without writing.
+Without `--yes` a real run shows the cluster and memory counts and asks before
+merging and deleting the source rows; with nothing to merge it prints 'nothing
+to merge' and exits 0.
+`reembed` converts a database written before task prefixes were used. nomic-embed-text expects `search_document: ` before stored text and `search_query: ` before queries; databases created by earlier versions hold vectors made without them. Those databases keep working unchanged, and `doctor` / `stats` report them as `embedding_scheme: plain (legacy: no task prefixes)` and recommend `reembed`. The command computes every new vector first, then writes them all in one commit (text and metadata are not touched), and only then records the new scheme. A failure before that commit changes nothing; if it is interrupted after it, `doctor` says so and running `reembed` again finishes the job. Stop Hermes before running it: a running agent holds the database and `reembed` refuses to convert it underneath one, because a vector the agent encoded before the switch could be written after it. New databases use the prefixes from the start.
+`export --limit N` counts written rows (default: all, N must be 1 or more) and
+warns on stderr if output was cut off. `stats`, `doctor`, `search`, `export`,
+`purge` and `compact` exit 1 with `no memory store at PATH` rather than creating
+a database at a mistyped `--path`. `doctor -q` prints only findings and errors.
+`import` skips malformed rows with a warning and exits 1 if any were rejected.
 `search` is a recall-debugging tool: what it prints is what the agent can
 recall, including `--session-id` scoping. `stats --json` and `search --json`
 emit machine-readable output (search strips vectors). `doctor`, `stats`, and
@@ -224,7 +236,8 @@ results = store.search("concise responses", limit=5, mode="hybrid")  # default
 results = store.search("concise responses", limit=5, mode="vector")
 results = store.search("concise responses", limit=5, mode="bm25")
 
-# Every result has a portable `score` in [0, 1]; use it across all modes.
+# Every result has a `score` in [0, 1]: cosine similarity for vector, scaled RRF
+# for hybrid, scaled BM25 for bm25.
 for r in results:
     print(r["score"], r["text"])
 
@@ -236,6 +249,11 @@ hits = retriever.retrieve(
     session_id="sess-2026-05-07_abc",   # scope out other sessions
     min_score=0.2,                      # drop weak matches
 )
+```
+
+`min_score` compares with `_final_score` (0.7 × cosine relevance + 0.3 × memory health), so tune it for your embedding model.
+
+```python
 
 # After the LLM has actually used the recall, credit those memories:
 store.mark_recall_used([h["id"] for h in hits])

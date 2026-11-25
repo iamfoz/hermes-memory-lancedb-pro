@@ -11,7 +11,8 @@ memories, and the design decisions behind it.
 │  (store.py)    │     │  Table       │     │  dataset       │
 └──────┬─────────┘     └──────────────┘     └────────────────┘
        │
-       ├─▶ _vector_search   nomic-embed-text-v1.5, 768-d cosine
+       ├─▶ _vector_search   nomic-embed-text-v1.5, 768-d cosine,
+                          search_query:/search_document: prefixes (per-db scheme)
        ├─▶ _bm25_search     full-text index scoped to the `text` column
        └─▶ _hybrid_search   Reciprocal Rank Fusion (k = 60)
 
@@ -53,17 +54,34 @@ Each memory is one row:
 Everything else (session id, tier, decay state, support stats, entities,
 temporal type) lives in the `metadata` JSON blob.
 
+An L2 vector index left by older versions is rebuilt with the cosine metric on
+first open. Preferences and entities record a `fact_key` (category plus topic
+before the first `": "` or `" -> "`) in metadata; supersede is still decided by
+vector similarity plus the LLM dedup decision, and nothing looks up rows by
+`fact_key` yet.
+
+## Reflection
+
+The provider path is: session-end LLM reflection → invariant/derived item rows
+(plus one legacy combined row) → ranked recall. No event rows are written. The
+mapped-row loader, resolved-item suppression, `extract_reflection_lessons`,
+`extract_reflection_learning_governance_candidates`,
+`extract_reflection_mapped_memory_items` and `is_recall_used` are library
+helpers and are not on any runtime path.
+
 ## Retrieval pipeline
 
 `MemoryRetriever.retrieve()` runs these stages in order:
 
-1. **Hybrid search** — BM25 and vector results fused with Reciprocal Rank
-   Fusion (`k = 60`). RRF is purely rank-based, so it combines lexical and
-   semantic hits without needing a shared score space.
+1. **Hybrid search** — vector and BM25 candidates are fused vector-first: a
+   vector hit scores its cosine similarity to the query, with a bonus when BM25
+   also finds it; BM25-only hits get a small rank-based score.
+   (`MemoryStore.search(mode="hybrid")` uses Reciprocal Rank Fusion, `k = 60`,
+   instead.)
 2. **Length normalisation** — dampens the bias toward very short or very long
    texts.
-3. **Hard min-score gate** — drops results below `min_score` (only active when
-   `min_score > 0`, so a score of exactly `0.0` is not discarded).
+3. **Hard min-score gate** — before decay, drops candidates whose relevance is
+   below 0.05 (for vector hits, cosine similarity < 0.05).
 4. **Decay scoring** — the Weibull recency term is folded together with
    importance, access frequency, and an evidence-weighted confidence blend into
    a single composite score.
@@ -72,7 +90,10 @@ temporal type) lives in the `metadata` JSON blob.
    Engine); skipped silently when no reranker is configured.
 7. **MMR diversity** — Maximal Marginal Relevance removes near-duplicate hits
    so the recall block is not three phrasings of one fact.
-8. **Lifecycle hooks** — throttled access-count and tier updates.
+8. **Final `min_score` gate** — drops results whose `_final_score` is below
+   `min_score` (only active when `min_score > 0`, so a score of exactly `0.0` is
+   not discarded). The scale is absolute: 0.7 × relevance + 0.3 × memory health.
+9. **Lifecycle hooks** — throttled access-count and tier updates.
 
 ## Weibull decay
 
@@ -113,7 +134,7 @@ cross-session.
    classifiers) run in tests without the heavy dependencies.
 6. **A portable `score` field.** Every search result carries a `score` in
    `[0, 1]` that is comparable across vector, BM25, and hybrid modes.
-   Mode-specific raw fields are prefixed with `_` and are debug-only.
+   Mode-specific raw fields are prefixed with `_` and are debug-only. Vector `score` is cosine similarity (`1 - _distance`, cosine distance); hybrid `score` is `_rrf_score × 30`, clamped, so it follows the hybrid ranking; BM25 `score` is `_score / 10`, clamped.
 
 ## Anti-stickiness
 

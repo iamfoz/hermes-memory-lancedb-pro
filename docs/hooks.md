@@ -33,15 +33,18 @@ the reflection block). This is the only recall hook the host actually drives.
 
 ### `sync_turn`
 
-Persists a completed conversation turn. The work runs in a **daemon thread** so
-the hook returns immediately and never blocks the agent. When an extraction LLM
+Persists a completed conversation turn. The host already calls this hook on its own
+serialized memory worker, so the write runs inline there and the host's flush
+and shutdown drain cover it. Called from the main thread (standalone use), it
+returns immediately and writes on a background thread instead. Either way,
+turns are written one at a time in the order they arrived. When an extraction LLM
 is configured the smart extractor distils the turn into structured memories;
 otherwise the raw user turn is written directly.
 
 ### `on_pre_compress`
 
 Called immediately before the host compresses context and discards old
-messages. The provider ensures a session recovery anchor exists and returns the
+messages. It first waits for pending turn writes (up to `MEMORY_WRITE_DRAIN_TIMEOUT_S`). The provider ensures a session recovery anchor exists and returns the
 current active-task control block so the host can fold it into the compression
 summary — this is what lets a long task survive compaction.
 
@@ -57,20 +60,20 @@ same target are ever touched.
 
 ### `on_session_switch`
 
-Handles a change of session. On a genuine reset it archives the conversation's
+Handles a change of session. It first waits for pending turn writes (up to `MEMORY_WRITE_DRAIN_TIMEOUT_S`). On a genuine reset it archives the conversation's
 auto-anchors and advances the internal conversation id; on a non-reset switch it
 keeps the conversation id. Stale pending recall-credit ids are dropped.
 
 ### `on_session_end`
 
-Called when a conversation ends (not at process exit). It joins pending writes,
+Called when a conversation ends (not at process exit). It waits for all pending turn writes (up to `MEMORY_WRITE_DRAIN_TIMEOUT_S`, default 60s),
 writes a session-summary memory, writes a reflection if an LLM is available,
 flushes the recall-credit ledger, and triggers cooldown-gated auto-purge and
 auto-compaction.
 
 ### `shutdown`
 
-Called at process exit. It joins the pending `sync_turn` thread, clears internal
+Called at process exit. It waits for all pending `sync_turn` writes (up to `MEMORY_WRITE_DRAIN_TIMEOUT_S`, default 60s), including one still running on the host's worker after the host's own 5-second drain, clears internal
 ledgers, and triggers cooldown-gated auto-purge and auto-compaction.
 
 ## Non-standard hooks

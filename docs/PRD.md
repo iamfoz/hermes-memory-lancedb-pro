@@ -190,15 +190,14 @@ Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9)
   JSONL rejection audit.
 - **FR-42** ✅ LLM client auto-detection from env (OpenAI-compatible triple →
   provider override → OpenAI → Anthropic), JSON-repair fallback, one-shot
-  transient retry, hourly rate limit. **No LLM configured → legacy raw-turn
+  transient retry (timeout, connection reset, 429, 5xx; after a 1-3 s jittered delay, for extraction, dedup, merge and reflection calls; the SDK clients also retry internally, so the worst case is up to three attempts per SDK call, then one more after our delay), hourly cap on extraction passes (not on LLM calls or spend). **No LLM configured → legacy raw-turn
   fallback; the product remains fully functional.**
 - **FR-43** ✅ Session-end **summary compression**: turns scored by
   information density (tool calls/corrections/decisions high; greetings low)
   and greedily fitted to a char budget as a single `session-summary` memory.
 - **FR-44** ✅ **Reflection layer**: session-end LLM reflection produces
   invariant (durable) + derived (short-lived) insights, stored per-agent,
-  ranked by logistic decay on recall, sanitised against injection, with
-  resolved-item suppression.
+  ranked by logistic decay on recall, sanitised against injection, with a per-agent ownership guard. Resolved-item suppression, mapped rows (user-model / agent-model / lesson / decision), lesson and learning-governance extraction are implemented as library helpers in hermes_memory_lancedb_pro.reflection but are not used by the provider: nothing sets resolved_at or writes mapped rows.
 
 ### 5.6 Durable tasks
 
@@ -220,7 +219,7 @@ Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9)
 
 - **FR-60** ✅ 10 provider hooks (`MemoryProvider` methods the host calls directly — deliberately not listed in `plugin.yaml`, whose `hooks:` field is for general plugin hooks): `system_prompt_block`
   (cache-stable, never raises), `prefetch` (the real recall path),
-  `sync_turn` (non-blocking daemon-thread writes), `on_pre_compress`
+  `sync_turn` (ordered writes, inline on the host's memory worker, background only from the main thread), `on_pre_compress`
   (recovery anchor), `on_memory_write` (mirrors host memory tool),
   `on_recall_used` + `on_tool_call_observed` (non-standard, inert on stock
   hosts), `on_session_switch`, `shutdown`, `on_session_end`.
@@ -248,17 +247,24 @@ Status legend: ✅ shipped (0.16.x) · 🔶 partial · ⬜ planned (see §8/§9)
   `reset`, `doctor` (counts, tier/category breakdown, orphan-chain and
   stale-row anomalies, recommendations **that reference real commands**),
   `export` (JSONL; strict-fail on corrupt store; `--salvage` recovery scan),
-  `import` (`--reembed`, `--allow-existing`, source-id traceability).
+  `import` (`--reembed`, `--allow-existing`, source-id traceability; skips malformed rows and exits 1 if any were rejected). `export --limit N`: maximum rows to export, counted after archived rows are filtered out (default: all). Must be 1 or more; a warning is printed on stderr if output was cut off.
 - **FR-72** ✅ **`stats`** (with `--json`), **`search`** (all modes +
   session-scoping flags + `--json`, vectors stripped), **`purge`**
   (`--grace-days`, `--dry-run`, confirm-unless`-y`), **`compact`**
-  (`--dry-run` plan preview, similarity/age/scan knobs) — registered in both
+  (`--dry-run` plan preview, similarity/age/scan knobs, `-y/--yes` to skip the confirmation prompt), **`reembed`** (`--dry-run`, `--batch-size`, `-y`; re-encodes a legacy store with nomic task prefixes) — registered in both
   CLI surfaces via one shared parser helper so they cannot drift.
 - **FR-73** ✅ `--version` flag. Destructive commands (`init`, `reset`,
-  `purge`) prompt for confirmation; `-y/--yes` for scripts; `-q/--quiet`
+  `purge`, `compact`, `reembed`) prompt for confirmation; `-y/--yes` for scripts; `-q/--quiet`
   everywhere.
 - **FR-74** ✅ Corruption recovery: `salvage_scan` walks dataset versions
   newest-first, then fragment-by-fragment, read-only.
+- **FR-75** ✅ Store API notes: `MemoryStore.anchors_for_session()` returns the
+  session's first and most recent rows from one scan, without loading vectors;
+  `MemoryStore.stats()` may carry a `scan_error` key when the table cannot be
+  read, and reports `embedding_scheme`, `embedding_scheme_preferred` and
+  `reembed_interrupted`. `get_by_id()` can return an archived row (state
+  `archived`) when its successor was deleted; `update()` and
+  `increment_access_count()` ignore such rows, and `forget()` deletes them.
 
 ## 6. Non-functional requirements
 
@@ -325,7 +331,7 @@ Gaps identified in the 2026-07 review, with disposition:
 | GA-11 | No scheduled-maintenance entry point (users must rely on session-end cooldowns or cron the CLI themselves) | Nice-to-have | Roadmap R4 |
 | GA-12 | `HF_TOKEN` documented but consumed only by transitive deps — docs could mislead | Nice-to-have | Roadmap R2 |
 | GA-13 | CONTRIBUTING/SECURITY/bug-report template said `doctor` reports the package version — it didn't | Defect | **Fixed** — `doctor` and `stats` now print `package_version` (JSON included) |
-| GA-14 | `doctor -q/--quiet` is declared but never read — an inert flag (pre-existing) | Nice-to-have | Roadmap R2 (wire or retire) |
+| GA-14 | `doctor -q/--quiet` is declared but never read — an inert flag (pre-existing) | Nice-to-have | **Fixed** — `doctor -q` prints only findings and errors |
 | GA-15 | `[Unreleased]`/`[0.14.3]`/`[0.14.2]` changelog headers had no link definitions — dead compare links | Nice-to-have | **Fixed** |
 | GA-16 | No test coverage for the `_cmd_init`/`_cmd_reset`/`smoke_main`/task-CLI wrapper layer (module logic is tested; the argparse wrappers are not) | Gap | Roadmap R2 |
 | GA-17 | `MemoryStore.optimize()` (fragment compaction) has no manual CLI trigger — automatic only | Nice-to-have | Roadmap R4 (`maintain` includes it) |
@@ -341,7 +347,7 @@ Gaps identified in the 2026-07 review, with disposition:
   `doctor`, `export`, `import`) into shared helpers like
   `_add_store_admin_parsers`, eliminating the last CLI-drift surface.
 - **R2** — Operability polish: `doctor --json` (machine-readable health for
-  cron/monitoring); wire or retire the inert `doctor -q` flag (GA-14); test
+  cron/monitoring); test
   coverage for the CLI wrapper layer — `init`, `reset`, `smoke_main`, task
   dispatch (GA-16); documentation pass on env-var edge cases (`HF_TOKEN`).
 
@@ -397,7 +403,8 @@ Gaps identified in the 2026-07 review, with disposition:
 hermes-memory[-lancedb-pro] [--version]
   init | reset | doctor | export | import
   stats [--json] | search QUERY [--mode|--limit|--category|--scope|--session-id|--min-score|--json]
-  purge [--grace-days N] [--dry-run] [-y] | compact [--dry-run] [--scope]... [--min-age-days] [--similarity] [--max-scan]
+  purge [--grace-days N] [--dry-run] [-y] | compact [--dry-run] [--scope]... [--min-age-days] [--similarity] [--max-scan] [-y]
+  reembed [--dry-run] [--batch-size N] [-y]
   task create|list [--json]|show|resume|advance|complete|pin|unpin|gc|hold|unhold
        wait|block|unwait|wake|reported|to-skill
   install-plugin | uninstall-plugin

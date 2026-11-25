@@ -112,7 +112,28 @@ hermes-memory-lancedb-pro export -o backup.jsonl
 hermes-memory-lancedb-pro import --in backup.jsonl --reembed
 hermes-memory-lancedb-pro purge --dry-run # reclaim space from archived rows
 hermes-memory-lancedb-pro compact --dry-run    # preview near-duplicate merges
+hermes-memory-lancedb-pro reembed --dry-run  # preview re-encoding a legacy store with nomic task prefixes
 ```
+
+Notes on the CLI:
+
+- `export --limit N` is the maximum rows to export, counted after archived rows
+  are filtered out (default: all). It must be 1 or more; a warning is printed on
+  stderr if output was cut off. Each exported record carries an
+  `embedding_scheme` field (`plain` or `task_prefix`).
+- `compact` asks before merging; `-y/--yes` skips the confirmation prompt
+  (without it a real run shows the cluster count and asks before merging). The
+  source rows are deleted.
+- `doctor -q/--quiet` prints only findings (anomalies) and errors, and nothing
+  when the store is healthy. `doctor` exits 1 and recommends `export --salvage`
+  when the table cannot be read.
+- `stats`, `doctor`, `search`, `export`, `purge` and `compact` exit 1 with
+  `no memory store at PATH` instead of creating a database when `--path` has no
+  store; `init` and `import` still create one.
+- `import` skips malformed rows with a warning and exits 1 if any row was
+  rejected.
+- The provider reports itself unavailable (with an actionable reason) when
+  `lancedb` or `sentence-transformers` is not installed.
 
 When the plugin is active, the same commands are also reachable through
 hermes-agent's CLI as `hermes lancedb_pro <command>`.
@@ -150,9 +171,13 @@ the defaults are production-ready. The most common ones:
 |---|---|---|
 | `MEMORY_DB_DIR` | `<hermes home>/memory-lancedb` | Database directory (agent and CLI) |
 | `MEMORY_PREFETCH_LIMIT` | `5` | Memories recalled per turn |
-| `MEMORY_MIN_RECALL_SCORE` | `0.0` | Score floor for recall (raise to ~0.2 to drop weak matches) |
+| `MEMORY_MIN_RECALL_SCORE` | `0.0` | Score floor for recall, on an absolute scale (0.7 × cosine relevance + 0.3 × memory health); see docs/configuration.md for choosing a value |
 | `MEMORY_ADMISSION_PRESET` | `balanced` | Admission gate: `balanced` / `conservative` / `high-recall` / `off` |
 | `MEMORY_REFLECTION` | `on` | Capture and replay session reflections |
+| `MEMORY_ADMISSION_AUDIT` | `on` | Log rejected admission candidates (`off` stops it) |
+| `MEMORY_WRITE_DRAIN_TIMEOUT_S` | `60` | Seconds to wait for pending turn writes at session end and shutdown |
+
+Reflection rows: invariants are kept until they decay out of the recall window; derived lines and the combined summary row expire after 14 days and are deleted at the end of the next session. The reflection layer's resolved-item, mapped-row, lesson and governance helpers are available as a library API only.
 
 The **complete reference** — every variable, default, and grouping — is in
 [docs/configuration.md](docs/configuration.md).
