@@ -44,9 +44,13 @@ def test_three_skills_are_bundled_with_names_and_descriptions():
     assert set(skills) == EXPECTED
     for name, skill in skills.items():
         assert Path(skill["path"]).is_file()
-        assert len(skill["description"]) > 40, name
-        # The description is what the agent sees when choosing a skill.
-        assert not skill["description"].startswith("**")
+        # The description is the one line the agent sees when choosing a
+        # skill. Hermes's skill index shows 60 characters and clips the
+        # rest, and asks for one sentence ending in a period.
+        description = skill["description"]
+        assert 20 <= len(description) <= 60, (name, len(description))
+        assert description.endswith(".") and description.count(".") == 1
+        assert not description.startswith("**")
 
 
 def test_skill_names_do_not_collide_with_a_builtin_hermes_command():
@@ -118,6 +122,14 @@ def test_front_matter_parses_with_the_hosts_own_parser():
         frontmatter, body = skill_utils.parse_frontmatter((SKILLS_DIR / name / "SKILL.md").read_text())
         assert frontmatter["name"] == name and frontmatter["description"]
         assert body.lstrip().startswith("# Skill:")
+        # The host shows the description unclipped.
+        assert skill_utils.extract_skill_description(frontmatter) == frontmatter["description"]
+
+
+def test_skills_say_they_are_read_only():
+    # The host refuses edits to plugin skills; the agent should not try.
+    for name in EXPECTED:
+        assert "read-only" in (SKILLS_DIR / name / "SKILL.md").read_text()
 
 
 _COMMAND = re.compile(r"hermes lancedb_pro ((?:[a-z][a-z-]*)(?: [a-z][a-z-]*)?)([^\n`|]*)")

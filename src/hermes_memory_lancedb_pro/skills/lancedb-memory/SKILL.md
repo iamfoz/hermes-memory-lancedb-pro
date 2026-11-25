@@ -1,6 +1,6 @@
 ---
 name: lancedb-memory
-description: Use long-term memory (lancedb_pro) correctly - read recall scores, remember or forget on purpose, search memory before saying you have no record, check its health, and know which memory commands are yours to run.
+description: Recall, remember, forget or search long-term memory.
 version: 1.0.0
 author: Martyn Forryan (iamfoz)
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 # Skill: Long-Term Memory (lancedb_pro)
 
 **Shipped with the `lancedb_pro` plugin** as `lancedb_pro:lancedb-memory`; there is nothing to install.
+It is read-only: do not try to edit or patch it. Keep notes of your own in a
+separate skill.
 
 Use this skill whenever you need to rely on, add to, correct, search or
 maintain your long-term memory. It explains how the `lancedb_pro` memory

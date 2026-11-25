@@ -13,6 +13,13 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Fixed
+- **Skill descriptions were clipped in the agent's skill index.** Hermes shows
+  60 characters per skill and cuts the rest; the three skills' descriptions
+  ran to 150-210. Each is now one sentence within the limit.
+- The skills say they are read-only. Hermes refuses edits to skills a plugin
+  ships, and the agent had tried to patch one.
+
 ---
 
 ## [0.17.2] — 2026-11-25

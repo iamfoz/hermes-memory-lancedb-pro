@@ -1,6 +1,6 @@
 ---
 name: task-to-skill
-description: Turn a completed durable task into a reusable skill draft - list candidate tasks, scaffold SKILL.md and AGENTS.md, then review and rewrite the protocol.
+description: Turn a completed durable task into a reusable skill.
 version: 1.0.0
 author: Martyn Forryan (iamfoz)
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 # Skill: Task → Skill
 
 **Shipped with the `lancedb_pro` plugin** as `lancedb_pro:task-to-skill`; there is nothing to install.
+It is read-only: do not try to edit or patch it. Keep notes of your own in a
+separate skill.
 
 Use this skill when the user asks to turn a task they ran into a reusable
 skill. The durable-task ledger already recorded what was done; your job is to

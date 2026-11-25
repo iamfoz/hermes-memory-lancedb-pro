@@ -1,6 +1,6 @@
 ---
 name: durable-task
-description: Keep multi-step work alive across context compaction and restarts with a task ledger on disk - create, pin, resume, advance, wait or block, complete and report a task.
+description: Run multi-step work that must survive context resets.
 version: 1.0.0
 author: Martyn Forryan (iamfoz)
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 # Skill: Durable Task Ledger
 
 **Shipped with the `lancedb_pro` plugin** as `lancedb_pro:durable-task`; there is nothing to install.
+It is read-only: do not try to edit or patch it. Keep notes of your own in a
+separate skill.
 
 Use this skill for any task that takes more than 3 sequential steps or tool calls.
 It ensures your progress survives context compaction, session restarts, and model
