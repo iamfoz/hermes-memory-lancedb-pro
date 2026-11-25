@@ -145,7 +145,7 @@ EMBEDDING_DEVICE: str | None = os.environ.get("MEMORY_EMBEDDING_DEVICE", "").str
 # before this was recorded holds unprefixed vectors. Mixing the two in one
 # table would compare vectors from different input distributions, so the
 # scheme is a property of the database: one with rows and no marker is
-# "plain" (legacy) until `hermes-memory reembed` converts it; a new database
+# "plain" (legacy) until `hermes lancedb_pro reembed` converts it; a new database
 # starts on "task_prefix".
 EMBEDDING_SCHEME_FILE: str = "embedding_scheme.json"
 SCHEME_PLAIN: str = "plain"

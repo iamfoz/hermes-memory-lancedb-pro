@@ -155,3 +155,17 @@ def test_the_memory_skill_marks_destructive_commands_as_the_operators(in_host_pa
     for command in _subparsers(in_host_parser):
         assert f"`{command}" in text or f"lancedb_pro {command}" in text, command
     assert "compact -y" in text  # the agent cannot answer a confirmation prompt
+
+
+def test_cli_messages_recommend_the_in_host_command():
+    """Advice printed by the CLI must name a command that works inside
+    Hermes. The `hermes-memory` / `hermes-memory-lancedb-pro` console scripts
+    are not on the agent's PATH; only `install-plugin` / `uninstall-plugin`,
+    which exist solely in the standalone script, may be named that way."""
+    source = (REPO / "src" / "hermes_memory_lancedb_pro" / "_cli.py").read_text()
+    stale = [
+        m.group(0)
+        for m in re.finditer(r"hermes-memory(?:-lancedb-pro)? ([a-z][a-z-]*)", source)
+        if m.group(1) not in ("install-plugin", "uninstall-plugin")
+    ]
+    assert stale == []

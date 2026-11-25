@@ -13,6 +13,15 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+### Fixed
+- **CLI advice named commands that are not on the agent's PATH.** `doctor`
+  recommendations and recovery hints said `hermes-memory reembed`,
+  `hermes-memory purge`, `hermes-memory compact` and
+  `hermes-memory-lancedb-pro export`. They now give the in-host form,
+  `hermes lancedb_pro <command>`, which works wherever Hermes does.
+- The `reembed` prompt said it was "best run" with Hermes stopped; it refuses
+  to run otherwise, and now says so.
+
 ---
 
 ## [0.17.0] — 2026-11-25

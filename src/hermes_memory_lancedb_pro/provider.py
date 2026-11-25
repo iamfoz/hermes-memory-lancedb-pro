@@ -106,7 +106,7 @@ def _effective_recall_config(
 # ---------------------------------------------------------------------------
 # Purge cooldown: minimum hours between automatic purge runs.  Set 0 to
 # disable auto-purge entirely (you'll need to call purge_archived() manually
-# or use `hermes-memory doctor` to see the recommendation).
+# or use `hermes lancedb_pro doctor` to see the recommendation).
 _AUTO_PURGE_COOLDOWN_HOURS: int = env_int("MEMORY_AUTO_PURGE_COOLDOWN_HOURS", 24)
 # Grace period: archived rows younger than this many days are left alone even
 # when a purge runs.  30 days gives a comfortable audit window.

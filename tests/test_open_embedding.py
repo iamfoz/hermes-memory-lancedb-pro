@@ -523,7 +523,7 @@ def test_doctor_and_stats_recommend_reembed_for_a_legacy_store(db_path, capsys):
     _cli._cmd_doctor(argparse.Namespace(), _store=s)
     out = capsys.readouterr().out
     assert "embedding_scheme:  plain (legacy: no task prefixes)" in out
-    assert "hermes-memory reembed" in out
+    assert "hermes lancedb_pro reembed" in out
     _cli._cmd_stats(argparse.Namespace(json=False), _store=s)
     out = capsys.readouterr().out
     assert "embedding_scheme:  plain (legacy" in out and "reembed" in out

@@ -129,7 +129,7 @@ def _report_unreadable(stats: dict[str, Any]) -> None:
         f"in full: {stats.get('scan_error')}\n"
         "  The counts are not reliable. To recover whatever is still "
         "readable, run:\n"
-        "    hermes-memory-lancedb-pro export --salvage -o backup.jsonl"
+        "    hermes lancedb_pro export --salvage -o backup.jsonl"
     )
 
 
@@ -512,14 +512,14 @@ def _reembed_advice(stats: dict[str, Any]) -> str | None:
     """The `reembed` recommendation for this store, or None."""
     if stats.get("reembed_interrupted"):
         return (
-            "Run `hermes-memory reembed` — a previous re-encode did not finish, "
+            "Run `hermes lancedb_pro reembed` — a previous re-encode did not finish, "
             "so the vectors may not match the recorded embedding scheme."
         )
     scheme = stats.get("embedding_scheme")
     preferred = stats.get("embedding_scheme_preferred")
     if scheme and preferred and scheme != preferred:
         return (
-            f"Run `hermes-memory reembed` — this store's vectors use the {scheme!r} "
+            f"Run `hermes lancedb_pro reembed` — this store's vectors use the {scheme!r} "
             f"scheme; {stats.get('embedding_model', 'the model')} retrieves better "
             f"with {preferred!r} (preview with --dry-run)."
         )
@@ -571,7 +571,7 @@ def _cmd_doctor(
         print(f"  The table scan failed: {stats['scan_error']}")
         print("  The counts are not reliable. To recover whatever is still")
         print("  readable, run:")
-        print("    hermes-memory-lancedb-pro export --salvage -o backup.jsonl")
+        print("    hermes lancedb_pro export --salvage -o backup.jsonl")
         return 1
 
     # ---- Header ----
@@ -592,7 +592,7 @@ def _cmd_doctor(
     say(f"archived_ratio: {archived_ratio:.1f}%")
     if archived_ratio > 30.0:
         say(
-            "  → run 'hermes-memory purge --grace-days 30' to reclaim space "
+            "  → run 'hermes lancedb_pro purge --grace-days 30' to reclaim space "
             "(preview with --dry-run)"
         )
     say()
@@ -644,7 +644,7 @@ def _cmd_doctor(
         print(f"  The full table scan failed: {e}")
         print("  The counts above are not reliable. To recover whatever is still")
         print("  readable, run:")
-        print("    hermes-memory-lancedb-pro export --salvage -o backup.jsonl")
+        print("    hermes lancedb_pro export --salvage -o backup.jsonl")
         return 1
     for row in scanned_rows:
         rid = row.get("id")
@@ -762,14 +762,14 @@ def _cmd_doctor(
     if archived_older_than_grace > 0:
         any_rec = True
         say(
-            f"Run `hermes-memory purge --grace-days 30` — "
+            f"Run `hermes lancedb_pro purge --grace-days 30` — "
             f"{archived_older_than_grace} archived rows older than 30 days."
         )
 
     if old_non_archived_count > 0:
         any_rec = True
         say(
-            f"Run `hermes-memory compact --dry-run` to preview merging — "
+            f"Run `hermes lancedb_pro compact --dry-run` to preview merging — "
             f"{old_non_archived_count} old non-archived rows that may be "
             "near-duplicates."
         )
@@ -1145,7 +1145,8 @@ def _cmd_reembed(
         return 0
     if not getattr(args, "yes", False):
         print(f"This will re-encode the vectors of {what}.")
-        print("Text and metadata are not changed. Best run while the Hermes agent is stopped.")
+        print("Text and metadata are not changed. Hermes must be stopped: this refuses to run "
+              "while an agent is using the database.")
         if not _confirm():
             print("Aborted.")
             return 1
@@ -1771,7 +1772,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             return 1
         print(f"  The existing database was moved to: {aside}", file=sys.stderr)
         print("  Nothing was deleted. To recover rows from it, run:\n"
-              f"    hermes-memory-lancedb-pro export --salvage --path {aside} -o backup.jsonl",
+              f"    hermes lancedb_pro export --salvage --path {aside} -o backup.jsonl",
               file=sys.stderr)
         store = MemoryStore(db_path=db_path)
         store._initialise()
@@ -1783,7 +1784,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         total = store.stats().get("total_memories", 0)
         if not quiet:
             print(f"  ⚠ Database already has {total} entries")
-            print("  Skipping seed. Run `hermes-memory-lancedb-pro reset` to start fresh.")
+            print("  Skipping seed. Run `hermes lancedb_pro reset` to start fresh.")
         return 0
 
     if not os.path.exists(memory_md):
