@@ -281,9 +281,10 @@ minor versions; breaking changes are called out under **Changed** and
   `sync_turn` now writes on the host's own memory worker, and uses a background
   thread only when called from the main thread. Writes run one at a time, in
   order.
-- **Session end, session switch, pre-compress and shutdown now wait for every
-  pending turn write**, not only the most recent one, for up to 60 seconds
-  (was 10 s for session end, 5 s for shutdown and 2 s for the others). The new
+- **Session end, a session reset and shutdown now wait for every pending
+  turn write**, not only the most recent one, for up to 60 seconds (was 10 s
+  for session end and 5 s for shutdown). Context compression and other
+  session switches keep a 2-second wait, since they run inside a live turn. The new
   `MEMORY_WRITE_DRAIN_TIMEOUT_S` setting changes the limit. When it is reached,
   a warning names the hook and the number of writes still pending. Background
   turn writes also run under the caller's profile context (`HERMES_HOME` and
@@ -503,7 +504,7 @@ minor versions; breaking changes are called out under **Changed** and
   Automatic compaction in the provider is unchanged.
 - **`MEMORY_ADMISSION_AUDIT`.** The rejection audit log
   (`admission-audit/rejections.jsonl`, which holds rejected candidate text and
-  a conversation excerpt) can be turned off with `MEMORY_ADMISSION_AUDIT=off`
+  scores) can be turned off with `MEMORY_ADMISSION_AUDIT=off`
   (also `0`, `false`, `no`, `disabled`) without disabling admission control. On
   by default.
 - **`MEMORY_WRITE_DRAIN_TIMEOUT_S`** (default 60) and

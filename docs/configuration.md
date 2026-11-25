@@ -43,7 +43,7 @@ Truthy values for boolean-style variables are `1`, `true`, `yes`, `on`
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEMORY_ADMISSION_PRESET` | `balanced` | AMAC-v1 admission gate: `balanced` / `conservative` / `high-recall` / `off`. An unrecognised value falls back to `balanced`. When jmunch is detected and this is left unset, the default is raised to `high-recall`. |
-| `MEMORY_ADMISSION_AUDIT` | `on` | Write rejected admission candidates, with a short conversation excerpt, to `<db parent>/admission-audit/rejections.jsonl` (rotated at 1 MB, mode 0600, outside the database directory so reset/purge do not remove it). Set `off`, `0`, `false`, `no` or `disabled` to stop writing it. Admission control itself is unaffected. |
+| `MEMORY_ADMISSION_AUDIT` | `on` | Write rejected admission candidates (candidate text and scores, no conversation text) to `<db parent>/admission-audit/rejections.jsonl` (rotated at 1 MB, mode 0600, outside the database directory so reset/purge do not remove it). Set `off`, `0`, `false`, `no` or `disabled` to stop writing it. Admission control itself is unaffected. |
 
 ## Compaction and purge
 
@@ -98,7 +98,7 @@ Conversation text and stored memories are passed to the extraction, dedup, merge
 | `MEMORY_EXTRACTION_MODEL` | *(none)* | Model id for extraction. |
 | `MEMORY_EXTRACTION_PROVIDER` | *(none)* | `openai` (default behaviour) or `anthropic` to route the override through the Anthropic SDK. |
 | `MEMORY_EXTRACTION_RATE_LIMIT` | `0` | Maximum extraction passes per hour. Each pass makes one extraction call plus dedup, admission-utility and merge calls per candidate, so this is not a cap on LLM calls or spend. When the cap is reached, turns are stored as raw user/assistant memories until the window clears. `0` disables the cap. |
-| `MEMORY_WRITE_DRAIN_TIMEOUT_S` | `60` | Seconds that session end, session switch, pre-compress and shutdown wait for pending turn writes (one extraction pass can make several LLM calls). A warning is logged if the wait runs out; the writes keep running. Recall (prefetch) waits at most 2 seconds. |
+| `MEMORY_WRITE_DRAIN_TIMEOUT_S` | `60` | Seconds that session end, a session reset and shutdown wait for pending turn writes (one extraction pass can make several LLM calls). A warning is logged if the wait runs out; the writes keep running. Recall (prefetch), context compression and non-reset session switches wait at most 2 seconds. |
 | `OPENAI_API_KEY` | *(none)* | Fallback extraction LLM (OpenAI-compatible). |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for the OpenAI fallback. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model for the OpenAI fallback. |
