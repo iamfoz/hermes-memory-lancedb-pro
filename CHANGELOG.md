@@ -15,6 +15,23 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
+## [0.17.2] — 2026-11-25
+
+### Fixed
+- **`compact` only looked at the first 200 rows.** It read 200 raw rows and
+  then dropped the ones it must skip (recent rows, task pins and so on), so
+  on a larger store most memories were never considered, by the command or
+  by the automatic weekly pass. The whole store is now read, and the cap
+  (`--max-scan`, default 2000) applies to the eligible memories compared.
+  The pairwise comparison uses numpy when available, so 2,000 memories take
+  under a second.
+- **`doctor` recommended `compact` whenever old rows existed**, quoting their
+  count as possible near-duplicates, and kept recommending it after every
+  compaction. It now runs the same check as `compact --dry-run` and
+  recommends it only when clusters are found, giving their number.
+
+---
+
 ## [0.17.1] — 2026-11-25
 
 ### Fixed
@@ -1229,7 +1246,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.15.1...v0.16.0
