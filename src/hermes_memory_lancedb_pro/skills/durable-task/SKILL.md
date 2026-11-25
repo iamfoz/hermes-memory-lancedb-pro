@@ -1,6 +1,18 @@
+---
+name: durable-task
+description: Keep multi-step work alive across context compaction and restarts with a task ledger on disk - create, pin, resume, advance, wait or block, complete and report a task.
+version: 1.0.0
+author: Martyn Forryan (iamfoz)
+license: MIT
+metadata:
+  hermes:
+    tags: [Memory, LanceDB, lancedb_pro]
+    related_skills: [lancedb-memory, task-to-skill]
+---
+
 # Skill: Durable Task Ledger
 
-**Install location**: `~/.hermes/skills/durable-task/SKILL.md`
+**Shipped with the `lancedb_pro` plugin** as `lancedb_pro:durable-task`; there is nothing to install.
 
 Use this skill for any task that takes more than 3 sequential steps or tool calls.
 It ensures your progress survives context compaction, session restarts, and model

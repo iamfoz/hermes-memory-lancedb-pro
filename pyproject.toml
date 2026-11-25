@@ -69,7 +69,8 @@ lancedb_pro = "hermes_memory_lancedb_pro.provider:register"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hermes_memory_lancedb_pro = ["plugin.yaml"]
+# skills/ ships the agent skills the plugin registers with Hermes at load.
+hermes_memory_lancedb_pro = ["plugin.yaml", "skills/*/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

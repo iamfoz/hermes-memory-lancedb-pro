@@ -1,6 +1,18 @@
+---
+name: task-to-skill
+description: Turn a completed durable task into a reusable skill draft - list candidate tasks, scaffold SKILL.md and AGENTS.md, then review and rewrite the protocol.
+version: 1.0.0
+author: Martyn Forryan (iamfoz)
+license: MIT
+metadata:
+  hermes:
+    tags: [Memory, LanceDB, lancedb_pro]
+    related_skills: [durable-task, lancedb-memory]
+---
+
 # Skill: Task → Skill
 
-**Install location**: `~/.hermes/skills/task-to-skill/SKILL.md`
+**Shipped with the `lancedb_pro` plugin** as `lancedb_pro:task-to-skill`; there is nothing to install.
 
 Use this skill when the user asks to turn a task they ran into a reusable
 skill. The durable-task ledger already recorded what was done; your job is to

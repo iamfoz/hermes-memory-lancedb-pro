@@ -1,6 +1,6 @@
 ## Durable Task Protocol
 
-Invoke `/durable-task` when starting any multi-step task to load the full
+Load the `lancedb_pro:durable-task` skill when starting any multi-step task for the full
 procedure guide. For any task requiring more than 3 sequential steps, tool
 calls, or iterations, you MUST use the durable task ledger before starting work.
 

@@ -2686,6 +2686,69 @@ def register(ctx: Any) -> None:
             )
 
 
+    _register_bundled_skills(ctx)
+
+
+def bundled_skills() -> list[dict[str, Any]]:
+    """The agent skills shipped inside the package: one dict per skill with
+    ``name``, ``description`` and ``path`` (its ``SKILL.md``).
+
+    Name and description come from the file's front matter, falling back to
+    the directory name."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+    found: list[dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return found
+    for entry in names:
+        skill_md = os.path.join(root, entry, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        meta: dict[str, str] = {}
+        try:
+            with open(skill_md, encoding="utf-8") as fh:
+                lines = fh.read(4000).splitlines()
+        except OSError:
+            continue
+        if lines and lines[0].strip() == "---":
+            for line in lines[1:]:
+                if line.strip() == "---":
+                    break
+                key, sep, value = line.partition(":")
+                if sep and key and not key.startswith((" ", "\t")):
+                    meta[key.strip()] = value.strip()
+        found.append({
+            "name": meta.get("name") or entry,
+            "description": meta.get("description", ""),
+            "path": skill_md,
+        })
+    return found
+
+
+def _register_bundled_skills(ctx: Any) -> None:
+    """Register the packaged skills with the host, so the agent gets them
+    with the plugin (as ``lancedb_pro:<name>``) and nothing has to be copied
+    into ``~/.hermes/skills``. Best-effort: older hosts have no
+    ``register_skill``, and a failure here must not stop the provider."""
+    if not hasattr(ctx, "register_skill"):
+        return
+    from pathlib import Path
+
+    for skill in bundled_skills():
+        try:
+            ctx.register_skill(
+                skill["name"],
+                Path(skill["path"]),
+                skill["description"],
+                {"name": skill["name"], "description": skill["description"]},
+            )
+        except Exception as exc:
+            logger.warning(
+                "lancedb_pro: could not register the %r skill: %s", skill["name"], exc
+            )
+
+
 def register_memory_provider(_ctx: Any = None) -> Any:
     """Backwards-compatible alias; prefer ``register(ctx)`` for new installs.
 

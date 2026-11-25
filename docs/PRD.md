@@ -310,7 +310,8 @@ All FRs marked ✅ above are shipped and tested. Subsystem inventory:
 `session_compressor.py`, `memory_compactor.py`, `reflection/` (8 modules),
 `task_ledger.py` / `task_gc.py` / `task_skill.py`, `jmunch.py`, `_sql.py`,
 `_cli.py`. Docs: architecture, configuration, hermes-integration, hooks,
-jmunch, usage, PRD (this document). Skills: `durable-task`, `task-to-skill`.
+jmunch, usage, PRD (this document). Skills (registered with the host at
+load): `lancedb-memory`, `durable-task`, `task-to-skill`.
 
 ## 8. Gap analysis
 

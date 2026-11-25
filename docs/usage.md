@@ -181,6 +181,26 @@ protects a task from collection. `task to-skill` turns a useful task into a
 draft reusable skill. Retention is tunable — see
 [configuration.md](configuration.md#task-ledger-garbage-collection).
 
+### Agent skills
+
+The plugin ships three skills and registers them with Hermes when it loads,
+so the agent has them as soon as the plugin is installed. Nothing needs
+copying into `~/.hermes/skills/`. They appear to the agent as:
+
+| Skill | Teaches the agent |
+|---|---|
+| `lancedb_pro:lancedb-memory` | How this memory differs from the built-in one; how to read recall scores and trend tags; how to remember, correct and forget on purpose (through the built-in `memory` tool, which is mirrored); how to search and how each search mode's score reads; how to check health with `stats` and `doctor`; that `compact` needs `-y`; and which commands (`reset`, `init`, `purge`, `import`, `reembed`, `export`) are the operator's and must not be run unless asked. |
+| `lancedb_pro:durable-task` | The task ledger: create, pin, resume, advance, wait or block, complete, report. |
+| `lancedb_pro:task-to-skill` | Turning a completed task into a reusable skill draft. |
+
+The provider gives the agent no memory tools of its own: it reads through the
+recall block, writes automatically or through the built-in `memory` tool, and
+does everything else with `hermes lancedb_pro …`. The skill is therefore the
+agent's only description of those commands, and a test fails if a skill names
+a command or flag that does not exist.
+
+The source files are in `src/hermes_memory_lancedb_pro/skills/`.
+
 ### Smoke test
 
 ```bash

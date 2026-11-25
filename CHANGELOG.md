@@ -484,6 +484,19 @@ minor versions; breaking changes are called out under **Changed** and
   model repositories.
 
 ### Added
+- **A `lancedb-memory` skill for the agent.** The provider gives the agent no
+  memory tools, so until now nothing told it how this memory differs from
+  the built-in one. The skill covers reading recall scores and trend tags,
+  remembering and forgetting on purpose through the built-in `memory` tool,
+  searching (and how each mode's score reads), checking health, passing `-y`
+  to `compact`, and which commands are the operator's to run.
+- **Skills ship with the plugin.** The three skills (`lancedb-memory`,
+  `durable-task`, `task-to-skill`) are packaged and registered with Hermes
+  when the plugin loads, as `lancedb_pro:<name>`; nothing has to be copied
+  into `~/.hermes/skills/`. They moved from `skills/` to
+  `src/hermes_memory_lancedb_pro/skills/`. Each now has a header with a
+  description: without one Hermes showed the agent the install-path line
+  as the description of the two existing skills.
 - **`task unpin <id>`** removes a task's pin without touching its ledger, and
   `task pin` replaces an earlier pin for the same task instead of adding a
   duplicate.
