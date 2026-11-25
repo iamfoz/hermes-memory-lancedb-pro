@@ -13,12 +13,38 @@ minor versions; breaking changes are called out under **Changed** and
 
 ## [Unreleased]
 
+---
+
+## [0.17.3] — 2026-11-25
+
 ### Fixed
+- **A failing extraction model was invisible.** A failed extraction call
+  stores the turn unprocessed, so memories keep arriving and nothing looks
+  wrong. Each extraction outcome is now recorded beside the database, and
+  `doctor` has an Extraction section (model, last success, last failure and
+  its error, consecutive failures) that says so when it is failing.
+- **The extraction timeout was fixed at 30 seconds**, which slow or free
+  routes exceed; the only way round it was to edit the installed plugin.
+  `MEMORY_EXTRACTION_TIMEOUT` sets it, and a timeout error names the setting.
+- **A reasoning model that returned no content gave an unexplained "empty
+  response".** The error now gives the finish reason and says the model spent
+  its output budget on reasoning. `MEMORY_EXTRACTION_MAX_TOKENS` sets the
+  budget (default 4096).
 - **Skill descriptions were clipped in the agent's skill index.** Hermes shows
   60 characters per skill and cuts the rest; the three skills' descriptions
   ran to 150-210. Each is now one sentence within the limit.
 - The skills say they are read-only. Hermes refuses edits to skills a plugin
   ships, and the agent had tried to patch one.
+
+### Added
+- **`extraction-test`** makes one real extraction call on a sample turn and
+  prints the model, the time taken and what it extracted, or the error. It
+  reads and writes no memories. Use it to find out why extraction is failing
+  and to prove a fix.
+- The `lancedb-memory` skill explains how to spot broken extraction, the two
+  usual causes (a reasoning model that never answers; a timeout), which
+  settings fix them, and that the installed plugin must never be edited to
+  work around it.
 
 ---
 
@@ -1253,7 +1279,8 @@ minor versions; breaking changes are called out under **Changed** and
 
 ---
 
-[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/iamfoz/hermes-memory-lancedb-pro/compare/v0.16.0...v0.17.0
